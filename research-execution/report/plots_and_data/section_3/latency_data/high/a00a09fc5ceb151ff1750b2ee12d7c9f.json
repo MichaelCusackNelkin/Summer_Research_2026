@@ -1,0 +1,20 @@
+{
+  "OBI_THRESHOLD": 0.1,
+  "depth_lmt": "09",
+  "end": "2026-04-18",
+  "horizon": 300000000000.0,
+  "latency": 50000000.0,
+  "max_overlap_ns": 299999999999.0,
+  "max_size": 0,
+  "method": "constant",
+  "min_ns": 200000000.0,
+  "min_shares": 0,
+  "n_chunks": 50,
+  "n_trials": 5000,
+  "parent_qty": 10000,
+  "replenishment": 15.0,
+  "seed": 12345,
+  "start": "2026-03-18",
+  "ticker": "DRH",
+  "wait_ns": 200000000.0
+}

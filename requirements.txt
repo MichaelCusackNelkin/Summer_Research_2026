@@ -1,0 +1,13 @@
+numpy
+pandas
+databento
+matplotlib
+statsmodels
+scikit-learn
+polars
+scipy
+pyyaml
+dotenv
+jupyter
+ipykernel
+quarto

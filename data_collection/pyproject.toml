@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "data-collection"
+description="Data collection functions."
+version = "0.1.0"
+requires-python = ">=3.11"
+
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.0,<3.0",
+    "matplotlib",
+    "databento",
+    "tqdm",
+    "polars",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sim_lib"
+version = "0.1.0"
+description = "Strategy, execution, and data utilities for the IEOR4733 Final Project."
+requires-python = ">=3.10"
+authors = [{ name = "Michael Cusack-Nelkin", email = "mcusacknelkin@gmail.com" }]
+dependencies = [
+    "numpy",
+    "pandas",
+    "polars",
+    "matplotlib",
+    "statsmodels",
+    "scikit-learn",
+    "databento",
+    "pyyaml",
+    "tqdm",
+    "yfinance",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ipykernel", "jupyter"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["sim_lib*"]
