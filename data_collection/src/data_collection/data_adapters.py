@@ -32,7 +32,8 @@ class DatabentoGenericAdapter(DataAdapter):
     Generic adapter for any Databento schema, returning polars DataFrames.
 
     Uses a three-layer cache (parquet -> raw dbn.zst -> Databento batch API)
-    and returns data filtered to US market hours (09:30-16:00 Eastern).
+    and returns time columns exactly as Databento delivers them -- all
+    hours, no timezone conversion, no market-hours filtering.
     """
 
     def __init__(self, api_key: str, cache_dir: Union[str, Path],
@@ -114,9 +115,12 @@ class DatabentoGenericAdapter(DataAdapter):
                     merged[iid] = raw_symbol
         return merged
 
-    def _load_and_filter(self, raw_paths: list[Path]) -> tuple[pl.DataFrame, dict[int, str]]:
+    def _load(self, raw_paths: list[Path]) -> tuple[pl.DataFrame, dict[int, str]]:
         """
-        Load one or more .dbn.zst files into polars and filter to 09:30-16:00 Eastern.
+        Load one or more .dbn.zst files into a single polars DataFrame.
+
+        Time columns are returned exactly as Databento delivers them -- all
+        hours, no timezone conversion, no market-hours filtering.
 
         Raises
         ------
@@ -130,22 +134,6 @@ class DatabentoGenericAdapter(DataAdapter):
             pdf = data.to_df()
             dfs.append(pl.from_pandas(pdf.reset_index()))
         df = pl.concat(dfs)
-
-        # ts_event is UTC -- convert to Eastern and filter to market hours
-        df = df.with_columns(
-            pl.col("ts_event")
-            .dt.convert_time_zone("US/Eastern")
-            .alias("ts_event")
-        )
-        df = df.filter(
-            (pl.col("ts_event").dt.hour() > 9)
-            | (
-                (pl.col("ts_event").dt.hour() == 9)
-                & (pl.col("ts_event").dt.minute() >= 30)
-            )
-        ).filter(
-            pl.col("ts_event").dt.hour() < 16
-        )
         return df, mappings
 
     async def _batch_download(self, tickers: list[str], start_date: str,
@@ -260,9 +248,11 @@ class DatabentoGenericAdapter(DataAdapter):
         Fetch data through a three-layer cache.
 
         ``end_date`` is exclusive and defaults to today. Returns
-        ``(df, mappings)`` where ``df`` is filtered to 09:30-16:00 Eastern and
-        ``mappings`` is ``{instrument_id: raw_symbol}`` -- empty when the
-        parquet cache is hit but the raw ``.dbn.zst`` files have been cleared.
+        ``(df, mappings)`` where ``df`` has time columns exactly as Databento
+        delivers them (all hours, no timezone conversion, no market-hours
+        filtering) and ``mappings`` is ``{instrument_id: raw_symbol}`` -- empty
+        when the parquet cache is hit but the raw ``.dbn.zst`` files have been
+        cleared.
 
         Raises
         ------
@@ -292,7 +282,7 @@ class DatabentoGenericAdapter(DataAdapter):
         if raw_paths:
             if self.verbose:
                 print(f"[GenericAdapter] Raw DBN cache hit: {len(raw_paths)} file(s)")
-            df, mappings = self._load_and_filter(raw_paths)
+            df, mappings = self._load(raw_paths)
             df.write_parquet(parquet_path)
             return df, mappings
 
@@ -307,6 +297,6 @@ class DatabentoGenericAdapter(DataAdapter):
         raw_paths = await self._batch_download(
             ticker_list, start_date, end_date, dataset, schema, cache_key
         )
-        df, mappings = self._load_and_filter(raw_paths)
+        df, mappings = self._load(raw_paths)
         df.write_parquet(parquet_path)
         return df, mappings

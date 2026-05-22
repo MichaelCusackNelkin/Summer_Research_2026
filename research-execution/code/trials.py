@@ -219,7 +219,7 @@ async def get_data_paths(tickers, start_date, end_date, dataset, schema, cache_o
     # Layer 2: raw dbn.zst cache
     raw_paths = adapter._find_raw_path(cache_key)
     if raw_paths:
-        df, mappings = adapter._load_and_filter(raw_paths)
+        df, mappings = adapter._load(raw_paths)
         df.write_parquet(parquet_path)
         ticker_to_id = {v: k for k, v in mappings.items()}
         return parquet_path, ticker_to_id
@@ -235,7 +235,7 @@ async def get_data_paths(tickers, start_date, end_date, dataset, schema, cache_o
     raw_paths = await adapter._batch_download(
         ticker_list, start_date, end_date, dataset, schema, cache_key
     )
-    df, mappings = adapter._load_and_filter(raw_paths)
+    df, mappings = adapter._load(raw_paths)
     df.write_parquet(parquet_path)
     ticker_to_id = {v: k for k, v in mappings.items()}
     return parquet_path, ticker_to_id
