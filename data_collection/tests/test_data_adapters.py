@@ -198,11 +198,107 @@ async def test_get_data_parquet_cache_hit(tmp_path):
     parquet_path = a._get_cache_path(cache_key)
     expected.write_parquet(parquet_path)
 
-    df, mappings = await a.get_data(
+    df = await a.get_data(
         tickers=["AAPL"],
         start_date="2026-01-01",
         end_date="2026-01-05",
         cache_only=True,
     )
     assert df.equals(expected)
-    assert mappings == {}
+
+
+# ---------------------------------------------------------------------------
+# scan_data -- lazy parquet-only layer
+# ---------------------------------------------------------------------------
+
+def test_scan_data_cache_hit_returns_lazyframe(tmp_path):
+    a = _adapter(tmp_path)
+    ticker_list = a._normalize_tickers(["AAPL"])
+    cache_key = a._generate_cache_key(
+        ticker_list, "2026-01-01", "2026-01-05",
+        dataset="XNAS.ITCH", schema="ohlcv-1m",
+    )
+    expected = pl.DataFrame({"ts_event": [1, 2, 3], "price": [10.0, 11.0, 12.0]})
+    expected.write_parquet(a._get_cache_path(cache_key))
+
+    lf = a.scan_data(
+        tickers=["AAPL"],
+        start_date="2026-01-01",
+        end_date="2026-01-05",
+    )
+    assert isinstance(lf, pl.LazyFrame)
+    assert lf.collect().equals(expected)
+
+
+async def test_scan_data_matches_get_data_for_same_args(tmp_path):
+    a = _adapter(tmp_path)
+    ticker_list = a._normalize_tickers(["AAPL"])
+    cache_key = a._generate_cache_key(
+        ticker_list, "2026-01-01", "2026-01-05",
+        dataset="XNAS.ITCH", schema="ohlcv-1m",
+    )
+    expected = pl.DataFrame({"ts_event": [1, 2, 3], "price": [10.0, 11.0, 12.0]})
+    expected.write_parquet(a._get_cache_path(cache_key))
+
+    eager = await a.get_data(
+        tickers=["AAPL"],
+        start_date="2026-01-01",
+        end_date="2026-01-05",
+        cache_only=True,
+    )
+    lazy = a.scan_data(
+        tickers=["AAPL"],
+        start_date="2026-01-01",
+        end_date="2026-01-05",
+    ).collect()
+    assert lazy.equals(eager)
+
+
+def test_scan_data_missing_cache_raises_filenotfounderror(tmp_path):
+    a = _adapter(tmp_path)
+    with pytest.raises(FileNotFoundError) as excinfo:
+        a.scan_data(
+            tickers=["AAPL"],
+            start_date="2026-01-01",
+            end_date="2026-01-05",
+        )
+    msg = str(excinfo.value)
+    assert "get_data" in msg
+    assert "parquet" in msg.lower()
+
+
+def test_scan_data_verbose_prints_filename(tmp_path, capsys):
+    a = DatabentoGenericAdapter("fake-key", tmp_path, verbose=True)
+    ticker_list = a._normalize_tickers(["AAPL"])
+    cache_key = a._generate_cache_key(
+        ticker_list, "2026-01-01", "2026-01-05",
+        dataset="XNAS.ITCH", schema="ohlcv-1m",
+    )
+    pl.DataFrame({"x": [1]}).write_parquet(a._get_cache_path(cache_key))
+
+    a.scan_data(
+        tickers=["AAPL"],
+        start_date="2026-01-01",
+        end_date="2026-01-05",
+    )
+    out = capsys.readouterr().out
+    assert "[GenericAdapter] scan_parquet:" in out
+    assert f"{cache_key}.parquet" in out
+
+
+def test_scan_data_quiet_when_not_verbose(tmp_path, capsys):
+    a = _adapter(tmp_path)  # verbose=False
+    ticker_list = a._normalize_tickers(["AAPL"])
+    cache_key = a._generate_cache_key(
+        ticker_list, "2026-01-01", "2026-01-05",
+        dataset="XNAS.ITCH", schema="ohlcv-1m",
+    )
+    pl.DataFrame({"x": [1]}).write_parquet(a._get_cache_path(cache_key))
+
+    a.scan_data(
+        tickers=["AAPL"],
+        start_date="2026-01-01",
+        end_date="2026-01-05",
+    )
+    out = capsys.readouterr().out
+    assert out == ""

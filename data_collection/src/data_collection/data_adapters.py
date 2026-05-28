@@ -83,58 +83,19 @@ class DatabentoGenericAdapter(DataAdapter):
         for file in self.cache_dir.glob("*.parquet"):
             file.unlink()
 
-    def _merge_mappings(self, raw_paths: list[Path]) -> dict[int, str]:
-        """
-        Read symbol mappings from .dbn.zst files into a flat
-        ``{instrument_id: raw_symbol}`` dict.
-
-        Raises
-        ------
-        ValueError
-            If the same instrument_id resolves to two different raw symbols
-            (violates the 1:1 symbol-to-instrument_id guarantee).
-        """
-        merged: dict[int, str] = {}
-        for p in raw_paths:
-            data = db.DBNStore.from_file(p)
-            for raw_symbol, intervals in data.metadata.mappings.items():
-                for interval in intervals:
-                    resolved = (
-                        interval["symbol"] if isinstance(interval, dict)
-                        else interval.symbol
-                    )
-                    if not resolved:
-                        continue
-                    iid = int(resolved)
-                    existing = merged.get(iid)
-                    if existing is not None and existing != raw_symbol:
-                        raise ValueError(
-                            f"instrument_id {iid} maps to both "
-                            f"{existing!r} and {raw_symbol!r}"
-                        )
-                    merged[iid] = raw_symbol
-        return merged
-
-    def _load(self, raw_paths: list[Path]) -> tuple[pl.DataFrame, dict[int, str]]:
+    def _load(self, raw_paths: list[Path]) -> pl.DataFrame:
         """
         Load one or more .dbn.zst files into a single polars DataFrame.
 
         Time columns are returned exactly as Databento delivers them -- all
         hours, no timezone conversion, no market-hours filtering.
-
-        Raises
-        ------
-        ValueError
-            If the same instrument_id resolves to two different raw symbols.
         """
-        mappings = self._merge_mappings(raw_paths)
         dfs = []
         for p in raw_paths:
             data = db.DBNStore.from_file(p)
             pdf = data.to_df()
             dfs.append(pl.from_pandas(pdf.reset_index()))
-        df = pl.concat(dfs)
-        return df, mappings
+        return pl.concat(dfs)
 
     async def _batch_download(self, tickers: list[str], start_date: str,
                               end_date: str, dataset: str, schema: str,
@@ -243,16 +204,13 @@ class DatabentoGenericAdapter(DataAdapter):
         dataset: str = "XNAS.ITCH",
         schema: str = "ohlcv-1m",
         cache_only: bool = False,
-    ) -> tuple[pl.DataFrame, dict[int, str]]:
+    ) -> pl.DataFrame:
         """
         Fetch data through a three-layer cache.
 
-        ``end_date`` is exclusive and defaults to today. Returns
-        ``(df, mappings)`` where ``df`` has time columns exactly as Databento
-        delivers them (all hours, no timezone conversion, no market-hours
-        filtering) and ``mappings`` is ``{instrument_id: raw_symbol}`` -- empty
-        when the parquet cache is hit but the raw ``.dbn.zst`` files have been
-        cleared.
+        ``end_date`` is exclusive and defaults to today. Returns a DataFrame
+        with time columns exactly as Databento delivers them (all hours, no
+        timezone conversion, no market-hours filtering).
 
         Raises
         ------
@@ -272,19 +230,16 @@ class DatabentoGenericAdapter(DataAdapter):
         if parquet_path.exists():
             if self.verbose:
                 print(f"[GenericAdapter] Parquet cache hit: {parquet_path.name}")
-            df = pl.read_parquet(parquet_path)
-            raw_paths = self._find_raw_path(cache_key)
-            mappings = self._merge_mappings(raw_paths) if raw_paths else {}
-            return df, mappings
+            return pl.read_parquet(parquet_path)
 
         # Layer 2: raw dbn.zst cache
         raw_paths = self._find_raw_path(cache_key)
         if raw_paths:
             if self.verbose:
                 print(f"[GenericAdapter] Raw DBN cache hit: {len(raw_paths)} file(s)")
-            df, mappings = self._load(raw_paths)
+            df = self._load(raw_paths)
             df.write_parquet(parquet_path)
-            return df, mappings
+            return df
 
         # Layer 3: Databento batch API
         if cache_only:
@@ -297,6 +252,53 @@ class DatabentoGenericAdapter(DataAdapter):
         raw_paths = await self._batch_download(
             ticker_list, start_date, end_date, dataset, schema, cache_key
         )
-        df, mappings = self._load(raw_paths)
+        df = self._load(raw_paths)
         df.write_parquet(parquet_path)
-        return df, mappings
+        return df
+
+    def scan_data(
+        self,
+        tickers: Union[str, Iterable[str]],
+        start_date: str,
+        end_date: Optional[str] = None,
+        dataset: str = "XNAS.ITCH",
+        schema: str = "ohlcv-1m",
+    ) -> pl.LazyFrame:
+        """
+        Lazy sibling of :meth:`get_data` for the parquet-cache layer only.
+
+        Returns a ``pl.LazyFrame`` backed by ``pl.scan_parquet`` so callers can
+        chain column pruning and predicate filters that polars pushes down
+        into the parquet read -- avoiding the memory blowup of
+        ``pl.read_parquet`` on multi-GB caches.
+
+        Unlike :meth:`get_data`, this method is synchronous: it is a pure
+        local-file lookup and never decodes raw DBN or hits the Databento
+        API. If the parquet cache is missing, it raises ``FileNotFoundError``
+        and tells the caller to materialize the cache via ``get_data`` first.
+
+        Raises
+        ------
+        FileNotFoundError
+            If no parquet cache exists for the given arguments.
+        """
+        if end_date is None:
+            end_date = datetime.today().strftime("%Y-%m-%d")
+
+        ticker_list = self._normalize_tickers(tickers)
+        cache_key = self._generate_cache_key(
+            ticker_list, start_date, end_date, dataset, schema
+        )
+
+        parquet_path = self._get_cache_path(cache_key)
+        if not parquet_path.exists():
+            raise FileNotFoundError(
+                f"No parquet cache for {ticker_list} ({start_date} to {end_date}), "
+                f"dataset={dataset}, schema={schema}. "
+                "scan_data is lazy-only and will not download; "
+                "call get_data(...) once first to materialize the parquet cache."
+            )
+
+        if self.verbose:
+            print(f"[GenericAdapter] scan_parquet: {parquet_path.name}")
+        return pl.scan_parquet(parquet_path)
