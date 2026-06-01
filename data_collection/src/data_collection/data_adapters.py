@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import hashlib
 import json
 from abc import ABC, abstractmethod
@@ -83,19 +84,56 @@ class DatabentoGenericAdapter(DataAdapter):
         for file in self.cache_dir.glob("*.parquet"):
             file.unlink()
 
-    def _load(self, raw_paths: list[Path]) -> pl.DataFrame:
+    @staticmethod
+    def _decode_one_to_parquet(raw_path: Path, out_path: Path) -> None:
         """
-        Load one or more .dbn.zst files into a single polars DataFrame.
+        Decode a single .dbn.zst file and write it to a parquet at
+        ``out_path``. Kept as a small helper so the pandas frame goes out
+        of scope before the caller moves on to the next file.
+        """
+        data = db.DBNStore.from_file(raw_path)
+        pdf = data.to_df()
+        df = pl.from_pandas(pdf.reset_index())
+        df.write_parquet(out_path)
 
-        Time columns are returned exactly as Databento delivers them -- all
+    def _load(self, raw_paths: list[Path], parquet_path: Path) -> None:
+        """
+        Decode one or more .dbn.zst files and write a single parquet at
+        ``parquet_path``. Streams per file so peak memory is one decoded
+        file's worth, not the full concatenated frame.
+
+        Each raw file is decoded via ``DBNStore.to_df().reset_index()``
+        (matching the historical output schema exactly), converted to
+        polars, and written to a per-file temp parquet next to the
+        destination. The temp parquets are then lazy-concat-sunk into
+        ``parquet_path`` and removed. Temp files are also removed on
+        failure.
+
+        Time columns are written exactly as Databento delivers them -- all
         hours, no timezone conversion, no market-hours filtering.
         """
-        dfs = []
-        for p in raw_paths:
-            data = db.DBNStore.from_file(p)
-            pdf = data.to_df()
-            dfs.append(pl.from_pandas(pdf.reset_index()))
-        return pl.concat(dfs)
+        tmp_paths: list[Path] = []
+        try:
+            for i, p in enumerate(raw_paths):
+                tmp = parquet_path.with_suffix(f".part{i}.parquet")
+                self._decode_one_to_parquet(p, tmp)
+                tmp_paths.append(tmp)
+                # Reclaim the decoded frames before the next file is read.
+                gc.collect()
+
+            if len(tmp_paths) == 1:
+                # Single-file case: rename the temp into place.
+                tmp_paths[0].replace(parquet_path)
+                tmp_paths = []
+            else:
+                lf = pl.concat(
+                    [pl.scan_parquet(tp) for tp in tmp_paths],
+                    how="vertical",
+                )
+                lf.sink_parquet(parquet_path)
+        finally:
+            for tp in tmp_paths:
+                tp.unlink(missing_ok=True)
 
     async def _batch_download(self, tickers: list[str], start_date: str,
                               end_date: str, dataset: str, schema: str,
@@ -204,13 +242,19 @@ class DatabentoGenericAdapter(DataAdapter):
         dataset: str = "XNAS.ITCH",
         schema: str = "ohlcv-1m",
         cache_only: bool = False,
-    ) -> pl.DataFrame:
+        materialize_only: bool = False,
+    ) -> Optional[pl.DataFrame]:
         """
         Fetch data through a three-layer cache.
 
         ``end_date`` is exclusive and defaults to today. Returns a DataFrame
         with time columns exactly as Databento delivers them (all hours, no
         timezone conversion, no market-hours filtering).
+
+        ``materialize_only=True`` skips the final eager ``pl.read_parquet`` --
+        ensures the parquet exists on disk and returns ``None``. Use this when
+        the caller only needs the cache populated and will read it back via
+        ``scan_data`` or ``DBNStore.from_file`` later.
 
         Raises
         ------
@@ -230,16 +274,15 @@ class DatabentoGenericAdapter(DataAdapter):
         if parquet_path.exists():
             if self.verbose:
                 print(f"[GenericAdapter] Parquet cache hit: {parquet_path.name}")
-            return pl.read_parquet(parquet_path)
+            return None if materialize_only else pl.read_parquet(parquet_path)
 
         # Layer 2: raw dbn.zst cache
         raw_paths = self._find_raw_path(cache_key)
         if raw_paths:
             if self.verbose:
                 print(f"[GenericAdapter] Raw DBN cache hit: {len(raw_paths)} file(s)")
-            df = self._load(raw_paths)
-            df.write_parquet(parquet_path)
-            return df
+            self._load(raw_paths, parquet_path)
+            return None if materialize_only else pl.read_parquet(parquet_path)
 
         # Layer 3: Databento batch API
         if cache_only:
@@ -252,9 +295,8 @@ class DatabentoGenericAdapter(DataAdapter):
         raw_paths = await self._batch_download(
             ticker_list, start_date, end_date, dataset, schema, cache_key
         )
-        df = self._load(raw_paths)
-        df.write_parquet(parquet_path)
-        return df
+        self._load(raw_paths, parquet_path)
+        return None if materialize_only else pl.read_parquet(parquet_path)
 
     def scan_data(
         self,
