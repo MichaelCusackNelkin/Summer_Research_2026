@@ -1,4 +1,10 @@
+from pathlib import Path
+from unittest.mock import patch
+
+import pandas as pd
 import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from data_collection.data_adapters import DataAdapter, DatabentoGenericAdapter
@@ -302,3 +308,205 @@ def test_scan_data_quiet_when_not_verbose(tmp_path, capsys):
     )
     out = capsys.readouterr().out
     assert out == ""
+
+
+# ---------------------------------------------------------------------------
+# _decode_one_to_parquet / _load -- streaming decode, schema parity with the
+# legacy ``DBNStore.to_df().reset_index()`` path
+# ---------------------------------------------------------------------------
+
+class _FakeDBNStore:
+    """
+    Minimal stand-in for ``databento.DBNStore`` for decode-path tests.
+
+    Mirrors the parts of the SDK contract that ``_decode_one_to_parquet``
+    depends on:
+
+    - ``to_df()`` returns a single ``pd.DataFrame`` (index is whatever the
+      caller set on the source frames).
+    - ``to_df(count=N)`` returns an iterator yielding ``pd.DataFrame``
+      chunks -- this is the streaming hook the real SDK exposes.
+    - ``to_parquet(path)`` writes the data using the same per-chunk
+      ``pyarrow.parquet.ParquetWriter`` pattern as the real SDK, so we
+      exercise the ``pa.Schema.from_pandas`` index-column promotion that
+      the new decode path has to reorder to match the legacy layout.
+    """
+
+    def __init__(self, frames: list[pd.DataFrame]) -> None:
+        self._frames = frames
+
+    def to_df(self, **kwargs):
+        if kwargs.get("count") is None:
+            return pd.concat(self._frames)
+        return iter(self._frames)
+
+    def to_parquet(self, path, **kwargs):
+        writer = None
+        try:
+            for frame in self.to_df(count=65536):
+                if writer is None:
+                    schema = pa.Schema.from_pandas(frame)
+                    writer = pq.ParquetWriter(str(path), schema=schema)
+                writer.write_table(pa.Table.from_pandas(frame, schema=schema))
+        finally:
+            if writer is not None:
+                writer.close()
+
+
+def _ohlcv_frame_ts_event_index() -> pd.DataFrame:
+    """OHLCV-shaped frame indexed on ``ts_event`` (e.g., ohlcv-1m / ohlcv-1s)."""
+    idx = pd.DatetimeIndex(
+        ["2026-01-01 14:30", "2026-01-01 14:31", "2026-01-01 14:32"],
+        name="ts_event",
+        tz="UTC",
+    )
+    return pd.DataFrame(
+        {
+            "open":   [10.0, 10.1, 10.2],
+            "high":   [10.5, 10.6, 10.7],
+            "low":    [9.9,  10.0, 10.05],
+            "close":  [10.1, 10.2, 10.6],
+            "volume": [1000, 1100, 1200],
+            "symbol": ["AAPL", "AAPL", "AAPL"],
+        },
+        index=idx,
+    )
+
+
+def _tbbo_frame_ts_recv_index() -> pd.DataFrame:
+    """tbbo/mbp-1-shaped frame indexed on ``ts_recv`` with ``ts_event`` as a column."""
+    idx = pd.DatetimeIndex(
+        ["2026-01-01 14:30", "2026-01-01 14:31"],
+        name="ts_recv",
+        tz="UTC",
+    )
+    return pd.DataFrame(
+        {
+            "ts_event": pd.DatetimeIndex(
+                ["2026-01-01 14:30", "2026-01-01 14:31"], tz="UTC"
+            ),
+            "bid_px": [9.99, 10.00],
+            "ask_px": [10.01, 10.02],
+            "symbol": ["AAPL", "AAPL"],
+        },
+        index=idx,
+    )
+
+
+def test_decode_one_to_parquet_matches_legacy_layout_ts_event(tmp_path):
+    """ohlcv schemas index on ts_event -- decoded parquet must put it first."""
+    df = _ohlcv_frame_ts_event_index()
+    store = _FakeDBNStore([df.iloc[:2], df.iloc[2:]])
+
+    raw = tmp_path / "fake.dbn.zst"
+    raw.touch()
+    out = tmp_path / "out.parquet"
+
+    with patch(
+        "data_collection.data_adapters.db.DBNStore.from_file",
+        return_value=store,
+    ):
+        DatabentoGenericAdapter._decode_one_to_parquet(raw, out)
+
+    got = pl.read_parquet(out)
+    expected = pl.from_pandas(df.reset_index())
+
+    assert got.columns == expected.columns
+    assert got.schema == expected.schema
+    assert got.height == expected.height
+    assert got.equals(expected)
+
+
+def test_decode_one_to_parquet_matches_legacy_layout_ts_recv(tmp_path):
+    """tbbo/mbp schemas index on ts_recv -- decoded parquet must put it first."""
+    df = _tbbo_frame_ts_recv_index()
+    store = _FakeDBNStore([df])
+
+    raw = tmp_path / "fake.dbn.zst"
+    raw.touch()
+    out = tmp_path / "out.parquet"
+
+    with patch(
+        "data_collection.data_adapters.db.DBNStore.from_file",
+        return_value=store,
+    ):
+        DatabentoGenericAdapter._decode_one_to_parquet(raw, out)
+
+    got = pl.read_parquet(out)
+    expected = pl.from_pandas(df.reset_index())
+
+    assert got.columns == expected.columns
+    assert got.schema == expected.schema
+    assert got.equals(expected)
+
+
+def test_decode_one_to_parquet_no_staged_file_leftover(tmp_path):
+    """The ``.staged.parquet`` temp must be cleaned up on success."""
+    df = _ohlcv_frame_ts_event_index()
+    store = _FakeDBNStore([df])
+
+    raw = tmp_path / "fake.dbn.zst"
+    raw.touch()
+    out = tmp_path / "out.parquet"
+
+    with patch(
+        "data_collection.data_adapters.db.DBNStore.from_file",
+        return_value=store,
+    ):
+        DatabentoGenericAdapter._decode_one_to_parquet(raw, out)
+
+    assert out.exists()
+    assert not (tmp_path / "out.staged.parquet").exists()
+
+
+def test_decode_one_to_parquet_cleans_staged_on_failure(tmp_path):
+    """A broken store must leave no staged temp behind."""
+
+    class _BrokenStore:
+        def to_parquet(self, path, **kwargs):
+            # Write something, then fail -- prove cleanup runs.
+            Path(path).write_bytes(b"partial")
+            raise RuntimeError("boom")
+
+    raw = tmp_path / "fake.dbn.zst"
+    raw.touch()
+    out = tmp_path / "out.parquet"
+
+    with patch(
+        "data_collection.data_adapters.db.DBNStore.from_file",
+        return_value=_BrokenStore(),
+    ):
+        with pytest.raises(RuntimeError, match="boom"):
+            DatabentoGenericAdapter._decode_one_to_parquet(raw, out)
+
+    assert not out.exists()
+    assert not (tmp_path / "out.staged.parquet").exists()
+
+
+def test_load_concats_multiple_files_in_order(tmp_path):
+    """``_load`` must produce the concat of per-file decodes, in order."""
+    df = _ohlcv_frame_ts_event_index()
+    df_a = df.iloc[:2]
+    df_b = df.iloc[2:]
+    store_a = _FakeDBNStore([df_a])
+    store_b = _FakeDBNStore([df_b])
+
+    raw_a = tmp_path / "a.dbn.zst"; raw_a.touch()
+    raw_b = tmp_path / "b.dbn.zst"; raw_b.touch()
+    out = tmp_path / "out.parquet"
+    adapter = DatabentoGenericAdapter("k", tmp_path / "cache", verbose=False)
+
+    def from_file(p):
+        return store_a if Path(p).name == "a.dbn.zst" else store_b
+
+    with patch(
+        "data_collection.data_adapters.db.DBNStore.from_file",
+        side_effect=from_file,
+    ):
+        adapter._load([raw_a, raw_b], out)
+
+    got = pl.read_parquet(out)
+    expected = pl.from_pandas(df.reset_index())
+    assert got.equals(expected)
+    # No temp parts left behind.
+    assert sorted(p.name for p in tmp_path.glob("out.*")) == ["out.parquet"]

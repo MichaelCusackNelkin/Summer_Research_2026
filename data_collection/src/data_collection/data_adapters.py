@@ -88,26 +88,62 @@ class DatabentoGenericAdapter(DataAdapter):
     def _decode_one_to_parquet(raw_path: Path, out_path: Path) -> None:
         """
         Decode a single .dbn.zst file and write it to a parquet at
-        ``out_path``. Kept as a small helper so the pandas frame goes out
-        of scope before the caller moves on to the next file.
+        ``out_path``.
+
+        Streams through ``DBNStore.to_parquet`` so peak memory is one
+        ``PARQUET_CHUNK_SIZE`` chunk (65,536 records as of databento
+        0.78), not the whole decoded file. Internally the SDK pulls a
+        ``DataFrameIterator`` from ``to_df(count=PARQUET_CHUNK_SIZE)``
+        and writes each chunk through a ``pyarrow.parquet.ParquetWriter``.
+
+        Schema parity with the previous ``to_df().reset_index()`` path:
+
+        - ``price_type="float"``, ``pretty_ts=True``, ``map_symbols=True``
+          all match the ``to_df`` defaults that the old path used. Prices
+          are floats (dollars). Timestamps are tz-aware UTC nanoseconds.
+        - ``to_df`` puts ``ts_recv`` (else ``ts_event``) on the index;
+          ``reset_index()`` moves it to the *first* column. ``to_parquet``
+          via ``pa.Schema.from_pandas`` instead writes the index column
+          *last*. To preserve the historical column order we re-sink the
+          parquet with the index column moved to the front. The re-sink is
+          a streaming lazy scan, so memory stays bounded.
         """
-        data = db.DBNStore.from_file(raw_path)
-        pdf = data.to_df()
-        df = pl.from_pandas(pdf.reset_index())
-        df.write_parquet(out_path)
+        staged = out_path.with_suffix(".staged.parquet")
+        try:
+            data = db.DBNStore.from_file(raw_path)
+            data.to_parquet(staged)
+
+            cols = pl.scan_parquet(staged).collect_schema().names()
+            # `to_df` indexes on ts_recv when present, otherwise ts_event.
+            if "ts_recv" in cols:
+                index_col = "ts_recv"
+            elif "ts_event" in cols:
+                index_col = "ts_event"
+            else:
+                index_col = None
+
+            if index_col is not None and cols[0] != index_col:
+                reordered = [index_col] + [c for c in cols if c != index_col]
+                pl.scan_parquet(staged).select(reordered).sink_parquet(out_path)
+                staged.unlink(missing_ok=True)
+            else:
+                staged.replace(out_path)
+        except BaseException:
+            staged.unlink(missing_ok=True)
+            raise
 
     def _load(self, raw_paths: list[Path], parquet_path: Path) -> None:
         """
         Decode one or more .dbn.zst files and write a single parquet at
-        ``parquet_path``. Streams per file so peak memory is one decoded
-        file's worth, not the full concatenated frame.
+        ``parquet_path``.
 
-        Each raw file is decoded via ``DBNStore.to_df().reset_index()``
-        (matching the historical output schema exactly), converted to
-        polars, and written to a per-file temp parquet next to the
-        destination. The temp parquets are then lazy-concat-sunk into
-        ``parquet_path`` and removed. Temp files are also removed on
-        failure.
+        Each raw file is streamed through ``_decode_one_to_parquet``
+        (``DBNStore.to_parquet`` under the hood), which writes one chunk
+        at a time so peak memory is one decoded chunk -- not one whole
+        file and not the full concatenated frame. Per-file temp parquets
+        live next to the destination and are then lazy-concat-sunk into
+        ``parquet_path`` (also chunked). Temp files are removed on
+        success and on failure.
 
         Time columns are written exactly as Databento delivers them -- all
         hours, no timezone conversion, no market-hours filtering.
@@ -149,7 +185,7 @@ class DatabentoGenericAdapter(DataAdapter):
             job_marker = self.raw_data_dir / f"{cache_key}.job"
             pbar = tqdm(
                 total=3,
-                desc=f"Batch {schema} {','.join(tickers)}",
+                desc=f"Batch {schema}",
                 unit="step",
                 disable=not self.verbose,
             )
