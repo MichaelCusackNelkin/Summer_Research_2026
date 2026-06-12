@@ -11,14 +11,16 @@ pl.enable_string_cache()
 CACHE_DIR = Path.cwd().resolve() / "data" / "dbn_cache" / "generic"
 adapter = DatabentoGenericAdapter(os.getenv("DATABENTO_API_KEY"), CACHE_DIR)
 
+print(CACHE_DIR)
+
 # Clear the cache if needed
-# adapter.clear_cache()
+adapter.clear_cache()
 
 # Reading universe.txt file
 with open("universe.txt", "r") as f:
     UNIVERSE = [line.strip() for line in f]
-START = "2025-06-02"
-END = "2026-06-02"
+START = "2025-06-11"
+END = "2026-06-11"
 DATASET = "XNAS.ITCH"
 
 async def main():

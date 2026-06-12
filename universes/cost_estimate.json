@@ -1,0 +1,560 @@
+{
+  "by_schema": {
+    "imbalance": {
+      "requests": 20,
+      "cost_usd": 1043.0742139816298
+    },
+    "statistics": {
+      "requests": 20,
+      "cost_usd": 0.0
+    },
+    "tbbo": {
+      "requests": 20,
+      "cost_usd": 2302.925158292055
+    }
+  },
+  "total_usd": 3345.999372273685,
+  "n_requests": 60,
+  "per_request": [
+    {
+      "i": 0,
+      "schema": "imbalance",
+      "rebalance_date": "2025-01-01",
+      "n_tickers": 2000,
+      "start": "2024-01-01",
+      "end": "2025-04-01",
+      "cost_usd": 515.620069026947
+    },
+    {
+      "i": 1,
+      "schema": "statistics",
+      "rebalance_date": "2025-01-01",
+      "n_tickers": 2000,
+      "start": "2024-01-01",
+      "end": "2025-04-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 2,
+      "schema": "tbbo",
+      "rebalance_date": "2025-01-01",
+      "n_tickers": 2000,
+      "start": "2024-01-01",
+      "end": "2025-04-01",
+      "cost_usd": 1851.76327496767
+    },
+    {
+      "i": 3,
+      "schema": "imbalance",
+      "rebalance_date": "2025-04-01",
+      "n_tickers": 70,
+      "start": "2024-04-01",
+      "end": "2025-07-01",
+      "cost_usd": 18.086974382401
+    },
+    {
+      "i": 4,
+      "schema": "imbalance",
+      "rebalance_date": "2025-04-01",
+      "n_tickers": 1930,
+      "start": "2025-04-01",
+      "end": "2025-07-01",
+      "cost_usd": 98.25417137146
+    },
+    {
+      "i": 5,
+      "schema": "statistics",
+      "rebalance_date": "2025-04-01",
+      "n_tickers": 70,
+      "start": "2024-04-01",
+      "end": "2025-07-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 6,
+      "schema": "statistics",
+      "rebalance_date": "2025-04-01",
+      "n_tickers": 1930,
+      "start": "2025-04-01",
+      "end": "2025-07-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 7,
+      "schema": "tbbo",
+      "rebalance_date": "2025-04-01",
+      "n_tickers": 70,
+      "start": "2024-04-01",
+      "end": "2025-07-01",
+      "cost_usd": 30.409902781248
+    },
+    {
+      "i": 8,
+      "schema": "tbbo",
+      "rebalance_date": "2025-04-01",
+      "n_tickers": 1930,
+      "start": "2025-04-01",
+      "end": "2025-07-01",
+      "cost_usd": 355.520856231451
+    },
+    {
+      "i": 9,
+      "schema": "imbalance",
+      "rebalance_date": "2025-07-01",
+      "n_tickers": 70,
+      "start": "2024-07-01",
+      "end": "2025-10-01",
+      "cost_usd": 18.446325063705
+    },
+    {
+      "i": 10,
+      "schema": "imbalance",
+      "rebalance_date": "2025-07-01",
+      "n_tickers": 2,
+      "start": "2025-04-01",
+      "end": "2025-10-01",
+      "cost_usd": 0.20974111557
+    },
+    {
+      "i": 11,
+      "schema": "imbalance",
+      "rebalance_date": "2025-07-01",
+      "n_tickers": 1928,
+      "start": "2025-07-01",
+      "end": "2025-10-01",
+      "cost_usd": 101.269806146622
+    },
+    {
+      "i": 12,
+      "schema": "statistics",
+      "rebalance_date": "2025-07-01",
+      "n_tickers": 70,
+      "start": "2024-07-01",
+      "end": "2025-10-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 13,
+      "schema": "statistics",
+      "rebalance_date": "2025-07-01",
+      "n_tickers": 2,
+      "start": "2025-04-01",
+      "end": "2025-10-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 14,
+      "schema": "statistics",
+      "rebalance_date": "2025-07-01",
+      "n_tickers": 1928,
+      "start": "2025-07-01",
+      "end": "2025-10-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 15,
+      "schema": "tbbo",
+      "rebalance_date": "2025-07-01",
+      "n_tickers": 70,
+      "start": "2024-07-01",
+      "end": "2025-10-01",
+      "cost_usd": 34.976226389408
+    },
+    {
+      "i": 16,
+      "schema": "tbbo",
+      "rebalance_date": "2025-07-01",
+      "n_tickers": 2,
+      "start": "2025-04-01",
+      "end": "2025-10-01",
+      "cost_usd": 0.091746300459
+    },
+    {
+      "i": 17,
+      "schema": "tbbo",
+      "rebalance_date": "2025-07-01",
+      "n_tickers": 1928,
+      "start": "2025-07-01",
+      "end": "2025-10-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 18,
+      "schema": "imbalance",
+      "rebalance_date": "2025-10-01",
+      "n_tickers": 53,
+      "start": "2024-10-01",
+      "end": "2026-01-01",
+      "cost_usd": 13.998593091965
+    },
+    {
+      "i": 19,
+      "schema": "imbalance",
+      "rebalance_date": "2025-10-01",
+      "n_tickers": 3,
+      "start": "2025-04-01",
+      "end": "2026-01-01",
+      "cost_usd": 0.484535455704
+    },
+    {
+      "i": 20,
+      "schema": "imbalance",
+      "rebalance_date": "2025-10-01",
+      "n_tickers": 7,
+      "start": "2025-07-01",
+      "end": "2026-01-01",
+      "cost_usd": 0.728010654449
+    },
+    {
+      "i": 21,
+      "schema": "imbalance",
+      "rebalance_date": "2025-10-01",
+      "n_tickers": 1937,
+      "start": "2025-10-01",
+      "end": "2026-01-01",
+      "cost_usd": 101.982858181
+    },
+    {
+      "i": 22,
+      "schema": "statistics",
+      "rebalance_date": "2025-10-01",
+      "n_tickers": 53,
+      "start": "2024-10-01",
+      "end": "2026-01-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 23,
+      "schema": "statistics",
+      "rebalance_date": "2025-10-01",
+      "n_tickers": 3,
+      "start": "2025-04-01",
+      "end": "2026-01-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 24,
+      "schema": "statistics",
+      "rebalance_date": "2025-10-01",
+      "n_tickers": 7,
+      "start": "2025-07-01",
+      "end": "2026-01-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 25,
+      "schema": "statistics",
+      "rebalance_date": "2025-10-01",
+      "n_tickers": 1937,
+      "start": "2025-10-01",
+      "end": "2026-01-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 26,
+      "schema": "tbbo",
+      "rebalance_date": "2025-10-01",
+      "n_tickers": 53,
+      "start": "2024-10-01",
+      "end": "2026-01-01",
+      "cost_usd": 16.72953531146
+    },
+    {
+      "i": 27,
+      "schema": "tbbo",
+      "rebalance_date": "2025-10-01",
+      "n_tickers": 3,
+      "start": "2025-04-01",
+      "end": "2026-01-01",
+      "cost_usd": 0.142676532269
+    },
+    {
+      "i": 28,
+      "schema": "tbbo",
+      "rebalance_date": "2025-10-01",
+      "n_tickers": 7,
+      "start": "2025-07-01",
+      "end": "2026-01-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 29,
+      "schema": "tbbo",
+      "rebalance_date": "2025-10-01",
+      "n_tickers": 1937,
+      "start": "2025-10-01",
+      "end": "2026-01-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 30,
+      "schema": "imbalance",
+      "rebalance_date": "2026-01-01",
+      "n_tickers": 66,
+      "start": "2025-01-01",
+      "end": "2026-04-01",
+      "cost_usd": 17.118048667908
+    },
+    {
+      "i": 31,
+      "schema": "imbalance",
+      "rebalance_date": "2026-01-01",
+      "n_tickers": 1,
+      "start": "2025-04-01",
+      "end": "2026-04-01",
+      "cost_usd": 0.224983453751
+    },
+    {
+      "i": 32,
+      "schema": "imbalance",
+      "rebalance_date": "2026-01-01",
+      "n_tickers": 2,
+      "start": "2025-07-01",
+      "end": "2026-04-01",
+      "cost_usd": 0.295655965805
+    },
+    {
+      "i": 33,
+      "schema": "imbalance",
+      "rebalance_date": "2026-01-01",
+      "n_tickers": 2,
+      "start": "2025-10-01",
+      "end": "2026-04-01",
+      "cost_usd": 0.180247783661
+    },
+    {
+      "i": 34,
+      "schema": "imbalance",
+      "rebalance_date": "2026-01-01",
+      "n_tickers": 1929,
+      "start": "2026-01-01",
+      "end": "2026-04-01",
+      "cost_usd": 96.58867931366
+    },
+    {
+      "i": 35,
+      "schema": "statistics",
+      "rebalance_date": "2026-01-01",
+      "n_tickers": 66,
+      "start": "2025-01-01",
+      "end": "2026-04-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 36,
+      "schema": "statistics",
+      "rebalance_date": "2026-01-01",
+      "n_tickers": 1,
+      "start": "2025-04-01",
+      "end": "2026-04-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 37,
+      "schema": "statistics",
+      "rebalance_date": "2026-01-01",
+      "n_tickers": 2,
+      "start": "2025-07-01",
+      "end": "2026-04-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 38,
+      "schema": "statistics",
+      "rebalance_date": "2026-01-01",
+      "n_tickers": 2,
+      "start": "2025-10-01",
+      "end": "2026-04-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 39,
+      "schema": "statistics",
+      "rebalance_date": "2026-01-01",
+      "n_tickers": 1929,
+      "start": "2026-01-01",
+      "end": "2026-04-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 40,
+      "schema": "tbbo",
+      "rebalance_date": "2026-01-01",
+      "n_tickers": 66,
+      "start": "2025-01-01",
+      "end": "2026-04-01",
+      "cost_usd": 8.965979218483
+    },
+    {
+      "i": 41,
+      "schema": "tbbo",
+      "rebalance_date": "2026-01-01",
+      "n_tickers": 1,
+      "start": "2025-04-01",
+      "end": "2026-04-01",
+      "cost_usd": 0.079728215933
+    },
+    {
+      "i": 42,
+      "schema": "tbbo",
+      "rebalance_date": "2026-01-01",
+      "n_tickers": 2,
+      "start": "2025-07-01",
+      "end": "2026-04-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 43,
+      "schema": "tbbo",
+      "rebalance_date": "2026-01-01",
+      "n_tickers": 2,
+      "start": "2025-10-01",
+      "end": "2026-04-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 44,
+      "schema": "tbbo",
+      "rebalance_date": "2026-01-01",
+      "n_tickers": 1929,
+      "start": "2026-01-01",
+      "end": "2026-04-01",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 45,
+      "schema": "imbalance",
+      "rebalance_date": "2026-04-01",
+      "n_tickers": 64,
+      "start": "2025-04-01",
+      "end": "2026-06-11",
+      "cost_usd": 15.096518754959
+    },
+    {
+      "i": 46,
+      "schema": "imbalance",
+      "rebalance_date": "2026-04-01",
+      "n_tickers": 6,
+      "start": "2025-07-01",
+      "end": "2026-06-11",
+      "cost_usd": 1.100293874741
+    },
+    {
+      "i": 47,
+      "schema": "imbalance",
+      "rebalance_date": "2026-04-01",
+      "n_tickers": 2,
+      "start": "2025-10-01",
+      "end": "2026-06-11",
+      "cost_usd": 0.253992795944
+    },
+    {
+      "i": 48,
+      "schema": "imbalance",
+      "rebalance_date": "2026-04-01",
+      "n_tickers": 4,
+      "start": "2026-01-01",
+      "end": "2026-06-11",
+      "cost_usd": 0.288499593735
+    },
+    {
+      "i": 49,
+      "schema": "imbalance",
+      "rebalance_date": "2026-04-01",
+      "n_tickers": 1924,
+      "start": "2026-04-01",
+      "end": "2026-06-11",
+      "cost_usd": 42.846209287643
+    },
+    {
+      "i": 50,
+      "schema": "statistics",
+      "rebalance_date": "2026-04-01",
+      "n_tickers": 64,
+      "start": "2025-04-01",
+      "end": "2026-06-11",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 51,
+      "schema": "statistics",
+      "rebalance_date": "2026-04-01",
+      "n_tickers": 6,
+      "start": "2025-07-01",
+      "end": "2026-06-11",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 52,
+      "schema": "statistics",
+      "rebalance_date": "2026-04-01",
+      "n_tickers": 2,
+      "start": "2025-10-01",
+      "end": "2026-06-11",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 53,
+      "schema": "statistics",
+      "rebalance_date": "2026-04-01",
+      "n_tickers": 4,
+      "start": "2026-01-01",
+      "end": "2026-06-11",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 54,
+      "schema": "statistics",
+      "rebalance_date": "2026-04-01",
+      "n_tickers": 1924,
+      "start": "2026-04-01",
+      "end": "2026-06-11",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 55,
+      "schema": "tbbo",
+      "rebalance_date": "2026-04-01",
+      "n_tickers": 64,
+      "start": "2025-04-01",
+      "end": "2026-06-11",
+      "cost_usd": 4.245232343674
+    },
+    {
+      "i": 56,
+      "schema": "tbbo",
+      "rebalance_date": "2026-04-01",
+      "n_tickers": 6,
+      "start": "2025-07-01",
+      "end": "2026-06-11",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 57,
+      "schema": "tbbo",
+      "rebalance_date": "2026-04-01",
+      "n_tickers": 2,
+      "start": "2025-10-01",
+      "end": "2026-06-11",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 58,
+      "schema": "tbbo",
+      "rebalance_date": "2026-04-01",
+      "n_tickers": 4,
+      "start": "2026-01-01",
+      "end": "2026-06-11",
+      "cost_usd": 0.0
+    },
+    {
+      "i": 59,
+      "schema": "tbbo",
+      "rebalance_date": "2026-04-01",
+      "n_tickers": 1924,
+      "start": "2026-04-01",
+      "end": "2026-06-11",
+      "cost_usd": 0.0
+    }
+  ]
+}
