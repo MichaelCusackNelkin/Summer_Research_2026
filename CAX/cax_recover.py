@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pandas as pd
 
-import CAX  # same directory; reuses its fetch primitives + window/paths
+import CAX.CAX as CAX  # same directory; reuses its fetch primitives + window/paths
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FAILED_LIST = SCRIPT_DIR / "recovery_failed.txt"
