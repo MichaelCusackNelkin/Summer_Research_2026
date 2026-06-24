@@ -11,3 +11,5 @@ dotenv
 jupyter
 ipykernel
 quarto
+arch
+shap

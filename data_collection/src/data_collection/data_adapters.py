@@ -379,4 +379,4 @@ class DatabentoGenericAdapter(DataAdapter):
 
         if self.verbose:
             print(f"[GenericAdapter] scan_parquet: {parquet_path.name}")
-        return pl.scan_parquet(parquet_path)
+        return pl.scan_parquet(parquet_path, low_memory=True)
