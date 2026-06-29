@@ -15,7 +15,7 @@ START = "2025-01-01"
 END = "2025-06-10"
 DATASET = "XNAS.ITCH"
 
-K = 50
+K = 100
 
 
 # Imbalance
@@ -43,5 +43,9 @@ top_k = (
     .collect()
 )
 top_k = top_k["by"].to_list()
-with open(f"top_{K}_universe.txt", "x") as f:
-    f.write("\n".join(top_k))
+if Path.exists(f"top_{K}_universe.txt"):
+    with open(f"top_{K}_universe.txt", "w") as f:
+        f.write("\n".join(top_k))
+else:
+    with open(f"top_{K}_universe.txt", "x") as f:
+        f.write("\n".join(top_k))
