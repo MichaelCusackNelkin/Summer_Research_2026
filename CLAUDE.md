@@ -9,11 +9,20 @@ backtest from three estimated pieces — a return **forecast**, a **covariance**
 **spread costs** — solved as a portfolio optimization and backtested on a **point-in-time
 (PIT) universe**. The original close-auction imbalance homework is the alpha seed.
 
-**The active work on this branch (`covariance-estimation`) is the covariance matrix.** The
-goal is a well-conditioned, factor-structured covariance estimate fit on corporate-action–
-adjusted daily returns. Everything below is organized around that: the `covariance_research/`
-notebook is the live surface, and the `CAX/` corporate-actions downloader exists to feed it
-clean (split/dividend-adjusted) prices.
+**All three pieces are now live, each in its own top-level directory** — `forecast/`,
+`covariance/`, and `optimizer/` — and the active branch is `attempt-to-forecast`. The three
+notebooks form a pipeline: `covariance/` fits the risk model and `forecast/` fits the alpha
+model, each **persisting artifacts to disk**; `optimizer/optimal_portfolio.ipynb` loads both
+and runs the daily MVO backtest. The `CAX/` corporate-actions downloader feeds the covariance
+side clean (split/dividend-adjusted) prices. The `README.md` "Notes / Research Direction" list
+is the current open-problem backlog (condition number, GARCH idiosyncratic vol, richer
+forecast features, lambda sweeps, intraday/multi-period variants).
+
+**Two deliberately disjoint date windows** run through the pipeline (see commit "none-
+overlapping train sets"): the covariance is fit on **2023-06-01 .. 2025-06-01** daily bars,
+while the forecast and optimizer operate on the **later, non-overlapping 2025-06-11 ..
+2026-06-11** window. Keep them separate when editing — the covariance is a train-period risk
+model consumed out-of-sample by the optimizer.
 
 > History: the repo began as two parallel projects (an execution project under
 > `research-alpha/`/`sim_lib/`, plus this alpha direction). The execution code and the
@@ -22,45 +31,61 @@ clean (split/dividend-adjusted) prices.
 > `sim_lib` as an editable install pointing at a missing directory; do not import or
 > reinstall it.
 >
-> This branch also **retired the PIT-download orchestrator** (`build_universes.py`), its
-> outputs (`universes/`), the deferred security-master plan (`docs/`), and the
-> `universe_selection` notebook. `data_collection/src/data_collection/universe_pipeline.py`
-> and its test file survive but are now **orphaned/legacy** — nothing imports the pipeline
-> anymore. Treat it as reference, not active code; don't build new work on it without asking.
+> Earlier cleanup also **retired the PIT-download orchestrator** (`build_universes.py`), its
+> outputs (`universes/`), the deferred security-master plan (`docs/`), and the old
+> `universe_selection` notebook (a lightweight `universe_selection.py` script replaced it —
+> see below). `data_collection/src/data_collection/universe_pipeline.py` and its test file
+> survive but are now **orphaned/legacy** — nothing imports the pipeline anymore. Treat it as
+> reference, not active code; don't build new work on it without asking. The old
+> `alpha_research/`/`optimization_research/` empty placeholders and the `covariance_research/`
+> directory (renamed to `covariance/`) are also gone.
 
 ## Repository layout
 
-- `covariance_research/` — **the active surface.** `covariance.ipynb` builds the covariance
-  estimate; `covariance.py` is an earlier scratch script (exploratory, not wired in, and
-  contains stale column references like `price`/`date` — prefer the notebook).
+- `covariance/` — the risk-model surface. `covariance.ipynb` builds the factor covariance and
+  **saves its artifacts here** as `.npy` (`loadings.npy`, `factor_returns.npy`,
+  `factor_cov_matrix.npy`, `idiosyncratic_diag_vec.npy`, `cov_matrix.npy`). `covariance.py`
+  is an earlier scratch script (exploratory, not wired in, and contains stale column
+  references like `price`/`date` — prefer the notebook).
+- `forecast/` — the alpha-model surface. `forecasting.ipynb` builds and cross-validates the
+  return forecast and **persists** the fitted sklearn pipeline to `ridge_pipe.joblib`.
+- `optimizer/` — `optimal_portfolio.ipynb`, the daily MVO backtest that **loads** the
+  forecast (`../forecast/ridge_pipe.joblib`) and risk model (`../covariance/*.npy`) and solves
+  a parametrized QP per day. (Moved here out of the old `notebook_studies/`.)
 - `CAX/` — corporate-actions download + recovery (splits & dividends from **yfinance**),
   the input to the covariance adjustment. See the architecture note below. Outputs
   `corporate_actions.csv` and `missing_corporate_actions.txt` next to the scripts.
 - `data_collection/` — the only installable package (`data-collection`, installed editable
   into `.venv`). Core infrastructure everything else builds on:
   - `src/data_collection/data_adapters.py` — the Databento-backed three-layer cached
-    adapter (`DatabentoGenericAdapter`). **Still central** — the covariance notebook pulls
-    daily bars through it. Has tests.
+    adapter (`DatabentoGenericAdapter`). **Still central** — every notebook pulls bars
+    through it. Has tests.
   - `src/data_collection/universe_pipeline.py` — pure PIT universe-selection logic.
     **Legacy/orphaned** (see history note); still has a passing test file.
+- `universe_selection.py` (repo root) — small script that picks the top-`K` names by average
+  daily dollar volume (`close*volume`) from an `ALL_SYMBOLS` daily-bar scan and writes
+  `top_{K}_universe.txt`. Run from the repo root. (Note: the `Path.exists`/`top_k["by"]` calls
+  are brittle — treat as a helper, verify output.)
+- `top_50_universe.txt`, `top_100_universe.txt`, `top_250_universe.txt`, `top_500_universe.txt`
+  — tiered ADV-ranked universes produced by `universe_selection.py`. **`top_250_universe.txt`
+  is the active universe** all three pipeline notebooks currently read.
+- `universe.txt` — flat newline-delimited ticker list (~2000 names) used by `data.py`, `CAX/`,
+  and as the broad pool. Uses Bloomberg/CRSP-style class delimiters (e.g. `BRK.B`).
 - `data.py` (repo root) — small scratch script: materialize-only fetch of
   `imbalance`/`tbbo`/`statistics` for the flat `universe.txt` ticker list over a fixed
   window. (Calls `adapter.clear_cache()` on every run.)
-- `universe.txt` — flat newline-delimited ticker list (~2000 names) used by `data.py`,
-  `CAX/`, and the notebooks. Uses Bloomberg/CRSP-style class delimiters (e.g. `BRK.B`).
-- `notebook_studies/` — the broader research surface (all notebooks, no `.py`):
-  `optimal_portfolio` (the backtest that consumes the covariance), `alpha_forecast_study`,
+- `notebook_studies/` — older research scratch (all notebooks, no `.py`): `alpha_forecast_study`,
   `rules_based_backtest`, `closing_imbalance_homework` (the original NYSE-IBF homework), and
-  `test` scratch.
-- `alpha_research/`, `optimization_research/` — currently empty placeholders.
+  `test`. Superseded by `forecast/`/`optimizer/` for the live pipeline, kept for reference.
 - `data/dbn_cache/generic/` — parquet + raw `.dbn.zst` adapter cache (gitignored: `**/data`).
 
 Notebooks and scripts import the package as a top-level name
 (`from data_collection.data_adapters import ...`) — there is no `PYTHONPATH` shim, it relies
-on the editable install. **Working-directory matters** (paths are relative):
-`covariance.ipynb`/`covariance.py` run from `covariance_research/` (they read
-`../CAX/corporate_actions.csv` / `../../../universe.txt`); `CAX/CAX.py` and `data.py` run
-from the repo root.
+on the editable install. **Working-directory matters** (paths are relative): each pipeline
+notebook runs from its own directory and reaches up with `../` — e.g. `covariance.ipynb` reads
+`../CAX/corporate_actions.csv` and `../top_250_universe.txt`; the optimizer reads
+`../forecast/ridge_pipe.joblib` and `../covariance/*.npy`. `CAX/CAX.py`, `data.py`, and
+`universe_selection.py` run from the repo root.
 
 ## Common commands
 
@@ -82,6 +107,8 @@ Use the project venv explicitly — there is no `activate` step. Python is 3.14.
 - **Single test:**
   `.venv/bin/python -m pytest data_collection/tests/test_universe_pipeline.py::test_select_universe_top_n`
 - **Materialize raw schema parquets** for `universe.txt`: `.venv/bin/python data.py`.
+- **Rebuild a tiered universe** (ADV top-`K` → `top_{K}_universe.txt`; edit `K`/window in the
+  file): `.venv/bin/python universe_selection.py`.
 - Re-install after editing `data_collection/pyproject.toml`:
   `.venv/bin/pip install -e ./data_collection`.
 - Jupyter: `.venv/bin/jupyter lab` (or run notebooks through the venv `ipykernel`).
@@ -92,31 +119,63 @@ authoritative dependency set for the installed package.
 ## Required environment
 
 The adapter, `CAX`, and `data.py` read `DATABENTO_API_KEY` (yfinance in `CAX/` needs no key).
-Note the **inconsistency**: notebooks and `covariance_research/covariance.py` reference the
-hyphenated `DATABENTO-API-KEY`, while the `.env` standard and the adapter's `_resolve_api_key`
-use the underscore `DATABENTO_API_KEY` (`_resolve_api_key` accepts either). Prefer the
-underscore form. Loaded via `python-dotenv` from `./.env`. The cache root the tools expect is
-`<repo_root>/data/dbn_cache/generic/`.
+Note the **inconsistency**: the pipeline notebooks and `universe_selection.py` reference the
+hyphenated `DATABENTO-API-KEY` (via `os.getenv("DATABENTO-API-KEY")`), while the `.env`
+standard and the adapter's `_resolve_api_key` use the underscore `DATABENTO_API_KEY`
+(`_resolve_api_key` accepts either). Prefer the underscore form. Loaded via `python-dotenv`
+from `./.env`. The cache root the tools expect is `<repo_root>/data/dbn_cache/generic/`.
 
 ## Architecture notes that span multiple files
 
-### Covariance estimation pipeline (`covariance_research/covariance.ipynb`)
+The pipeline is three notebooks that hand artifacts to each other on disk. The forecast
+and optimizer share the same data-loading preamble (imbalance/tbbo/statistics over the
+2025-06-11 .. 2026-06-11 window, `top_250_universe.txt`); the covariance runs on its own
+earlier daily-bar window.
 
-The active build, end to end inside the notebook:
+### Covariance / risk model (`covariance/covariance.ipynb`)
 
-1. Pull daily bars (`ohlcv-1d`, `XNAS.ITCH`) for `universe.txt` through the adapter's
-   `scan_data` (lazy Polars).
+End to end inside the notebook, producing a **factor covariance** `Σ_r = Lᵀ Σ_f L + D`:
+
+1. Pull daily bars (`ohlcv-1d`, `XNAS.ITCH`, `2023-06-01 .. 2025-06-01`) for the universe
+   through the adapter's `scan_data` (lazy Polars).
 2. Load `../CAX/corporate_actions.csv`, fold splits/dividends into a per-symbol cumulative
    **adjustment factor**, join it onto `close`, and form `adj_close`.
 3. Compute daily returns off `adj_close`, then **EWMA-vol-standardize** them (causal: the
    vol estimate is shifted so it uses only past info) to get unit-ish-variance residuals.
-4. Estimate covariance with a **factor structure**: SVD/PCA on the standardized return
-   matrix, keep the top-`k` factors (`k≈10`), reconstruct `best_k_cov = Vᵀ S² V`, and sanity-
-   check **condition number** and **PSD** (`eigvalsh ≥ -1e-8`).
+4. **SVD/PCA** on the standardized return matrix, keep the top-`k` factors (`k≈10`) to get
+   loadings `L` and factor returns `F`; form the factor covariance `Σ_f` and an
+   **idiosyncratic diagonal** `D` from the residual (per-name) variance, so the reconstruction
+   `Lᵀ Σ_f L + D` is full-rank/PSD. Sanity-check **condition number** and PSD
+   (`eigvalsh ≥ -1e-8`).
+5. **Persist** `loadings.npy`, `factor_returns.npy`, `factor_cov_matrix.npy`,
+   `idiosyncratic_diag_vec.npy`, and the assembled `cov_matrix.npy` — the optimizer reads
+   these directly.
 
-When extending this, the open problems from `README.md` are the guide: covariance needs more
-daily data and a real factor structure (plus a market-neutrality constraint in the optimizer
-downstream).
+Open problems (from `README.md`): condition number is still ~11,000 (want ≈10); the
+idiosyncratic term should become **time-varying via GARCH(1,1)** (there is a stub markdown
+section for this), and the optimizer wants a **market-neutrality constraint** downstream.
+
+### Return forecast (`forecast/forecasting.ipynb`)
+
+Forecasts the **15:50–16:00 return** (the close-auction window) from close-imbalance features.
+Pulls `imbalance`, `tbbo`, and `statistics` schemas over the 2025-06-11 .. 2026-06-11 window,
+engineers cross-sectional imbalance features (e.g. rank / pct-of-total net imbalance), and
+runs an **IC study** with a `TimeSeriesSplit` (non-overlapping train sets) before fitting a
+linear model (`Ridge`/`Lasso` compared; **Ridge** is the chosen one). The fitted sklearn
+`Pipeline` (scaler + Ridge) is saved to `ridge_pipe.joblib`. Later cells explore **regime
+detection** — regressing daily IC on day-level features like an absorption ratio — to find
+when the imbalance signal flips between momentum and reversion.
+
+### Daily MVO backtest (`optimizer/optimal_portfolio.ipynb`)
+
+Loads `../forecast/ridge_pipe.joblib` (alpha) and `../covariance/*.npy` (risk), then solves a
+**per-day mean–variance QP with cvxpy** over the active set. Days are independent (the book is
+flat at every close), so it **fans the days across processes**, compiling the parametrized QP
+**once** per worker and re-solving with each day's alpha/costs plugged into `cp.Parameter`s.
+Positions are **absolute-dollar** weights (`{date: {symbol: $}}`), not fractions. Downstream
+cells do PnL accounting (dollar positions · returns-to-close, net of a spread-cost model),
+diagnostics (Sharpe, GMV vs cumulative PnL), and **1-D parameter sweeps** (e.g. GMV vs the
+risk-aversion `lambda`) that reuse the already-built per-day QP records.
 
 ### Corporate actions (`CAX/`) — input to the adjustment
 
