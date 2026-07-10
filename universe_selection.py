@@ -15,7 +15,7 @@ START = "2025-01-01"
 END = "2025-06-10"
 DATASET = "XNAS.ITCH"
 
-K = 100
+K = 500
 
 
 # Imbalance
@@ -29,6 +29,35 @@ day_bars = (
     )
 )
 
+defs = (
+    adapter.scan_data(
+        tickers="ALL_SYMBOLS",
+        start_date=START,
+        end_date=END,
+        dataset=DATASET,
+        schema="definition"
+    )
+)
+
+nasdaq_stocks = (
+    defs
+    .group_by("symbol")
+    .agg(
+        pl.col("security_type").last().alias("sec_type"),
+        (pl.col("exchange") == "XNAS").all().alias("xnas_full_window"),
+        pl.col("exchange").n_unique().alias("n_exch"),
+    )
+    .filter(
+        (pl.col("sec_type") == "C") & pl.col("xnas_full_window"),
+        ~pl.col("symbol").str.contains(r"ZZT$|^Z[A-Z]YZ|^ZBZX|^ZSPC|^ZWZ")
+    )
+    .select("symbol")
+    .sort("symbol")
+    .collect(engine="streaming")
+    .to_series()
+    .to_list()
+)
+
 top_k = (
     day_bars
     .select(["ts_event", "symbol", "close", "volume"])
@@ -38,11 +67,15 @@ top_k = (
     .agg(
         (pl.col("close")*pl.col("volume")).mean().alias("ADV")
     )
+    .rename({"by":"symbol"})
+    .filter(pl.col("symbol").is_in(nasdaq_stocks))
     .top_k(K, by="ADV")
-    .select("by")
-    .collect()
+    .select("symbol")
+    .collect(engine="streaming")
+    .to_series()
+    .to_list()
 )
-top_k = top_k["by"].to_list()
+
 if Path.exists(f"top_{K}_universe.txt"):
     with open(f"top_{K}_universe.txt", "w") as f:
         f.write("\n".join(top_k))
