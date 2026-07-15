@@ -40,13 +40,11 @@ try:
         IB, Stock, MarketOrder, LimitOrder, StopOrder,
         Order, Contract, Trade, util,
     )
-    from ib_async.order import OrderStatus
 except ImportError:
     from ib_insync import (
         IB, Stock, MarketOrder, LimitOrder, StopOrder,
         Order, Contract, Trade, util,
     )
-    from ib_insync.order import OrderStatus
 
 # CRITICAL for Jupyter: ``util.startLoop()`` calls ``nest_asyncio.apply()``
 # so that ``ib.connect()`` (which internally uses ``loop.run_until_complete``)
@@ -128,12 +126,26 @@ class Broker:
     # request that points at one of these (fat-finger protection).
     _LIVE_PORTS: frozenset[int] = frozenset({7496, 4001})
 
+    # IB paper-account prefixes. Individual paper accounts are prefixed
+    # ``DU``; advisor / IB Advisor paper is ``DF``. Anything else — ``U``,
+    # ``F``, etc. — is a LIVE account. Used post-connect to verify that
+    # the account TWS actually serves matches the caller's ``mode``.
+    _PAPER_ACCOUNT_PREFIXES: tuple[str, ...] = ("DU", "DF")
+
     # IB error codes that deserve explicit warnings
     _WARN_ERROR_CODES: set[int] = {
         103,  # Duplicate order id
-        110,  # Price does not conform to minimum price variation
-        201,  # Order rejected
         202,  # Order cancelled
+    }
+
+    # IB error codes that indicate a hard order rejection — the order is
+    # dead on arrival, not resting. Escalated above warning so callers
+    # scanning logs notice, and — coupled with ``wait_for_fill``'s isDone
+    # check — a rejected order surfaces as ``Inactive`` rather than as a
+    # silent timeout.
+    _REJECT_ERROR_CODES: set[int] = {
+        110,  # Price does not conform to minimum price variation
+        201,  # Order rejected — reason follows in errorString
     }
 
     def __init__(self) -> None:
@@ -169,7 +181,14 @@ class Broker:
         ``broker.ib.errorEvent -= broker._default_error_handler``.
         """
         symbol = contract.symbol if contract else "N/A"
-        if errorCode in Broker._WARN_ERROR_CODES:
+        if errorCode in Broker._REJECT_ERROR_CODES:
+            # Hard rejections: escalate to error so callers watching logs
+            # notice. The order will show as ``Inactive`` in orderStatus.
+            logger.error(
+                "IB order rejected — code %d (reqId=%d, symbol=%s): %s",
+                errorCode, reqId, symbol, errorString,
+            )
+        elif errorCode in Broker._WARN_ERROR_CODES:
             logger.warning(
                 "IB error %d (reqId=%d, symbol=%s): %s",
                 errorCode, reqId, symbol, errorString,
@@ -241,14 +260,82 @@ class Broker:
             )
 
         self._ib.connect(host, actual_port, clientId=client_id)
-        # Only record mode after a successful connection — a failed connect
-        # (e.g. ConnectionRefused) must not leave a stale mode on the object.
+
+        # Belt & suspenders: the port heuristic isn't enough — a
+        # user-configured 7497 (paper port) can still serve a live
+        # account. Verify by reading managedAccounts() and inspecting
+        # the account prefix. Paper accounts are prefixed DU/DF; anything
+        # else is live. Do this BEFORE recording ``_mode`` so a mismatch
+        # leaves the broker in a clean disconnected state.
+        try:
+            self._verify_account_matches_mode(mode)
+        except Exception:
+            self._ib.disconnect()
+            raise
+
+        # Only record mode after a successful connection AND account check
+        # — a failed connect (e.g. ConnectionRefused) must not leave a
+        # stale mode on the object.
         self._mode = mode
         logger.info(
             f"Connected to TWS ({mode}) at {host}:{actual_port} "
             f"[client_id={client_id}]"
         )
         print(f"✓ Connected to TWS ({mode.upper()}) on port {actual_port}")
+
+    def _verify_account_matches_mode(self, mode: str) -> None:
+        """
+        Confirm the managed account(s) TWS just returned match *mode*.
+
+        IB paper accounts are prefixed ``"DU"`` (individual) or ``"DF"``
+        (advisor); live accounts use ``"U"`` / ``"F"``. If ``mode`` is
+        ``"paper"`` and TWS reports a live-looking account, we refuse to
+        proceed. If ``mode`` is ``"live"`` and TWS reports paper
+        accounts, we log a warning but continue (nothing bad can happen —
+        paper is the safe direction).
+
+        Raises
+        ------
+        RuntimeError
+            If mode is paper but a live account was found, or if
+            managedAccounts() stays empty after a brief poll.
+        """
+        # managedAccounts() is populated by the initial handshake, but
+        # there can be a small race — poll briefly instead of crashing
+        # if the list happens to be empty on the first read.
+        accounts: list[str] = []
+        for _ in range(20):  # up to ~2s
+            accounts = [a for a in self._ib.managedAccounts() if a]
+            if accounts:
+                break
+            self._ib.sleep(0.1)
+
+        if not accounts:
+            raise RuntimeError(
+                "Connected to TWS but managedAccounts() returned no "
+                "accounts after 2s — cannot verify paper vs live safety. "
+                "Refusing to proceed."
+            )
+
+        paper_accounts = [
+            a for a in accounts if a.startswith(self._PAPER_ACCOUNT_PREFIXES)
+        ]
+        live_accounts = [a for a in accounts if a not in paper_accounts]
+
+        if mode == "paper" and live_accounts:
+            raise RuntimeError(
+                f"Refusing to run in paper mode — TWS reports LIVE "
+                f"account(s) {live_accounts}. Paper accounts must start "
+                f"with 'DU' or 'DF'. To trade live, call "
+                f"connect(mode='live', "
+                f"live_confirm=Broker.LIVE_CONFIRM_MSG)."
+            )
+        if mode == "live" and not live_accounts:
+            logger.warning(
+                "connect(mode='live') but TWS reports only paper "
+                "account(s) %s (prefixed DU/DF). Orders will not "
+                "touch a real account.", accounts,
+            )
 
     def disconnect(self) -> None:
         """Disconnect from TWS. Safe to call when already disconnected."""
@@ -289,6 +376,43 @@ class Broker:
                 f"Check that the symbol is correct and TWS is connected."
             )
         return qualified[0]
+
+    def _min_tick(self, contract: Contract) -> float:
+        """
+        Fetch the minimum price increment for a contract.
+
+        Falls back to ``0.01`` (a penny) when TWS doesn't report a
+        minTick, so that callers still get a sensible round even on
+        pathological contracts / non-live sessions. Any exception from
+        ``reqContractDetails`` is treated as a miss.
+        """
+        try:
+            details = self._ib.reqContractDetails(contract)
+            if details:
+                min_tick = getattr(details[0], "minTick", None)
+                if min_tick and float(min_tick) > 0:
+                    return float(min_tick)
+        except Exception as e:
+            logger.debug(
+                "reqContractDetails failed for %s (%s); falling back to $0.01.",
+                getattr(contract, "symbol", "?"), e,
+            )
+        return 0.01
+
+    @staticmethod
+    def _round_to_tick(price: float, min_tick: float) -> float:
+        """
+        Round *price* to the nearest multiple of *min_tick*.
+
+        Guards against error code 110 (price does not conform to minimum
+        price variation), which otherwise turns the order Inactive
+        moments after ``_place`` returns a normal-looking order_id.
+        """
+        if min_tick <= 0:
+            return round(price, 2)
+        # round(x, 8) trims float-arithmetic dust from the multiplication
+        # so the price prints as e.g. 150.05 instead of 150.05000000001.
+        return round(round(price / min_tick) * min_tick, 8)
 
     # ------------------------------------------------------------------
     # Order placement
@@ -362,10 +486,12 @@ class Broker:
         elif order_type == "LMT":
             if limit_price is None:
                 raise ValueError("limit_price required for LMT orders")
+            limit_price = self._round_to_tick(limit_price, self._min_tick(contract))
             order = LimitOrder(action, quantity, limit_price)
         elif order_type == "STP":
             if stop_price is None:
                 raise ValueError("stop_price required for STP orders")
+            stop_price = self._round_to_tick(stop_price, self._min_tick(contract))
             order = StopOrder(action, quantity, stop_price)
         elif order_type == "MOC":
             # Market-on-Close: no dedicated helper in ib_async, built via
@@ -789,7 +915,7 @@ class Broker:
 
     def wait_for_fill(self, order_id: str, timeout: float = 30.0) -> OrderInfo:
         """
-        Block until an order is filled or timeout is reached.
+        Block until an order reaches a terminal state, or timeout.
 
         Parameters
         ----------
@@ -801,8 +927,12 @@ class Broker:
         Returns
         -------
         OrderInfo
-            Final state of the order (status will be ``"Filled"``,
-            ``"Cancelled"``, or ``"Inactive"``).
+            Final state of the order. ``status`` will be one of the
+            library's terminal states — ``"Filled"``, ``"Cancelled"``,
+            ``"ApiCancelled"``, or ``"Inactive"``. ``"Inactive"``
+            typically means the order was rejected (bad price, MOC
+            after cutoff, margin, etc.); callers should treat it as a
+            failure, not a fill.
 
         Raises
         ------
@@ -815,10 +945,12 @@ class Broker:
         if trade is None:
             raise ValueError(f"Unknown order_id '{order_id}'")
 
-        # ib_async's authoritative set of terminal states — includes
-        # ApiCancelled, which we would otherwise wait on forever.
+        # Trade.isDone() checks the library's authoritative DoneStates,
+        # which includes ``Inactive`` (rejected). Using it here means a
+        # rejected order surfaces immediately instead of spinning to
+        # timeout — see M1 in the code-review notes.
         deadline = datetime.now().timestamp() + timeout
-        while trade.orderStatus.status not in OrderStatus.DoneStates:
+        while not trade.isDone():
             if datetime.now().timestamp() > deadline:
                 raise TimeoutError(
                     f"Order {order_id} not filled within {timeout}s. "
@@ -836,23 +968,60 @@ class Broker:
         """
         Get all current positions from TWS.
 
+        Positions are **aggregated across accounts** — TWS's
+        ``reqPositions()`` returns every position from every managed
+        account, and this method sums signed quantity per symbol. If
+        the same symbol is held across two accounts, callers see the
+        net position (with a quantity-weighted average cost) rather
+        than one row silently overwriting the other.
+
         Returns
         -------
         list[Position]
             Position objects with signed quantity (positive = long,
-            negative = short).
+            negative = short). One entry per symbol.
         """
+        # Trigger a position refresh. In ib_async 2.x, ``reqPositions``
+        # blocks until the position-end signal fires; in older ib_insync
+        # it was fire-and-forget and the caller had to sleep. The
+        # bounded retry below handles both cases without a fixed 0.5s
+        # bet, so a slow round trip (esp. first-after-connect) gets more
+        # time to populate before a rebalance treats existing holdings
+        # as zero and double-buys.
         self._ib.reqPositions()
-        self._ib.sleep(0.5)  # give it a moment to populate
+        for _ in range(10):  # up to ~1s
+            if self._ib.positions():
+                break
+            self._ib.sleep(0.1)
         positions = self._ib.positions()
 
-        results = []
+        # Aggregate across accounts. Weighted average cost uses |qty| as
+        # the weight — a long+short offset across two accounts gives a
+        # sensible blended basis, and a single-account symbol collapses
+        # to its own cost unchanged.
+        agg: dict[str, dict[str, float]] = {}
         for p in positions:
+            sym = p.contract.symbol
+            qty = int(p.position)
+            cost = float(p.avgCost)
+            entry = agg.setdefault(
+                sym, {"qty": 0, "abs_qty": 0, "cost_x_abs_qty": 0.0}
+            )
+            entry["qty"] += qty
+            entry["abs_qty"] += abs(qty)
+            entry["cost_x_abs_qty"] += cost * abs(qty)
+
+        results = []
+        for sym, entry in agg.items():
+            abs_qty = entry["abs_qty"]
+            avg_cost = (
+                entry["cost_x_abs_qty"] / abs_qty if abs_qty else 0.0
+            )
             results.append(
                 Position(
-                    symbol=p.contract.symbol,
-                    quantity=int(p.position),
-                    avg_cost=p.avgCost,
+                    symbol=sym,
+                    quantity=int(entry["qty"]),
+                    avg_cost=avg_cost,
                 )
             )
         return results

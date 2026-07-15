@@ -93,15 +93,65 @@ def _is_us_market_open() -> bool:
     return market_open <= now <= market_close
 
 
-def _far_away_limit_price(side: str, reference: float = 0.0) -> float:
+# Sane per-symbol fallback prices used only when broker.get_price() returns
+# None (no market data subscription, market closed, etc.). Rough mid-2026
+# quotes; the exact number doesn't matter — it only has to be > 0 so the
+# far-from-market math produces a genuinely unfillable price.
+_FALLBACK_PRICES: dict[str, float] = {
+    "AAPL": 200.0,
+    "MSFT": 400.0,
+}
+
+# Cache one lookup per symbol per session. broker.get_price() sleeps ~2s
+# internally, so we don't want to pay that for every LMT test.
+_REFERENCE_PRICE_CACHE: dict[str, float] = {}
+
+
+def _reference_price(broker, symbol: str) -> float:
     """
-    Return a limit price that will never fill.
-    BUY: way below market.  SELL: way above market.
+    Return a positive reference price for *symbol*, cached per session.
+
+    Falls back to the per-symbol fallback in ``_FALLBACK_PRICES`` if the
+    live snapshot is unavailable, then to $100 for anything unknown. The
+    guarantee to callers is only that the result is > 0 — enough for
+    ``_far_away_limit_price`` to produce a non-zero far-from-market price.
     """
+    if symbol in _REFERENCE_PRICE_CACHE:
+        return _REFERENCE_PRICE_CACHE[symbol]
+    px = broker.get_price(symbol)
+    if px is None or px <= 0:
+        px = _FALLBACK_PRICES.get(symbol, 100.0)
+    _REFERENCE_PRICE_CACHE[symbol] = float(px)
+    return _REFERENCE_PRICE_CACHE[symbol]
+
+
+def _far_away_limit_price(side: str, reference: float) -> float:
+    """
+    Return a limit price far from *reference* that will not fill.
+
+    BUY: 70% below reference.  SELL: 200% above reference.
+
+    A caller who forgets to pass a real reference used to silently get
+    $0.00 back (the old default was ``reference=0.0``), which is
+    immediately marketable — a SELL LMT @ $0 fills at the bid and a BUY
+    STP @ $0 triggers instantly. We now reject non-positive references
+    outright so the bug can't recur.
+    """
+    if reference is None or reference <= 0:
+        raise ValueError(
+            f"reference price must be > 0 (got {reference!r}). Fetch a "
+            f"real market price via _reference_price(broker, symbol) so "
+            f"far-from-market is genuinely far from market."
+        )
     if side == "BUY":
         return round(reference * 0.30, 2)   # 70% below
     else:
         return round(reference * 3.0, 2)    # 200% above
+
+
+def _far_from_market(broker, symbol: str, side: str) -> float:
+    """Convenience: reference-price lookup + far-from-market in one call."""
+    return _far_away_limit_price(side, _reference_price(broker, symbol))
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +559,231 @@ class TestMOCOffline:
             b.short_moc("AAPL", 999_999)
 
 
+class TestFarAwayLimitPrice:
+    """The far-from-market helper must never return a marketable price."""
+
+    def test_rejects_zero_reference(self):
+        with pytest.raises(ValueError, match="reference price must be > 0"):
+            _far_away_limit_price("BUY", 0.0)
+
+    def test_rejects_negative_reference(self):
+        with pytest.raises(ValueError, match="reference price must be > 0"):
+            _far_away_limit_price("SELL", -10.0)
+
+    def test_rejects_none_reference(self):
+        with pytest.raises(ValueError, match="reference price must be > 0"):
+            _far_away_limit_price("BUY", None)  # type: ignore[arg-type]
+
+    def test_buy_far_below_market(self):
+        # BUY LMT should sit well below reference so it never fills.
+        px = _far_away_limit_price("BUY", 200.0)
+        assert px == 60.0
+        assert px < 200.0
+
+    def test_sell_far_above_market(self):
+        # SELL LMT should sit well above reference so it never fills.
+        px = _far_away_limit_price("SELL", 200.0)
+        assert px == 600.0
+        assert px > 200.0
+
+
+class TestTickRounding:
+    """`_place()` must round to min tick before submission — code 110 kills."""
+
+    def test_round_to_tick_penny(self):
+        b, _ = _make_stubbed_broker()
+        # 150.037 with a penny tick rounds to 150.04
+        assert b._round_to_tick(150.037, 0.01) == 150.04
+        assert b._round_to_tick(150.032, 0.01) == 150.03
+
+    def test_round_to_tick_nickel(self):
+        b, _ = _make_stubbed_broker()
+        assert b._round_to_tick(150.03, 0.05) == 150.05
+        assert b._round_to_tick(150.02, 0.05) == 150.0
+
+    def test_round_to_tick_zero_min_tick_falls_back_to_two_decimals(self):
+        b, _ = _make_stubbed_broker()
+        # A zero (or negative) min tick should not divide-by-zero — it
+        # falls back to a 2-decimal round.
+        assert b._round_to_tick(150.037, 0.0) == 150.04
+
+    def test_min_tick_falls_back_on_missing_details(self):
+        b, _ = _make_stubbed_broker()
+        # Missing / falsy details should return the $0.01 fallback,
+        # not crash.
+        b._ib.reqContractDetails.return_value = []
+        assert b._min_tick(MagicMock()) == 0.01
+
+    def test_min_tick_falls_back_on_exception(self):
+        b, _ = _make_stubbed_broker()
+        b._ib.reqContractDetails.side_effect = RuntimeError("boom")
+        assert b._min_tick(MagicMock()) == 0.01
+
+    def test_place_lmt_rounds_price_before_submission(self):
+        b, captured = _make_stubbed_broker()
+        # Stub a nickel-tick contract so we can prove the input got
+        # rounded — 150.03 must land as 150.05, not 150.03.
+        details = MagicMock()
+        details.minTick = 0.05
+        b._ib.reqContractDetails.return_value = [details]
+
+        b._place(
+            "AAPL", 1, "BUY",
+            order_type="LMT", limit_price=150.03, stop_price=None, tif="DAY",
+        )
+        _, order = captured[0]
+        assert order.lmtPrice == 150.05, (
+            f"limit_price must be rounded to nickel-tick, got {order.lmtPrice}"
+        )
+
+    def test_place_stp_rounds_price_before_submission(self):
+        b, captured = _make_stubbed_broker()
+        details = MagicMock()
+        details.minTick = 0.05
+        b._ib.reqContractDetails.return_value = [details]
+
+        b._place(
+            "AAPL", 1, "BUY",
+            order_type="STP", limit_price=None, stop_price=150.03, tif="DAY",
+        )
+        _, order = captured[0]
+        assert order.auxPrice == 150.05
+
+
+class TestGetPositionsAggregation:
+    """
+    ``reqPositions()`` returns rows per account; get_positions() must sum
+    per symbol instead of silently overwriting a prior account's row.
+    """
+
+    def _fake_pos(self, symbol: str, qty: float, cost: float, account: str = "DU1"):
+        p = MagicMock(name=f"pos_{symbol}_{account}")
+        p.contract.symbol = symbol
+        p.position = qty
+        p.avgCost = cost
+        p.account = account
+        return p
+
+    def test_aggregates_same_symbol_across_accounts(self):
+        b, _ = _make_stubbed_broker()
+        b._ib.positions.return_value = [
+            self._fake_pos("AAPL", 100, 150.0, account="DU1"),
+            self._fake_pos("AAPL",  50, 200.0, account="DU2"),
+        ]
+        positions = b.get_positions()
+        assert len(positions) == 1
+        p = positions[0]
+        assert p.symbol == "AAPL"
+        assert p.quantity == 150
+        # Quantity-weighted average cost: (100*150 + 50*200) / 150 = 166.66...
+        assert abs(p.avg_cost - (100 * 150.0 + 50 * 200.0) / 150) < 1e-6
+
+    def test_long_short_offset_across_accounts_nets(self):
+        b, _ = _make_stubbed_broker()
+        b._ib.positions.return_value = [
+            self._fake_pos("MSFT", 100, 300.0, account="DU1"),
+            self._fake_pos("MSFT", -30, 320.0, account="DU2"),
+        ]
+        positions = b.get_positions()
+        assert len(positions) == 1
+        assert positions[0].symbol == "MSFT"
+        assert positions[0].quantity == 70   # signed sum
+
+    def test_distinct_symbols_stay_distinct(self):
+        b, _ = _make_stubbed_broker()
+        b._ib.positions.return_value = [
+            self._fake_pos("AAPL", 10, 150.0),
+            self._fake_pos("MSFT", 20, 300.0),
+        ]
+        positions = b.get_positions()
+        by_sym = {p.symbol: p for p in positions}
+        assert by_sym["AAPL"].quantity == 10
+        assert by_sym["MSFT"].quantity == 20
+
+
+class TestConnectAccountVerification:
+    """H2: paper mode must reject a live account even on a paper port."""
+
+    def _fresh(self):
+        b = _Broker()
+        b._ib = MagicMock(name="fake_ib")
+        # connect() itself is a no-op — we're only testing the post-
+        # connect account-type check.
+        b._ib.connect.return_value = None
+        b._ib.sleep = MagicMock()
+        return b
+
+    def test_paper_mode_rejects_live_account(self):
+        b = self._fresh()
+        b._ib.managedAccounts.return_value = ["U1234567"]  # live prefix
+        with pytest.raises(RuntimeError, match="LIVE account"):
+            b.connect(mode="paper", port=7497)
+        # And we must have disconnected on the way out.
+        assert b._ib.disconnect.called
+
+    def test_paper_mode_accepts_paper_account(self):
+        b = self._fresh()
+        b._ib.managedAccounts.return_value = ["DU1234567"]
+        b.connect(mode="paper", port=7497)
+        assert b.mode == "paper"
+
+    def test_paper_mode_accepts_advisor_paper_prefix(self):
+        b = self._fresh()
+        b._ib.managedAccounts.return_value = ["DF999"]
+        b.connect(mode="paper", port=7497)
+        assert b.mode == "paper"
+
+    def test_empty_managed_accounts_raises(self):
+        b = self._fresh()
+        b._ib.managedAccounts.return_value = []  # always empty
+        with pytest.raises(RuntimeError, match="managedAccounts"):
+            b.connect(mode="paper", port=7497)
+        assert b._ib.disconnect.called
+
+    def test_live_mode_warns_but_proceeds_on_paper_account(self, caplog):
+        b = self._fresh()
+        b._ib.managedAccounts.return_value = ["DU1234567"]
+        import logging
+        with caplog.at_level(logging.WARNING, logger="ibkr_broker.broker"):
+            b.connect(
+                mode="live",
+                port=7496,
+                live_confirm=_Broker.LIVE_CONFIRM_MSG,
+            )
+        assert b.mode == "live"
+        assert any(
+            "paper" in rec.getMessage().lower() for rec in caplog.records
+        ), f"expected a paper-account warning, got {caplog.records}"
+
+
+class TestWaitForFillTerminatesOnInactive:
+    """M1: a rejected order (status=Inactive) must terminate wait_for_fill."""
+
+    def test_rejected_order_returns_instead_of_timing_out(self):
+        b, _ = _make_stubbed_broker()
+
+        trade = MagicMock(name="rejected_trade")
+        trade.contract.symbol = "AAPL"
+        trade.order.orderId = 4242
+        trade.order.action = "BUY"
+        trade.order.totalQuantity = 100
+        trade.order.orderType = "LMT"
+        trade.order.lmtPrice = 100.0
+        trade.order.auxPrice = 0.0
+        trade.orderStatus.status = "Inactive"
+        trade.orderStatus.filled = 0
+        trade.orderStatus.avgFillPrice = 0.0
+        # In ib_async 2.x, Trade.isDone() returns True for Inactive
+        # because Inactive is in OrderStatus.DoneStates. Mirror that here.
+        trade.isDone.return_value = True
+
+        b._trades["4242"] = trade
+
+        info = b.wait_for_fill("4242", timeout=1.0)
+        assert info.status == "Inactive"
+        assert info.filled == 0
+
+
 # =========================================================================
 # 4. LIMIT ORDERS (far from market, won't fill — safe anytime)
 # =========================================================================
@@ -516,7 +791,7 @@ class TestMOCOffline:
 class TestLimitOrders:
 
     def test_place_buy_limit(self, broker, clean_orders):
-        far_price = _far_away_limit_price("BUY")
+        far_price = _far_from_market(broker, SYMBOL_A, "BUY")
         oid = broker.buy(SYMBOL_A, TEST_QTY, "LMT", limit_price=far_price)
 
         assert isinstance(oid, str) and len(oid) > 0
@@ -530,7 +805,7 @@ class TestLimitOrders:
         assert status.order_type == "LMT"
 
     def test_place_sell_limit(self, broker, clean_orders):
-        far_price = _far_away_limit_price("SELL")
+        far_price = _far_from_market(broker, SYMBOL_A, "SELL")
         oid = broker.sell(SYMBOL_A, TEST_QTY, "LMT", limit_price=far_price)
 
         broker.sleep(1)
@@ -539,9 +814,9 @@ class TestLimitOrders:
 
     def test_get_open_orders_shows_placed_orders(self, broker, clean_orders):
         oid1 = broker.buy(SYMBOL_A, TEST_QTY, "LMT",
-                          limit_price=_far_away_limit_price("BUY"))
+                          limit_price=_far_from_market(broker, SYMBOL_A, "BUY"))
         oid2 = broker.sell(SYMBOL_B, TEST_QTY, "LMT",
-                           limit_price=_far_away_limit_price("SELL"))
+                           limit_price=_far_from_market(broker, SYMBOL_B, "SELL"))
         broker.sleep(2)
 
         orders = broker.get_open_orders()
@@ -551,7 +826,7 @@ class TestLimitOrders:
 
     def test_cancel_single_order(self, broker, clean_orders):
         oid = broker.buy(SYMBOL_A, TEST_QTY, "LMT",
-                         limit_price=_far_away_limit_price("BUY"))
+                         limit_price=_far_from_market(broker, SYMBOL_A, "BUY"))
         broker.sleep(1)
 
         broker.cancel(oid)
@@ -562,9 +837,9 @@ class TestLimitOrders:
 
     def test_cancel_all_clears_everything(self, broker):
         broker.buy(SYMBOL_A, TEST_QTY, "LMT",
-                   limit_price=_far_away_limit_price("BUY"))
+                   limit_price=_far_from_market(broker, SYMBOL_A, "BUY"))
         broker.buy(SYMBOL_B, TEST_QTY, "LMT",
-                   limit_price=_far_away_limit_price("BUY"))
+                   limit_price=_far_from_market(broker, SYMBOL_B, "BUY"))
         broker.sleep(1)
 
         broker.cancel_all()
@@ -574,9 +849,10 @@ class TestLimitOrders:
         assert len(orders) == 0, f"Expected 0 open orders, got {len(orders)}"
 
     def test_stop_order(self, broker, clean_orders):
-        # Stop BUY way above market — won't trigger
+        # Stop BUY way above market — won't trigger. The "SELL" side of
+        # _far_from_market gives us the 3x-market price we want here.
         oid = broker.buy(SYMBOL_A, TEST_QTY, "STP",
-                         stop_price=_far_away_limit_price("SELL"))
+                         stop_price=_far_from_market(broker, SYMBOL_A, "SELL"))
         broker.sleep(1)
 
         status = broker.get_order_status(oid)
@@ -584,7 +860,7 @@ class TestLimitOrders:
 
     def test_show_orders_with_data(self, broker, capsys, clean_orders):
         broker.buy(SYMBOL_A, TEST_QTY, "LMT",
-                   limit_price=_far_away_limit_price("BUY"))
+                   limit_price=_far_from_market(broker, SYMBOL_A, "BUY"))
         broker.sleep(1)
 
         broker.show_orders()
@@ -593,7 +869,7 @@ class TestLimitOrders:
 
     def test_wait_for_fill_times_out_on_limit(self, broker, clean_orders):
         oid = broker.buy(SYMBOL_A, TEST_QTY, "LMT",
-                         limit_price=_far_away_limit_price("BUY"))
+                         limit_price=_far_from_market(broker, SYMBOL_A, "BUY"))
         broker.sleep(1)
 
         with pytest.raises(TimeoutError, match="not filled"):
