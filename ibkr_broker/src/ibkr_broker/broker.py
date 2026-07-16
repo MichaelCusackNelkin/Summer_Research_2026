@@ -489,18 +489,27 @@ class Broker:
 
         quotient = price / min_tick
 
+        # Guard against binary-float dust on already-on-tick prices:
+        # 10.02 / 0.01 evaluates to 1001.9999999999999, so a bare floor
+        # would move a legitimate on-tick BUY LMT a full penny lower.
+        # Nudging the quotient by eps before floor/ceil snaps on-tick
+        # prices to themselves while leaving a genuinely off-tick price
+        # (whose fractional part is >> eps) to still round in the safe
+        # direction.
+        eps = 1e-9
+
         # Decide floor vs ceil vs nearest based on (action, order_type).
         # "Less aggressive" means: for LMTs, never make the limit closer
         # to the current market; for STPs, never make the trigger closer
         # to the current market either.
         if order_type == "LMT" and action == "BUY":
-            units = math.floor(quotient)
+            units = math.floor(quotient + eps)
         elif order_type == "LMT" and action == "SELL":
-            units = math.ceil(quotient)
+            units = math.ceil(quotient - eps)
         elif order_type == "STP" and action == "BUY":
-            units = math.ceil(quotient)
+            units = math.ceil(quotient - eps)
         elif order_type == "STP" and action == "SELL":
-            units = math.floor(quotient)
+            units = math.floor(quotient + eps)
         else:
             units = round(quotient)
 

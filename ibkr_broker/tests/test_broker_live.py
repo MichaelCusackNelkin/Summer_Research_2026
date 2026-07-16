@@ -666,6 +666,105 @@ class TestTickRounding:
             150.037, 0.01, action="SELL", order_type="STP",
         ) == 150.03
 
+    def test_on_tick_prices_map_to_themselves(self):
+        """
+        Regression: with min_tick=0.01, ``10.02 / 0.01`` evaluates to
+        ``1001.9999999999999`` in binary floating point (and ``10.13 /
+        0.01`` to ``1013.0000000000001``). A bare ``math.floor`` /
+        ``math.ceil`` on the quotient would move on-tick prices a full
+        tick in the wrong direction — e.g. a BUY LMT requested at
+        $10.02 would be submitted at $10.01.
+
+        This asserts an on-tick price is left untouched for every
+        (action, order_type) combination, across penny and nickel tick
+        ladders that both include known dust cases (10.02, 10.13, etc.).
+        """
+        b, _ = _make_stubbed_broker()
+
+        combos = [
+            ("BUY", "LMT"),
+            ("SELL", "LMT"),
+            ("BUY", "STP"),
+            ("SELL", "STP"),
+        ]
+
+        # Penny grid, $10.00-$20.00 inclusive: 1001 on-tick prices,
+        # includes the .02 / .13 / .17 dust points that fail on a bare
+        # floor/ceil.
+        penny_prices = [round(10.00 + 0.01 * i, 2) for i in range(1001)]
+        for action, order_type in combos:
+            for p in penny_prices:
+                got = b._round_to_tick(
+                    p, 0.01, action=action, order_type=order_type,
+                )
+                assert got == p, (
+                    f"on-tick {p} (penny) shifted to {got} "
+                    f"for {action} {order_type}"
+                )
+
+        # Nickel grid, $10.00-$20.00 inclusive: multiples of $0.05.
+        nickel_prices = [round(10.00 + 0.05 * i, 2) for i in range(201)]
+        for action, order_type in combos:
+            for p in nickel_prices:
+                got = b._round_to_tick(
+                    p, 0.05, action=action, order_type=order_type,
+                )
+                assert got == p, (
+                    f"on-tick {p} (nickel) shifted to {got} "
+                    f"for {action} {order_type}"
+                )
+
+    def test_off_tick_still_rounds_in_safe_direction(self):
+        """
+        The dust-guard epsilon must not swallow genuinely off-tick
+        prices. Sweep values well outside 1e-9 of an on-tick point and
+        confirm each still rounds in the safety-preserving direction:
+
+        * BUY  LMT / SELL STP → floor (result <= / <= requested)
+        * SELL LMT / BUY  STP → ceil  (result >= / >= requested)
+
+        Includes the dust-boundary cases the earlier existing tests
+        happen to hit (e.g. 150.03 with a 0.01 tick, which the old code
+        got right by accident because 150.03 / 0.01 has no dust).
+        """
+        b, _ = _make_stubbed_broker()
+
+        # (price, tick, expected_floor, expected_ceil)
+        cases = [
+            (150.037, 0.01, 150.03, 150.04),
+            (150.033, 0.01, 150.03, 150.04),
+            (150.03,  0.05, 150.00, 150.05),
+            (150.049, 0.05, 150.00, 150.05),
+            # Boundary of the dust guard: a fractional part of 0.5
+            # is nowhere near the 1e-9 epsilon.
+            (150.005, 0.01, 150.00, 150.01),
+        ]
+
+        for price, tick, exp_floor, exp_ceil in cases:
+            buy_lmt = b._round_to_tick(
+                price, tick, action="BUY", order_type="LMT",
+            )
+            sell_lmt = b._round_to_tick(
+                price, tick, action="SELL", order_type="LMT",
+            )
+            buy_stp = b._round_to_tick(
+                price, tick, action="BUY", order_type="STP",
+            )
+            sell_stp = b._round_to_tick(
+                price, tick, action="SELL", order_type="STP",
+            )
+
+            assert buy_lmt == exp_floor
+            assert sell_lmt == exp_ceil
+            assert buy_stp == exp_ceil
+            assert sell_stp == exp_floor
+
+            # And the safety property itself, spelled out explicitly.
+            assert buy_lmt <= price
+            assert sell_lmt >= price
+            assert buy_stp >= price
+            assert sell_stp <= price
+
     def test_min_tick_falls_back_on_missing_details(self):
         b, _ = _make_stubbed_broker()
         # Missing / falsy details should return the $0.01 fallback,
