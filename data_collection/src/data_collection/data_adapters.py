@@ -173,21 +173,31 @@ class DatabentoGenericAdapter(DataAdapter):
 
     async def _batch_download(self, tickers: list[str], start_date: str,
                               end_date: str, dataset: str, schema: str,
-                              cache_key: str) -> list[Path]:
+                              cache_key: str,
+                              pbar_position: Optional[int] = None,
+                              pbar_desc: Optional[str] = None) -> list[Path]:
         """
         Submit a Databento batch job and download results.
 
         Runs the blocking SDK calls in a thread so Jupyter event loops
         are not blocked.
+
+        ``pbar_position`` pins the tqdm bar to a fixed row so multiple concurrent
+        jobs render on their own line instead of overwriting each other.
+        ``pbar_desc`` overrides the default ``"Batch <schema>"`` label. Both
+        default to ``None`` -- existing single-call sites (e.g. ``data.py``) are
+        unaffected.
         """
         def _submit_and_download() -> list[Path]:
             client = db.Historical(self.api_key)
             job_marker = self.raw_data_dir / f"{cache_key}.job"
             pbar = tqdm(
                 total=3,
-                desc=f"Batch {schema}",
+                desc=pbar_desc if pbar_desc is not None else f"Batch {schema}",
                 unit="step",
                 disable=not self.verbose,
+                position=pbar_position,
+                leave=True,
             )
 
             # Resume an in-flight job instead of submitting a duplicate
@@ -279,6 +289,8 @@ class DatabentoGenericAdapter(DataAdapter):
         schema: str = "ohlcv-1m",
         cache_only: bool = False,
         materialize_only: bool = False,
+        pbar_position: Optional[int] = None,
+        pbar_desc: Optional[str] = None,
     ) -> Optional[pl.DataFrame]:
         """
         Fetch data through a three-layer cache.
@@ -329,7 +341,8 @@ class DatabentoGenericAdapter(DataAdapter):
             )
 
         raw_paths = await self._batch_download(
-            ticker_list, start_date, end_date, dataset, schema, cache_key
+            ticker_list, start_date, end_date, dataset, schema, cache_key,
+            pbar_position=pbar_position, pbar_desc=pbar_desc,
         )
         self._load(raw_paths, parquet_path)
         return None if materialize_only else pl.read_parquet(parquet_path)

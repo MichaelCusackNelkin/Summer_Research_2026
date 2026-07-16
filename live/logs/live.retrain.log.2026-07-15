@@ -1,0 +1,8 @@
+{"ts": "2026-07-15T20:19:08.066-04:00", "level": "INFO", "logger": "live.retrain", "msg": "retrain starting", "refit": "all", "end_date": "2026-07-14", "window_months": 1, "n_broad": 2000, "n_active": 100, "dry_run": true}
+{"ts": "2026-07-15T20:19:08.067-04:00", "level": "INFO", "logger": "live.retrain", "msg": "refitting covariance", "start": "2024-07-14", "end": "2026-07-14", "n_active": 100, "n_factors": 10}
+{"ts": "2026-07-15T20:19:08.067-04:00", "level": "INFO", "logger": "live.retrain", "msg": "dry-run: skipping covariance materialize + fit + write"}
+{"ts": "2026-07-15T20:19:08.067-04:00", "level": "INFO", "logger": "live.retrain", "msg": "refitting forecast", "start": "2026-06-14", "end": "2026-07-14", "n_universe": 2000, "n_active": 100, "lasso_alpha": 0.0001}
+{"ts": "2026-07-15T20:19:08.067-04:00", "level": "INFO", "logger": "live.retrain", "msg": "dry-run: skipping forecast materialize + fit + write"}
+{"ts": "2026-07-15T20:19:08.067-04:00", "level": "INFO", "logger": "live.retrain", "msg": "refitting impact", "start": "2026-06-14", "end": "2026-07-14", "n_active": 100}
+{"ts": "2026-07-15T20:19:08.067-04:00", "level": "INFO", "logger": "live.retrain", "msg": "dry-run: skipping impact materialize + fit + write"}
+{"ts": "2026-07-15T20:19:08.067-04:00", "level": "INFO", "logger": "live.retrain", "msg": "retrain complete", "refit": "all", "artifacts_dir_forecast": "/Users/michaelcusack-nelkin/GitHub/Summer_Research_2026/forecast", "artifacts_dir_covariance": "/Users/michaelcusack-nelkin/GitHub/Summer_Research_2026/covariance", "artifacts_dir_impact": "/Users/michaelcusack-nelkin/GitHub/Summer_Research_2026/impact"}
