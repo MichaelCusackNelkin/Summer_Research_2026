@@ -24,9 +24,10 @@ Connection ports:
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 # Support both ib_async (actively maintained) and ib_insync (archived).
 # They have identical APIs — ib_async is the community fork after
@@ -93,6 +94,34 @@ class Position:
     unrealized_pnl: float = 0.0
 
 
+class RebalanceResult(list):
+    """
+    Result of a ``rebalance()`` call.
+
+    Behaves like a ``list[str]`` of order IDs for backward compatibility
+    (``len(res)``, iteration, ``res[0]``), while exposing a
+    ``rejected`` attribute — a list of the order IDs that TWS refused
+    (status ``"Inactive"``, typically error codes 110/201). Callers who
+    only care about the placed IDs can keep treating the return value as
+    a plain list; callers that need to know whether the rebalance was
+    fully accepted should inspect ``result.rejected``.
+    """
+
+    def __init__(
+        self,
+        order_ids: "list[str] | tuple[str, ...]" = (),
+        rejected: "list[str] | tuple[str, ...]" = (),
+    ) -> None:
+        super().__init__(order_ids)
+        self.rejected: list[str] = list(rejected)
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return (
+            f"RebalanceResult(order_ids={list(self)!r}, "
+            f"rejected={self.rejected!r})"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Broker wrapper
 # ---------------------------------------------------------------------------
@@ -152,6 +181,15 @@ class Broker:
         self._ib = IB()
         self._trades: dict[str, Trade] = {}  # order_id -> Trade
         self._mode: str = "paper"
+        # Cache of minTick per contract keyed by conId (falling back to a
+        # (symbol, exchange, currency) tuple when conId is absent). Every
+        # LMT/STP placement previously did a fresh reqContractDetails
+        # round-trip — this cuts that to one per contract for the life of
+        # the Broker instance. The safe $0.01 fallback IS cached, on
+        # purpose: a contract whose details we couldn't fetch once is very
+        # likely to fail again, and $0.01 is finer than any US-equity
+        # minTick we care about, so caching it doesn't create bad orders.
+        self._min_tick_cache: dict[Any, float] = {}
 
         # Register default error handler so common codes are not silently dropped
         self._ib.errorEvent += self._default_error_handler
@@ -381,38 +419,94 @@ class Broker:
         """
         Fetch the minimum price increment for a contract.
 
-        Falls back to ``0.01`` (a penny) when TWS doesn't report a
-        minTick, so that callers still get a sensible round even on
-        pathological contracts / non-live sessions. Any exception from
-        ``reqContractDetails`` is treated as a miss.
+        Results are cached on the Broker instance keyed by ``conId``
+        (falling back to a ``(symbol, exchange, currency)`` tuple), so
+        repeated LMT/STP placements for the same contract don't repeat
+        the ``reqContractDetails`` round-trip. The safe ``$0.01`` fallback
+        (used when TWS doesn't report a minTick or ``reqContractDetails``
+        raises) is also cached — see ``__init__`` for the rationale.
         """
+        cache_key = getattr(contract, "conId", 0) or (
+            getattr(contract, "symbol", ""),
+            getattr(contract, "exchange", ""),
+            getattr(contract, "currency", ""),
+        )
+        cached = self._min_tick_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        min_tick_value = 0.01
         try:
             details = self._ib.reqContractDetails(contract)
             if details:
-                min_tick = getattr(details[0], "minTick", None)
-                if min_tick and float(min_tick) > 0:
-                    return float(min_tick)
+                raw = getattr(details[0], "minTick", None)
+                if raw and float(raw) > 0:
+                    min_tick_value = float(raw)
         except Exception as e:
             logger.debug(
                 "reqContractDetails failed for %s (%s); falling back to $0.01.",
                 getattr(contract, "symbol", "?"), e,
             )
-        return 0.01
+
+        self._min_tick_cache[cache_key] = min_tick_value
+        return min_tick_value
 
     @staticmethod
-    def _round_to_tick(price: float, min_tick: float) -> float:
+    def _round_to_tick(
+        price: float,
+        min_tick: float,
+        *,
+        action: Optional[str] = None,
+        order_type: Optional[str] = None,
+    ) -> float:
         """
-        Round *price* to the nearest multiple of *min_tick*.
+        Round *price* to a multiple of *min_tick* in the direction that
+        is never more aggressive than the caller's requested price.
 
         Guards against error code 110 (price does not conform to minimum
         price variation), which otherwise turns the order Inactive
         moments after ``_place`` returns a normal-looking order_id.
+
+        Directional convention (safer for a live broker — rounding never
+        pushes an order toward marketability or an earlier trigger):
+
+        * ``BUY``  ``LMT`` → floor (round DOWN). Never higher than the
+          caller's price, so a limit near the touch cannot be nudged half
+          a tick further into marketable territory.
+        * ``SELL`` ``LMT`` → ceil (round UP). Symmetric — never lower
+          than the caller's price.
+        * ``BUY``  ``STP`` → ceil (round UP). Higher trigger triggers
+          later, not earlier, than the caller intended.
+        * ``SELL`` ``STP`` → floor (round DOWN). Lower trigger triggers
+          later, not earlier.
+
+        When *action* / *order_type* aren't provided (legacy callers or
+        untyped uses), we fall back to nearest-tick rounding. The safe
+        directional callers are inside ``_place``.
         """
         if min_tick <= 0:
             return round(price, 2)
+
+        quotient = price / min_tick
+
+        # Decide floor vs ceil vs nearest based on (action, order_type).
+        # "Less aggressive" means: for LMTs, never make the limit closer
+        # to the current market; for STPs, never make the trigger closer
+        # to the current market either.
+        if order_type == "LMT" and action == "BUY":
+            units = math.floor(quotient)
+        elif order_type == "LMT" and action == "SELL":
+            units = math.ceil(quotient)
+        elif order_type == "STP" and action == "BUY":
+            units = math.ceil(quotient)
+        elif order_type == "STP" and action == "SELL":
+            units = math.floor(quotient)
+        else:
+            units = round(quotient)
+
         # round(x, 8) trims float-arithmetic dust from the multiplication
         # so the price prints as e.g. 150.05 instead of 150.05000000001.
-        return round(round(price / min_tick) * min_tick, 8)
+        return round(units * min_tick, 8)
 
     # ------------------------------------------------------------------
     # Order placement
@@ -459,7 +553,14 @@ class Broker:
         Returns
         -------
         str
-            The order ID assigned by TWS.
+            The order ID assigned by TWS. **NOTE:** the return of this
+            method only guarantees that TWS accepted the *submission*.
+            The order can still be rejected **asynchronously** (bad price
+            code 110, generic rejection code 201, margin, MOC-past-cutoff,
+            etc.), in which case its status will become ``"Inactive"``.
+            Callers that need to confirm acceptance should follow up with
+            ``wait_for_fill`` or ``get_order_status`` — a rejected order
+            is not a fill.
 
         Raises
         ------
@@ -486,12 +587,18 @@ class Broker:
         elif order_type == "LMT":
             if limit_price is None:
                 raise ValueError("limit_price required for LMT orders")
-            limit_price = self._round_to_tick(limit_price, self._min_tick(contract))
+            limit_price = self._round_to_tick(
+                limit_price, self._min_tick(contract),
+                action=action, order_type="LMT",
+            )
             order = LimitOrder(action, quantity, limit_price)
         elif order_type == "STP":
             if stop_price is None:
                 raise ValueError("stop_price required for STP orders")
-            stop_price = self._round_to_tick(stop_price, self._min_tick(contract))
+            stop_price = self._round_to_tick(
+                stop_price, self._min_tick(contract),
+                action=action, order_type="STP",
+            )
             order = StopOrder(action, quantity, stop_price)
         elif order_type == "MOC":
             # Market-on-Close: no dedicated helper in ib_async, built via
@@ -558,6 +665,15 @@ class Broker:
         str
             Order ID.
 
+        Notes
+        -----
+        The returned ``order_id`` is *not* proof of acceptance. TWS can
+        reject the order asynchronously (e.g. codes 110 / 201, margin,
+        MOC-past-cutoff) — in which case the rejection is only visible
+        via the logs and the order's status transitioning to
+        ``"Inactive"``. Callers who need programmatic confirmation
+        should follow up with ``wait_for_fill`` or ``get_order_status``.
+
         Examples
         --------
         >>> b.buy("AAPL", 100)
@@ -600,6 +716,13 @@ class Broker:
         -------
         str
             Order ID.
+
+        Notes
+        -----
+        The returned ``order_id`` is *not* proof of acceptance — see
+        ``buy()`` for the details on asynchronous rejection and the
+        ``"Inactive"`` status. Callers who need programmatic confirmation
+        should follow up with ``wait_for_fill`` or ``get_order_status``.
         """
         return self._place(symbol, quantity, "SELL", order_type, limit_price, stop_price, tif)
 
@@ -644,6 +767,13 @@ class Broker:
         ------
         RuntimeError
             If a long position already exists for *symbol*.
+
+        Notes
+        -----
+        The returned ``order_id`` is *not* proof of acceptance — see
+        ``buy()`` for the details on asynchronous rejection and the
+        ``"Inactive"`` status. Callers who need programmatic confirmation
+        should follow up with ``wait_for_fill`` or ``get_order_status``.
         """
         positions = self.get_positions()
         current_qty = 0
@@ -703,6 +833,13 @@ class Broker:
         ------
         RuntimeError
             If no short position exists for *symbol*.
+
+        Notes
+        -----
+        The returned ``order_id`` is *not* proof of acceptance — see
+        ``buy()`` for the details on asynchronous rejection and the
+        ``"Inactive"`` status. Callers who need programmatic confirmation
+        should follow up with ``wait_for_fill`` or ``get_order_status``.
         """
         positions = self.get_positions()
         current_qty = 0
@@ -748,7 +885,11 @@ class Broker:
         Returns
         -------
         str
-            The order ID assigned by TWS.
+            The order ID assigned by TWS. **NOTE:** MOC orders submitted
+            after the per-exchange cutoff are rejected asynchronously
+            (status becomes ``"Inactive"``), and the return of this
+            method is only a submission-accepted signal. Callers should
+            confirm via ``wait_for_fill`` / ``get_order_status``.
 
         Examples
         --------
@@ -777,7 +918,9 @@ class Broker:
         Returns
         -------
         str
-            The order ID assigned by TWS.
+            The order ID assigned by TWS. **NOTE:** see ``buy_moc`` on
+            asynchronous rejection — the return is a submission-accepted
+            signal, not proof the order will fill.
 
         Raises
         ------
@@ -981,19 +1124,16 @@ class Broker:
             Position objects with signed quantity (positive = long,
             negative = short). One entry per symbol.
         """
-        # Trigger a position refresh. In ib_async 2.x, ``reqPositions``
-        # blocks until the position-end signal fires; in older ib_insync
-        # it was fire-and-forget and the caller had to sleep. The
-        # bounded retry below handles both cases without a fixed 0.5s
-        # bet, so a slow round trip (esp. first-after-connect) gets more
-        # time to populate before a rebalance treats existing holdings
-        # as zero and double-buys.
-        self._ib.reqPositions()
-        for _ in range(10):  # up to ~1s
-            if self._ib.positions():
-                break
-            self._ib.sleep(0.1)
-        positions = self._ib.positions()
+        # ib_async 2.x's ``reqPositions`` is blocking and returns the
+        # fully-populated list — using its return value directly avoids
+        # the ~1s poll the old bounded-retry burned on a genuinely flat
+        # account (get_positions is hot: is_flat / reconcile_positions /
+        # rebalance all call it). If ``reqPositions`` returns None (older
+        # ib_insync API, or a stub that doesn't specify a return value),
+        # fall back to the cached ``positions()`` snapshot.
+        positions = self._ib.reqPositions()
+        if positions is None:
+            positions = self._ib.positions()
 
         # Aggregate across accounts. Weighted average cost uses |qty| as
         # the weight — a long+short offset across two accounts gives a
@@ -1242,13 +1382,20 @@ class Broker:
     # end-of-day factor rotation, etc.).
     _REBALANCE_ORDER_TYPES: frozenset[str] = frozenset({"MKT", "MOC"})
 
+    # Bounded wait rebalance() uses to surface immediate order
+    # rejections (codes 110/201 flip the order to ``"Inactive"``).
+    # Kept short — hard rejections come back in milliseconds; anything
+    # slower isn't the "programmatic partial-failure" signal we want.
+    _REBALANCE_REJECT_POLL_SECONDS: float = 2.0
+    _REBALANCE_REJECT_POLL_STEP: float = 0.1
+
     def rebalance(
         self,
         target_positions: dict[str, int],
         order_type: str = "MKT",
         close_unlisted: bool = True,
         tif: str = "DAY",
-    ) -> list[str]:
+    ) -> RebalanceResult:
         """
         Rebalance portfolio to match target positions.
 
@@ -1268,8 +1415,19 @@ class Broker:
 
         Returns
         -------
-        list[str]
-            Order IDs for all orders placed.
+        RebalanceResult
+            A ``list[str]`` subclass containing every order ID placed
+            (existing callers that do ``oids = broker.rebalance(...)``
+            and treat it as a list keep working). Additionally exposes
+            ``result.rejected: list[str]`` — the order IDs that TWS
+            turned to ``"Inactive"`` (codes 110 / 201, MOC after cutoff,
+            etc.) inside a short bounded wait after submission. An empty
+            ``rejected`` list means no leg reported a hard rejection in
+            the wait window; a non-empty one is a programmatic signal of
+            partial failure and each leg has already been logged at
+            ``ERROR``. **Note:** an order that's rejected *later*
+            (after the bounded wait) still needs the per-order
+            ``wait_for_fill`` / ``get_order_status`` follow-up to detect.
 
         Raises
         ------
@@ -1278,7 +1436,9 @@ class Broker:
 
         Examples
         --------
-        >>> b.rebalance({"AAPL": 100, "TSLA": -50, "MSFT": 200})
+        >>> res = b.rebalance({"AAPL": 100, "TSLA": -50, "MSFT": 200})
+        >>> if res.rejected:
+        ...     logger.error("Rebalance partially failed: %s", res.rejected)
         >>> b.rebalance({"AAPL": 100}, tif="IOC")
         >>> b.rebalance({"AAPL": 100, "MSFT": 50}, order_type="MOC")
         """
@@ -1290,6 +1450,10 @@ class Broker:
 
         current = {p.symbol: p.quantity for p in self.get_positions()}
         order_ids: list[str] = []
+        # Track which symbol each order_id corresponds to so a rejection
+        # log can name the symbol without another get_order_status
+        # lookup.
+        symbol_by_oid: dict[str, str] = {}
 
         # Adjust existing and open new positions
         for symbol, target_qty in target_positions.items():
@@ -1304,6 +1468,7 @@ class Broker:
                 oid = self.sell(symbol, abs(diff), order_type, tif=tif)
 
             order_ids.append(oid)
+            symbol_by_oid[oid] = symbol
             logger.info(
                 f"Rebalance: {symbol} {current_qty} -> {target_qty} (diff={diff})"
             )
@@ -1317,10 +1482,73 @@ class Broker:
                     else:
                         oid = self.buy(symbol, abs(qty), order_type, tif=tif)
                     order_ids.append(oid)
+                    symbol_by_oid[oid] = symbol
                     logger.info(f"Rebalance: closing {symbol} (qty={qty})")
 
-        print(f"Rebalance: placed {len(order_ids)} orders")
-        return order_ids
+        rejected = self._collect_rejected_orders(order_ids, symbol_by_oid)
+
+        if rejected:
+            print(
+                f"Rebalance: placed {len(order_ids)} orders "
+                f"({len(rejected)} rejected — see logs)"
+            )
+        else:
+            print(f"Rebalance: placed {len(order_ids)} orders")
+
+        return RebalanceResult(order_ids, rejected)
+
+    def _collect_rejected_orders(
+        self,
+        order_ids: list[str],
+        symbol_by_oid: dict[str, str],
+    ) -> list[str]:
+        """
+        Poll the just-placed orders briefly for an ``"Inactive"`` status
+        (async rejection surface, see error codes 110 / 201), log each
+        one clearly per symbol, and return the rejected IDs.
+
+        The wait is intentionally bounded (``_REBALANCE_REJECT_POLL_
+        SECONDS``) — TWS surfaces hard rejections in milliseconds, and a
+        rebalance shouldn't block a strategy indefinitely to catch a
+        rejection that could just as well be observed via a later
+        ``wait_for_fill``.
+        """
+        if not order_ids:
+            return []
+
+        rejected: set[str] = set()
+        pending = set(order_ids)
+        deadline = datetime.now().timestamp() + self._REBALANCE_REJECT_POLL_SECONDS
+
+        # Poll until every order has hit a terminal state (Filled,
+        # Cancelled, ApiCancelled, Inactive) or the bounded deadline
+        # elapses. Terminal-but-not-Inactive orders are simply removed
+        # from pending; Inactive orders are recorded as rejected.
+        while pending and datetime.now().timestamp() < deadline:
+            for oid in list(pending):
+                trade = self._trades.get(oid)
+                if trade is None:
+                    pending.discard(oid)
+                    continue
+                status = trade.orderStatus.status
+                if status == "Inactive":
+                    rejected.add(oid)
+                    pending.discard(oid)
+                elif getattr(trade, "isDone", None) is not None and trade.isDone():
+                    pending.discard(oid)
+            if pending:
+                self._ib.sleep(self._REBALANCE_REJECT_POLL_STEP)
+
+        for oid in rejected:
+            symbol = symbol_by_oid.get(oid, "?")
+            logger.error(
+                "Rebalance: order %s for %s rejected — status Inactive "
+                "(see IB error codes 110 / 201 above for the reason)",
+                oid, symbol,
+            )
+
+        # Preserve caller-facing order of order_ids for readability.
+        return [oid for oid in order_ids if oid in rejected]
 
     # ------------------------------------------------------------------
     # Display helpers (nice in Jupyter)
@@ -1400,7 +1628,11 @@ class Broker:
         Returns
         -------
         str
-            The order ID assigned by TWS.
+            The order ID assigned by TWS. **NOTE:** see ``buy()`` on
+            asynchronous rejection — the return is only a submission-
+            accepted signal. IOC orders that don't fill immediately go
+            straight to ``"Cancelled"`` rather than resting; confirm via
+            ``wait_for_fill`` / ``get_order_status``.
 
         Raises
         ------
@@ -1443,7 +1675,11 @@ class Broker:
         Returns
         -------
         str or None
-            Order ID, or ``None`` if already flat.
+            Order ID, or ``None`` if already flat. **NOTE:** the returned
+            ``order_id`` is a submission-accepted signal only; TWS can
+            reject the closing order asynchronously (rare for
+            close-position MKTs but possible for MOC after cutoff /
+            odd-lot / halted symbol). Confirm via ``wait_for_fill``.
         """
         pos = self.get_position(symbol)
         if pos is None or pos.quantity == 0:

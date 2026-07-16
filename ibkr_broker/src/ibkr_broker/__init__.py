@@ -10,6 +10,6 @@ Usage:
     b.disconnect()
 """
 
-from ibkr_broker.broker import Broker, OrderInfo, Position
+from ibkr_broker.broker import Broker, OrderInfo, Position, RebalanceResult
 
-__all__ = ["Broker", "OrderInfo", "Position"]
+__all__ = ["Broker", "OrderInfo", "Position", "RebalanceResult"]

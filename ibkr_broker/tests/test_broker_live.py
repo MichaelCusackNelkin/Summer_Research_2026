@@ -411,7 +411,11 @@ def _make_stubbed_broker() -> tuple["_Broker", list]:
     b._ib.qualifyContracts.return_value = [fake_contract]
     b._ib.placeOrder.side_effect = fake_place_order
     b._ib.positions.return_value = []
-    b._ib.reqPositions.return_value = []
+    # In ib_async 2.x, reqPositions() is blocking and returns the same
+    # list positions() would return. Have the stub forward so tests that
+    # only override positions.return_value still see the expected data
+    # via get_positions() → reqPositions().
+    b._ib.reqPositions.side_effect = lambda: b._ib.positions()
 
     return b, captured
 
@@ -588,24 +592,79 @@ class TestFarAwayLimitPrice:
 
 
 class TestTickRounding:
-    """`_place()` must round to min tick before submission — code 110 kills."""
+    """
+    ``_place()`` must round to min tick before submission — code 110
+    otherwise kills the order.
 
-    def test_round_to_tick_penny(self):
+    Rounding is directional: it must never make a limit price closer to
+    the touch or a stop price closer to its trigger. Convention:
+
+    * BUY  LMT → floor (never higher than requested)
+    * SELL LMT → ceil  (never lower than requested)
+    * BUY  STP → ceil  (never lower than requested; triggers later)
+    * SELL STP → floor (never higher than requested; triggers later)
+    """
+
+    def test_round_to_tick_defaults_to_nearest_without_side(self):
+        # Legacy signature (no action/order_type) — nearest-tick.
         b, _ = _make_stubbed_broker()
-        # 150.037 with a penny tick rounds to 150.04
         assert b._round_to_tick(150.037, 0.01) == 150.04
         assert b._round_to_tick(150.032, 0.01) == 150.03
-
-    def test_round_to_tick_nickel(self):
-        b, _ = _make_stubbed_broker()
-        assert b._round_to_tick(150.03, 0.05) == 150.05
-        assert b._round_to_tick(150.02, 0.05) == 150.0
 
     def test_round_to_tick_zero_min_tick_falls_back_to_two_decimals(self):
         b, _ = _make_stubbed_broker()
         # A zero (or negative) min tick should not divide-by-zero — it
         # falls back to a 2-decimal round.
         assert b._round_to_tick(150.037, 0.0) == 150.04
+
+    def test_buy_lmt_rounds_down(self):
+        b, _ = _make_stubbed_broker()
+        # A BUY limit is never rounded UP toward the ask — floor it.
+        assert b._round_to_tick(
+            150.03, 0.05, action="BUY", order_type="LMT",
+        ) == 150.00
+        assert b._round_to_tick(
+            150.037, 0.01, action="BUY", order_type="LMT",
+        ) == 150.03
+        # Already on a tick: no change.
+        assert b._round_to_tick(
+            150.00, 0.05, action="BUY", order_type="LMT",
+        ) == 150.00
+
+    def test_sell_lmt_rounds_up(self):
+        b, _ = _make_stubbed_broker()
+        # A SELL limit is never rounded DOWN toward the bid — ceil it.
+        assert b._round_to_tick(
+            150.03, 0.05, action="SELL", order_type="LMT",
+        ) == 150.05
+        assert b._round_to_tick(
+            150.032, 0.01, action="SELL", order_type="LMT",
+        ) == 150.04
+        assert b._round_to_tick(
+            150.00, 0.05, action="SELL", order_type="LMT",
+        ) == 150.00
+
+    def test_buy_stp_rounds_up(self):
+        b, _ = _make_stubbed_broker()
+        # A BUY stop sits above the market — rounding UP delays the
+        # trigger, never fires it earlier than intended.
+        assert b._round_to_tick(
+            150.03, 0.05, action="BUY", order_type="STP",
+        ) == 150.05
+        assert b._round_to_tick(
+            150.032, 0.01, action="BUY", order_type="STP",
+        ) == 150.04
+
+    def test_sell_stp_rounds_down(self):
+        b, _ = _make_stubbed_broker()
+        # A SELL stop sits below the market — rounding DOWN delays the
+        # trigger, never fires it earlier than intended.
+        assert b._round_to_tick(
+            150.03, 0.05, action="SELL", order_type="STP",
+        ) == 150.00
+        assert b._round_to_tick(
+            150.037, 0.01, action="SELL", order_type="STP",
+        ) == 150.03
 
     def test_min_tick_falls_back_on_missing_details(self):
         b, _ = _make_stubbed_broker()
@@ -619,10 +678,82 @@ class TestTickRounding:
         b._ib.reqContractDetails.side_effect = RuntimeError("boom")
         assert b._min_tick(MagicMock()) == 0.01
 
-    def test_place_lmt_rounds_price_before_submission(self):
+    def test_min_tick_cached_across_calls(self):
+        """
+        Repeated ``_min_tick`` calls for the same contract must hit the
+        cache, not the network. Otherwise every LMT/STP placement burns
+        a round-trip on reqContractDetails.
+        """
+        b, _ = _make_stubbed_broker()
+        details = MagicMock()
+        details.minTick = 0.05
+        b._ib.reqContractDetails.return_value = [details]
+
+        contract = MagicMock()
+        contract.conId = 12345
+        contract.symbol = "AAPL"
+
+        assert b._min_tick(contract) == 0.05
+        assert b._min_tick(contract) == 0.05
+        assert b._min_tick(contract) == 0.05
+        assert b._ib.reqContractDetails.call_count == 1
+
+    def test_min_tick_cache_distinguishes_contracts(self):
+        """Distinct contracts must not collide in the cache."""
+        b, _ = _make_stubbed_broker()
+
+        det_penny = MagicMock()
+        det_penny.minTick = 0.01
+        det_nickel = MagicMock()
+        det_nickel.minTick = 0.05
+
+        # Return different minTicks based on the first arg to
+        # reqContractDetails, so the cache-vs-network behaviour is
+        # observable.
+        def _details_for(contract):
+            return [det_penny if contract.conId == 1 else det_nickel]
+
+        b._ib.reqContractDetails.side_effect = _details_for
+
+        c1 = MagicMock()
+        c1.conId = 1
+        c2 = MagicMock()
+        c2.conId = 2
+
+        assert b._min_tick(c1) == 0.01
+        assert b._min_tick(c2) == 0.05
+        # A second lookup on either should be cache-served.
+        assert b._min_tick(c1) == 0.01
+        assert b._min_tick(c2) == 0.05
+        assert b._ib.reqContractDetails.call_count == 2
+
+    def test_min_tick_cache_survives_place_calls(self):
+        """
+        Two consecutive LMT placements on the same symbol must only
+        trigger one reqContractDetails round-trip. Regression guard for
+        the "network round-trip per placement" review finding.
+        """
+        b, _ = _make_stubbed_broker()
+        details = MagicMock()
+        details.minTick = 0.05
+        b._ib.reqContractDetails.return_value = [details]
+
+        # Both placements go through _place → _min_tick(contract). The
+        # stubbed qualifyContracts always returns the same fake_contract,
+        # so cache-key equality is guaranteed.
+        b._place(
+            "AAPL", 1, "BUY",
+            order_type="LMT", limit_price=150.00, stop_price=None, tif="DAY",
+        )
+        b._place(
+            "AAPL", 1, "SELL",
+            order_type="LMT", limit_price=200.00, stop_price=None, tif="DAY",
+        )
+        assert b._ib.reqContractDetails.call_count == 1
+
+    def test_place_buy_lmt_floors_price_before_submission(self):
+        """BUY LMT with a nickel tick — 150.03 must FLOOR to 150.00."""
         b, captured = _make_stubbed_broker()
-        # Stub a nickel-tick contract so we can prove the input got
-        # rounded — 150.03 must land as 150.05, not 150.03.
         details = MagicMock()
         details.minTick = 0.05
         b._ib.reqContractDetails.return_value = [details]
@@ -632,11 +763,28 @@ class TestTickRounding:
             order_type="LMT", limit_price=150.03, stop_price=None, tif="DAY",
         )
         _, order = captured[0]
-        assert order.lmtPrice == 150.05, (
-            f"limit_price must be rounded to nickel-tick, got {order.lmtPrice}"
+        assert order.lmtPrice == 150.00, (
+            f"BUY LMT must FLOOR to nickel tick (safer), got {order.lmtPrice}"
         )
 
-    def test_place_stp_rounds_price_before_submission(self):
+    def test_place_sell_lmt_ceils_price_before_submission(self):
+        """SELL LMT with a nickel tick — 150.03 must CEIL to 150.05."""
+        b, captured = _make_stubbed_broker()
+        details = MagicMock()
+        details.minTick = 0.05
+        b._ib.reqContractDetails.return_value = [details]
+
+        b._place(
+            "AAPL", 1, "SELL",
+            order_type="LMT", limit_price=150.03, stop_price=None, tif="DAY",
+        )
+        _, order = captured[0]
+        assert order.lmtPrice == 150.05, (
+            f"SELL LMT must CEIL to nickel tick (safer), got {order.lmtPrice}"
+        )
+
+    def test_place_buy_stp_ceils_price_before_submission(self):
+        """BUY STP with a nickel tick — 150.03 must CEIL to 150.05."""
         b, captured = _make_stubbed_broker()
         details = MagicMock()
         details.minTick = 0.05
@@ -647,7 +795,25 @@ class TestTickRounding:
             order_type="STP", limit_price=None, stop_price=150.03, tif="DAY",
         )
         _, order = captured[0]
-        assert order.auxPrice == 150.05
+        assert order.auxPrice == 150.05, (
+            f"BUY STP must CEIL to nickel tick (safer), got {order.auxPrice}"
+        )
+
+    def test_place_sell_stp_floors_price_before_submission(self):
+        """SELL STP with a nickel tick — 150.03 must FLOOR to 150.00."""
+        b, captured = _make_stubbed_broker()
+        details = MagicMock()
+        details.minTick = 0.05
+        b._ib.reqContractDetails.return_value = [details]
+
+        b._place(
+            "AAPL", 1, "SELL",
+            order_type="STP", limit_price=None, stop_price=150.03, tif="DAY",
+        )
+        _, order = captured[0]
+        assert order.auxPrice == 150.00, (
+            f"SELL STP must FLOOR to nickel tick (safer), got {order.auxPrice}"
+        )
 
 
 class TestGetPositionsAggregation:
@@ -782,6 +948,141 @@ class TestWaitForFillTerminatesOnInactive:
         info = b.wait_for_fill("4242", timeout=1.0)
         assert info.status == "Inactive"
         assert info.filled == 0
+
+
+class TestRebalanceSurfacesRejectedLegs:
+    """
+    A rebalance() with one leg TWS turns to ``"Inactive"`` (codes 110 /
+    201) must:
+
+    * still return every placed order_id (backward-compat list shape)
+    * expose the rejected id via ``result.rejected``
+    * emit an ERROR log naming the rejected symbol.
+    """
+
+    def _rebalance_with_leg_status(
+        self,
+        leg_statuses: dict[str, str],
+    ) -> tuple:
+        """
+        Set up a stubbed broker whose placeOrder assigns increasing
+        order IDs and whose per-symbol trade objects report the given
+        ``orderStatus.status`` values. Returns (broker, captured_orders,
+        result).
+
+        ``leg_statuses`` maps symbol -> desired status string
+        (e.g. ``{"AAPL": "Inactive", "MSFT": "Submitted"}``).
+        """
+        from ibkr_broker.broker import RebalanceResult  # local import
+
+        b = _Broker()
+        captured: list = []
+
+        # One qualified contract per symbol.
+        contracts: dict[str, MagicMock] = {}
+        for sym in leg_statuses:
+            c = MagicMock(name=f"contract_{sym}")
+            c.symbol = sym
+            c.conId = hash(sym) & 0xFFFF
+            contracts[sym] = c
+
+        def _qualify(contract):
+            return [contracts[contract.symbol]]
+
+        next_id = {"n": 5000}
+
+        def _place_order(contract, order):
+            oid = next_id["n"]
+            next_id["n"] += 1
+            trade = MagicMock(name=f"trade_{contract.symbol}_{oid}")
+            trade.order = order
+            trade.order.orderId = oid
+            trade.contract = contract
+            status = leg_statuses.get(contract.symbol, "Submitted")
+            trade.orderStatus.status = status
+            trade.orderStatus.filled = 0
+            trade.orderStatus.avgFillPrice = 0.0
+            trade.isDone.return_value = status in {
+                "Filled", "Cancelled", "ApiCancelled", "Inactive",
+            }
+            captured.append((contract, order, trade))
+            return trade
+
+        b._ib = MagicMock(name="fake_ib")
+        b._ib.isConnected.return_value = True
+        b._ib.qualifyContracts.side_effect = _qualify
+        b._ib.placeOrder.side_effect = _place_order
+        # No pre-existing positions — every leg is a fresh buy.
+        b._ib.positions.return_value = []
+        b._ib.reqPositions.side_effect = lambda: b._ib.positions()
+        # Bounded-wait sleep is a no-op in tests. Shrink the deadline
+        # so a stable "Submitted" (never-Inactive) leg exits the poll
+        # quickly instead of spinning 2s per test.
+        b._ib.sleep = MagicMock()
+        b._REBALANCE_REJECT_POLL_SECONDS = 0.05
+
+        targets = {sym: 10 for sym in leg_statuses}
+        result = b.rebalance(targets, close_unlisted=False)
+        return b, captured, result, RebalanceResult
+
+    def test_rejected_leg_appears_in_rejected_field(self, caplog):
+        import logging
+        with caplog.at_level(logging.ERROR, logger="ibkr_broker.broker"):
+            b, captured, result, RebalanceResult = self._rebalance_with_leg_status(
+                {"AAPL": "Inactive", "MSFT": "Submitted"}
+            )
+
+        assert isinstance(result, RebalanceResult)
+        # Backward compat: still list-like with two order IDs
+        assert len(result) == 2
+        for oid in result:
+            assert isinstance(oid, str)
+
+        # Rejected list surfaces exactly the AAPL leg. Find the oid by
+        # matching the captured order's contract.symbol.
+        aapl_oid = next(
+            str(trade.order.orderId)
+            for contract, _, trade in captured
+            if contract.symbol == "AAPL"
+        )
+        msft_oid = next(
+            str(trade.order.orderId)
+            for contract, _, trade in captured
+            if contract.symbol == "MSFT"
+        )
+        assert result.rejected == [aapl_oid]
+        assert msft_oid not in result.rejected
+
+        # And a per-symbol ERROR log names AAPL (the rejected symbol),
+        # not MSFT.
+        rejection_logs = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.ERROR and "rejected" in rec.getMessage()
+        ]
+        assert rejection_logs, "expected an ERROR log for the rejected leg"
+        assert any("AAPL" in rec.getMessage() for rec in rejection_logs)
+        assert not any("MSFT" in rec.getMessage() for rec in rejection_logs)
+
+    def test_all_accepted_returns_empty_rejected(self):
+        b, captured, result, RebalanceResult = self._rebalance_with_leg_status(
+            {"AAPL": "Submitted", "MSFT": "Submitted"}
+        )
+        assert isinstance(result, RebalanceResult)
+        assert len(result) == 2
+        assert result.rejected == []
+
+    def test_result_is_still_list_for_legacy_callers(self):
+        """Callers doing ``oids = broker.rebalance(...)`` must not break."""
+        b, captured, result, _ = self._rebalance_with_leg_status(
+            {"AAPL": "Submitted"}
+        )
+        # Every legacy usage exercised on real code.
+        assert isinstance(result, list)
+        assert len(result) == 1
+        first = result[0]
+        assert isinstance(first, str)
+        collected = [oid for oid in result]
+        assert collected == [first]
 
 
 # =========================================================================
