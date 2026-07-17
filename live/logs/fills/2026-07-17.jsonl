@@ -1562,3 +1562,101 @@
 {"ts": "2026-07-17T00:29:59.192609-04:00", "order_id": "oid-66", "symbol": "WDAY", "action": "SELL", "quantity": 10, "status": "Filled", "filled": 10, "avg_fill_price": 100.0}
 {"ts": "2026-07-17T00:29:59.192613-04:00", "order_id": "oid-67", "symbol": "WDC", "action": "SELL", "quantity": 24, "status": "Filled", "filled": 24, "avg_fill_price": 100.0}
 {"ts": "2026-07-17T00:29:59.192616-04:00", "order_id": "oid-68", "symbol": "ZS", "action": "BUY", "quantity": 12, "status": "Filled", "filled": 12, "avg_fill_price": 100.0}
+{"ts": "2026-07-17T15:38:01.630036-04:00", "order_id": "53", "symbol": "AAPL", "action": "BUY", "quantity": 43, "status": "Filled", "filled": 43, "avg_fill_price": 332.89}
+{"ts": "2026-07-17T15:38:01.630080-04:00", "order_id": "55", "symbol": "ABNB", "action": "BUY", "quantity": 281, "status": "Filled", "filled": 281, "avg_fill_price": 146.18}
+{"ts": "2026-07-17T15:38:01.630109-04:00", "order_id": "57", "symbol": "ADBE", "action": "BUY", "quantity": 110, "status": "Filled", "filled": 110, "avg_fill_price": 237.64}
+{"ts": "2026-07-17T15:38:01.630131-04:00", "order_id": "59", "symbol": "ADI", "action": "BUY", "quantity": 36, "status": "Filled", "filled": 36, "avg_fill_price": 376.05}
+{"ts": "2026-07-17T15:38:01.630153-04:00", "order_id": "61", "symbol": "AMAT", "action": "BUY", "quantity": 37, "status": "Filled", "filled": 37, "avg_fill_price": 531.0}
+{"ts": "2026-07-17T15:38:01.630173-04:00", "order_id": "63", "symbol": "AMD", "action": "BUY", "quantity": 22, "status": "Filled", "filled": 22, "avg_fill_price": 495.81}
+{"ts": "2026-07-17T15:38:01.630194-04:00", "order_id": "65", "symbol": "AMGN", "action": "BUY", "quantity": 2, "status": "Filled", "filled": 2, "avg_fill_price": 364.87}
+{"ts": "2026-07-17T15:38:01.630223-04:00", "order_id": "67", "symbol": "AMZN", "action": "BUY", "quantity": 153, "status": "Filled", "filled": 153, "avg_fill_price": 246.84}
+{"ts": "2026-07-17T15:38:01.630245-04:00", "order_id": "69", "symbol": "APP", "action": "BUY", "quantity": 26, "status": "Filled", "filled": 26, "avg_fill_price": 423.11}
+{"ts": "2026-07-17T15:38:01.630266-04:00", "order_id": "71", "symbol": "AVGO", "action": "SELL", "quantity": 25, "status": "Filled", "filled": 25, "avg_fill_price": 372.0}
+{"ts": "2026-07-17T15:38:01.630286-04:00", "order_id": "73", "symbol": "BKNG", "action": "SELL", "quantity": 335, "status": "Filled", "filled": 335, "avg_fill_price": 181.202149}
+{"ts": "2026-07-17T15:38:01.630308-04:00", "order_id": "75", "symbol": "CEG", "action": "SELL", "quantity": 32, "status": "Filled", "filled": 32, "avg_fill_price": 252.06}
+{"ts": "2026-07-17T15:38:01.630328-04:00", "order_id": "77", "symbol": "CMCSA", "action": "SELL", "quantity": 585, "status": "Filled", "filled": 585, "avg_fill_price": 23.87}
+{"ts": "2026-07-17T15:38:01.630349-04:00", "order_id": "79", "symbol": "COIN", "action": "SELL", "quantity": 166, "status": "Filled", "filled": 166, "avg_fill_price": 156.59}
+{"ts": "2026-07-17T15:38:01.630370-04:00", "order_id": "81", "symbol": "COST", "action": "BUY", "quantity": 10, "status": "Filled", "filled": 10, "avg_fill_price": 937.83}
+{"ts": "2026-07-17T15:38:01.630398-04:00", "order_id": "83", "symbol": "CRWD", "action": "BUY", "quantity": 15, "status": "Filled", "filled": 15, "avg_fill_price": 202.29}
+{"ts": "2026-07-17T15:38:01.630427-04:00", "order_id": "85", "symbol": "CSCO", "action": "SELL", "quantity": 188, "status": "Filled", "filled": 188, "avg_fill_price": 112.63}
+{"ts": "2026-07-17T15:38:01.630448-04:00", "order_id": "87", "symbol": "DASH", "action": "BUY", "quantity": 148, "status": "Filled", "filled": 148, "avg_fill_price": 184.14}
+{"ts": "2026-07-17T15:38:01.630467-04:00", "order_id": "89", "symbol": "GILD", "action": "SELL", "quantity": 226, "status": "Filled", "filled": 226, "avg_fill_price": 134.34}
+{"ts": "2026-07-17T15:38:01.630489-04:00", "order_id": "91", "symbol": "GOOG", "action": "SELL", "quantity": 24, "status": "Filled", "filled": 24, "avg_fill_price": 343.91}
+{"ts": "2026-07-17T15:38:01.630510-04:00", "order_id": "93", "symbol": "GOOGL", "action": "SELL", "quantity": 144, "status": "Filled", "filled": 144, "avg_fill_price": 344.35}
+{"ts": "2026-07-17T15:38:01.630530-04:00", "order_id": "95", "symbol": "HON", "action": "BUY", "quantity": 7, "status": "Filled", "filled": 7, "avg_fill_price": 225.49}
+{"ts": "2026-07-17T15:38:01.630550-04:00", "order_id": "97", "symbol": "HOOD", "action": "BUY", "quantity": 410, "status": "Filled", "filled": 410, "avg_fill_price": 100.73}
+{"ts": "2026-07-17T15:38:01.630571-04:00", "order_id": "99", "symbol": "INTC", "action": "BUY", "quantity": 33, "status": "Filled", "filled": 33, "avg_fill_price": 95.85}
+{"ts": "2026-07-17T15:38:01.630590-04:00", "order_id": "101", "symbol": "INTU", "action": "SELL", "quantity": 11, "status": "Filled", "filled": 11, "avg_fill_price": 290.49}
+{"ts": "2026-07-17T15:38:01.630610-04:00", "order_id": "103", "symbol": "ISRG", "action": "SELL", "quantity": 25, "status": "Filled", "filled": 25, "avg_fill_price": 347.81}
+{"ts": "2026-07-17T15:38:01.630630-04:00", "order_id": "105", "symbol": "KLAC", "action": "SELL", "quantity": 22, "status": "Filled", "filled": 22, "avg_fill_price": 213.27}
+{"ts": "2026-07-17T15:38:01.630649-04:00", "order_id": "107", "symbol": "LRCX", "action": "SELL", "quantity": 6, "status": "Filled", "filled": 6, "avg_fill_price": 312.41}
+{"ts": "2026-07-17T15:38:01.630669-04:00", "order_id": "109", "symbol": "MELI", "action": "SELL", "quantity": 3, "status": "Filled", "filled": 3, "avg_fill_price": 1814.68}
+{"ts": "2026-07-17T15:38:01.630688-04:00", "order_id": "111", "symbol": "META", "action": "BUY", "quantity": 30, "status": "Filled", "filled": 30, "avg_fill_price": 643.93}
+{"ts": "2026-07-17T15:38:01.630708-04:00", "order_id": "113", "symbol": "MRVL", "action": "BUY", "quantity": 13, "status": "Filled", "filled": 13, "avg_fill_price": 189.28}
+{"ts": "2026-07-17T15:38:01.630728-04:00", "order_id": "115", "symbol": "MSFT", "action": "SELL", "quantity": 19, "status": "Filled", "filled": 19, "avg_fill_price": 395.18}
+{"ts": "2026-07-17T15:38:01.630747-04:00", "order_id": "117", "symbol": "MSTR", "action": "SELL", "quantity": 3, "status": "Filled", "filled": 3, "avg_fill_price": 94.08}
+{"ts": "2026-07-17T15:38:01.630767-04:00", "order_id": "119", "symbol": "MU", "action": "BUY", "quantity": 4, "status": "Filled", "filled": 4, "avg_fill_price": 862.94}
+{"ts": "2026-07-17T15:38:01.630787-04:00", "order_id": "121", "symbol": "NFLX", "action": "SELL", "quantity": 301, "status": "Filled", "filled": 301, "avg_fill_price": 68.69}
+{"ts": "2026-07-17T15:38:01.630807-04:00", "order_id": "123", "symbol": "NVDA", "action": "SELL", "quantity": 51, "status": "Filled", "filled": 51, "avg_fill_price": 202.79}
+{"ts": "2026-07-17T15:38:01.630828-04:00", "order_id": "125", "symbol": "NXPI", "action": "BUY", "quantity": 31, "status": "Filled", "filled": 31, "avg_fill_price": 268.24}
+{"ts": "2026-07-17T15:38:01.630847-04:00", "order_id": "127", "symbol": "PANW", "action": "SELL", "quantity": 229, "status": "Filled", "filled": 229, "avg_fill_price": 356.555808}
+{"ts": "2026-07-17T15:38:01.630868-04:00", "order_id": "129", "symbol": "PEP", "action": "SELL", "quantity": 119, "status": "Filled", "filled": 119, "avg_fill_price": 136.75}
+{"ts": "2026-07-17T15:38:01.630888-04:00", "order_id": "131", "symbol": "PLTR", "action": "BUY", "quantity": 76, "status": "Filled", "filled": 76, "avg_fill_price": 132.15}
+{"ts": "2026-07-17T15:38:01.630908-04:00", "order_id": "133", "symbol": "PYPL", "action": "BUY", "quantity": 415, "status": "Filled", "filled": 415, "avg_fill_price": 56.68}
+{"ts": "2026-07-17T15:38:01.630929-04:00", "order_id": "135", "symbol": "QCOM", "action": "SELL", "quantity": 51, "status": "Filled", "filled": 51, "avg_fill_price": 171.1}
+{"ts": "2026-07-17T15:38:01.630948-04:00", "order_id": "137", "symbol": "REGN", "action": "BUY", "quantity": 57, "status": "Filled", "filled": 57, "avg_fill_price": 673.95}
+{"ts": "2026-07-17T15:38:01.630968-04:00", "order_id": "139", "symbol": "SBUX", "action": "BUY", "quantity": 66, "status": "Filled", "filled": 66, "avg_fill_price": 105.34}
+{"ts": "2026-07-17T15:38:01.630988-04:00", "order_id": "141", "symbol": "SMCI", "action": "BUY", "quantity": 59, "status": "Filled", "filled": 59, "avg_fill_price": 24.5}
+{"ts": "2026-07-17T15:38:01.631007-04:00", "order_id": "143", "symbol": "TMUS", "action": "SELL", "quantity": 1, "status": "Filled", "filled": 1, "avg_fill_price": 192.5}
+{"ts": "2026-07-17T15:38:01.631028-04:00", "order_id": "145", "symbol": "TSLA", "action": "BUY", "quantity": 50, "status": "Filled", "filled": 50, "avg_fill_price": 382.04}
+{"ts": "2026-07-17T15:38:01.631047-04:00", "order_id": "147", "symbol": "TXN", "action": "SELL", "quantity": 58, "status": "Filled", "filled": 58, "avg_fill_price": 285.01}
+{"ts": "2026-07-17T15:38:01.631071-04:00", "order_id": "149", "symbol": "VRTX", "action": "SELL", "quantity": 20, "status": "Filled", "filled": 20, "avg_fill_price": 485.4}
+{"ts": "2026-07-17T15:38:10.900501-04:00", "order_id": "151", "status": "timeout"}
+{"ts": "2026-07-17T15:38:20.165603-04:00", "order_id": "153", "status": "timeout"}
+{"ts": "2026-07-17T15:38:29.433405-04:00", "order_id": "155", "status": "timeout"}
+{"ts": "2026-07-17T15:38:38.698432-04:00", "order_id": "157", "status": "timeout"}
+{"ts": "2026-07-17T15:38:47.963373-04:00", "order_id": "159", "status": "timeout"}
+{"ts": "2026-07-17T15:38:57.230653-04:00", "order_id": "161", "status": "timeout"}
+{"ts": "2026-07-17T15:39:06.499775-04:00", "order_id": "163", "status": "timeout"}
+{"ts": "2026-07-17T15:39:15.768689-04:00", "order_id": "165", "status": "timeout"}
+{"ts": "2026-07-17T15:39:25.035168-04:00", "order_id": "167", "status": "timeout"}
+{"ts": "2026-07-17T15:39:34.303409-04:00", "order_id": "169", "status": "timeout"}
+{"ts": "2026-07-17T15:39:43.573046-04:00", "order_id": "171", "status": "timeout"}
+{"ts": "2026-07-17T15:39:52.843079-04:00", "order_id": "173", "status": "timeout"}
+{"ts": "2026-07-17T15:40:02.102978-04:00", "order_id": "175", "status": "timeout"}
+{"ts": "2026-07-17T15:40:11.365074-04:00", "order_id": "177", "status": "timeout"}
+{"ts": "2026-07-17T15:40:20.630718-04:00", "order_id": "179", "status": "timeout"}
+{"ts": "2026-07-17T15:40:29.896267-04:00", "order_id": "181", "status": "timeout"}
+{"ts": "2026-07-17T15:40:39.165829-04:00", "order_id": "183", "status": "timeout"}
+{"ts": "2026-07-17T15:40:48.432079-04:00", "order_id": "185", "status": "timeout"}
+{"ts": "2026-07-17T15:40:57.698004-04:00", "order_id": "187", "status": "timeout"}
+{"ts": "2026-07-17T15:41:06.961103-04:00", "order_id": "189", "status": "timeout"}
+{"ts": "2026-07-17T15:41:16.219506-04:00", "order_id": "191", "status": "timeout"}
+{"ts": "2026-07-17T15:41:25.484251-04:00", "order_id": "193", "status": "timeout"}
+{"ts": "2026-07-17T15:41:34.748515-04:00", "order_id": "195", "status": "timeout"}
+{"ts": "2026-07-17T15:41:44.012453-04:00", "order_id": "197", "status": "timeout"}
+{"ts": "2026-07-17T15:41:53.276932-04:00", "order_id": "199", "status": "timeout"}
+{"ts": "2026-07-17T15:42:02.539111-04:00", "order_id": "201", "status": "timeout"}
+{"ts": "2026-07-17T15:42:11.799944-04:00", "order_id": "203", "status": "timeout"}
+{"ts": "2026-07-17T15:42:21.055947-04:00", "order_id": "205", "status": "timeout"}
+{"ts": "2026-07-17T15:42:30.320916-04:00", "order_id": "207", "status": "timeout"}
+{"ts": "2026-07-17T15:42:39.587787-04:00", "order_id": "209", "status": "timeout"}
+{"ts": "2026-07-17T15:42:48.852658-04:00", "order_id": "211", "status": "timeout"}
+{"ts": "2026-07-17T15:42:58.119744-04:00", "order_id": "213", "status": "timeout"}
+{"ts": "2026-07-17T15:43:07.390156-04:00", "order_id": "215", "status": "timeout"}
+{"ts": "2026-07-17T15:43:16.661945-04:00", "order_id": "217", "status": "timeout"}
+{"ts": "2026-07-17T15:43:25.931652-04:00", "order_id": "219", "status": "timeout"}
+{"ts": "2026-07-17T15:43:35.203010-04:00", "order_id": "221", "status": "timeout"}
+{"ts": "2026-07-17T15:43:44.470214-04:00", "order_id": "223", "status": "timeout"}
+{"ts": "2026-07-17T15:43:53.740507-04:00", "order_id": "225", "status": "timeout"}
+{"ts": "2026-07-17T15:44:03.012792-04:00", "order_id": "227", "status": "timeout"}
+{"ts": "2026-07-17T15:44:12.280128-04:00", "order_id": "229", "status": "timeout"}
+{"ts": "2026-07-17T15:44:21.552263-04:00", "order_id": "231", "status": "timeout"}
+{"ts": "2026-07-17T15:44:30.821322-04:00", "order_id": "233", "status": "timeout"}
+{"ts": "2026-07-17T15:44:40.087321-04:00", "order_id": "235", "status": "timeout"}
+{"ts": "2026-07-17T15:44:49.353576-04:00", "order_id": "237", "status": "timeout"}
+{"ts": "2026-07-17T15:44:58.622717-04:00", "order_id": "239", "status": "timeout"}
+{"ts": "2026-07-17T15:45:07.892111-04:00", "order_id": "241", "status": "timeout"}
+{"ts": "2026-07-17T15:45:17.156123-04:00", "order_id": "243", "status": "timeout"}
+{"ts": "2026-07-17T15:45:26.423600-04:00", "order_id": "245", "status": "timeout"}
+{"ts": "2026-07-17T15:45:35.693791-04:00", "order_id": "247", "status": "timeout"}

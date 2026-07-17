@@ -17,8 +17,6 @@ DATASET = "XNAS.ITCH"
 
 K = 500
 
-
-# Imbalance
 day_bars = (
     adapter.scan_data(
         tickers="ALL_SYMBOLS",
