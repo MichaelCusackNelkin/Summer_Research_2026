@@ -280,7 +280,20 @@ class Broker:
         exchange: str = "SMART",
         currency: str = "USD",
     ) -> Stock:
-        """Create and qualify a stock contract."""
+        """Create and qualify a stock contract.
+
+        When *exchange* is anything other than ``"SMART"``, the
+        qualified contract MUST come back with the same exchange field —
+        anything else means IB re-routed the request (or qualifyContracts
+        picked a different match) and placing the order would ship it
+        off-venue. We RAISE in that case (fail closed) rather than let
+        a silent off-venue fill through: this is the safety backstop
+        for callers that direct-route to a specific book (e.g.
+        ``exchange="ISLAND"`` for NASDAQ-only strategies).
+
+        SMART callers are unaffected — the guard is skipped when the
+        caller explicitly asked for SMART routing.
+        """
         contract = Stock(symbol, exchange, currency)
         qualified = self._ib.qualifyContracts(contract)
         if not qualified or qualified[0] is None:
@@ -288,7 +301,29 @@ class Broker:
                 f"Could not qualify contract for '{symbol}'. "
                 f"Check that the symbol is correct and TWS is connected."
             )
-        return qualified[0]
+        q = qualified[0]
+        # Route-survival assertion: refuse to place an order whose
+        # qualified contract's exchange no longer matches the caller's
+        # request. Only fires on non-SMART requests, so this is
+        # invisible to legacy SMART callers. See ib_async's
+        # qualifyContractsAsync in ib.py — the "SMART" branch preserves
+        # the input string via a special case (search for
+        # ``contract.exchange == "SMART"`` in ib.py's
+        # qualifyContractsAsync); for any non-SMART request, IB's
+        # dataclassUpdate copies the exchange from the resolved
+        # ContractDetails record onto our contract, so a mismatch here
+        # is genuine (not a naming quirk of the SDK).
+        got_exchange = getattr(q, "exchange", "")
+        if exchange != "SMART" and got_exchange != exchange:
+            raise ValueError(
+                f"Qualified contract for '{symbol}' routed to "
+                f"{got_exchange!r}, expected {exchange!r} — refusing to "
+                f"place an off-venue order. This safety guard is what "
+                f"prevents a NASDAQ-only strategy from silently filling "
+                f"on a different venue when qualifyContracts "
+                f"canonicalises the route."
+            )
+        return q
 
     # ------------------------------------------------------------------
     # Order placement
@@ -303,6 +338,7 @@ class Broker:
         limit_price: Optional[float],
         stop_price: Optional[float],
         tif: str = "DAY",
+        exchange: str = "SMART",
     ) -> str:
         """
         Place an order and return its order_id as a string.
@@ -325,6 +361,14 @@ class Broker:
             Time in force. Common values: ``"DAY"``, ``"GTC"``, ``"IOC"``,
             ``"FOK"``. Defaults to ``"DAY"`` to prevent orders from
             accidentally surviving past the trading session.
+        exchange : str
+            Destination exchange for the underlying ``Stock`` contract.
+            Default ``"SMART"`` preserves legacy behaviour — IBKR's
+            SMART router picks the venue. Callers that require a
+            specific venue (e.g. ``"ISLAND"`` for the NASDAQ INET book,
+            when the strategy depends on the NASDAQ closing auction)
+            pass it explicitly. Threaded through to ``_make_contract``
+            unchanged so ``qualifyContracts`` sees the requested route.
 
             **Note:** Market-on-Close (``"MOC"``) orders are only valid with
             ``tif="DAY"`` — TWS rejects other TIFs. This method silently
@@ -355,7 +399,7 @@ class Broker:
                 "Broker is not connected. Call connect() before placing orders."
             )
 
-        contract = self._make_contract(symbol)
+        contract = self._make_contract(symbol, exchange=exchange)
 
         if order_type == "MKT":
             order = MarketOrder(action, quantity)
@@ -406,6 +450,7 @@ class Broker:
         limit_price: Optional[float] = None,
         stop_price: Optional[float] = None,
         tif: str = "DAY",
+        exchange: str = "SMART",
     ) -> str:
         """
         Buy shares (go long or cover a short).
@@ -426,6 +471,12 @@ class Broker:
             Time in force (``"DAY"``, ``"GTC"``, ``"IOC"``, ``"FOK"``).
             MOC orders are silently coerced to ``"DAY"`` — TWS rejects
             any other TIF for MOC.
+        exchange : str
+            Destination exchange for the underlying ``Stock`` contract.
+            Default ``"SMART"`` preserves legacy behaviour (IBKR's SMART
+            router picks the venue). Pass a direct-route code such as
+            ``"ISLAND"`` (NASDAQ INET) to force execution on a specific
+            venue.
 
         Returns
         -------
@@ -438,8 +489,12 @@ class Broker:
         >>> b.buy("AAPL", 100, "LMT", limit_price=150.00)
         >>> b.buy("AAPL", 50, tif="IOC")
         >>> b.buy("AAPL", 100, "MOC")            # market-on-close
+        >>> b.buy("AAPL", 100, exchange="ISLAND")  # NASDAQ direct route
         """
-        return self._place(symbol, quantity, "BUY", order_type, limit_price, stop_price, tif)
+        return self._place(
+            symbol, quantity, "BUY", order_type, limit_price, stop_price, tif,
+            exchange=exchange,
+        )
 
     def sell(
         self,
@@ -449,6 +504,7 @@ class Broker:
         limit_price: Optional[float] = None,
         stop_price: Optional[float] = None,
         tif: str = "DAY",
+        exchange: str = "SMART",
     ) -> str:
         """
         Sell shares (close a long or open a short).
@@ -469,13 +525,21 @@ class Broker:
             Time in force (``"DAY"``, ``"GTC"``, ``"IOC"``, ``"FOK"``).
             MOC orders are silently coerced to ``"DAY"`` — TWS rejects
             any other TIF for MOC.
+        exchange : str
+            Destination exchange for the underlying ``Stock`` contract.
+            Default ``"SMART"`` preserves legacy behaviour. Pass a
+            direct-route code such as ``"ISLAND"`` to force execution
+            on the NASDAQ INET book.
 
         Returns
         -------
         str
             Order ID.
         """
-        return self._place(symbol, quantity, "SELL", order_type, limit_price, stop_price, tif)
+        return self._place(
+            symbol, quantity, "SELL", order_type, limit_price, stop_price, tif,
+            exchange=exchange,
+        )
 
     def short(
         self,
@@ -485,6 +549,7 @@ class Broker:
         limit_price: Optional[float] = None,
         stop_price: Optional[float] = None,
         tif: str = "DAY",
+        exchange: str = "SMART",
     ) -> str:
         """
         Explicitly short a stock.
@@ -508,6 +573,11 @@ class Broker:
             Time in force (``"DAY"``, ``"GTC"``, ``"IOC"``, ``"FOK"``).
             MOC orders are silently coerced to ``"DAY"`` — TWS rejects
             any other TIF for MOC.
+        exchange : str
+            Destination exchange for the underlying ``Stock`` contract.
+            Default ``"SMART"`` preserves legacy behaviour. Pass a
+            direct-route code such as ``"ISLAND"`` to force execution
+            on the NASDAQ INET book.
 
         Returns
         -------
@@ -534,7 +604,10 @@ class Broker:
                 f"sell first, then short."
             )
 
-        return self._place(symbol, quantity, "SELL", order_type, limit_price, stop_price, tif)
+        return self._place(
+            symbol, quantity, "SELL", order_type, limit_price, stop_price, tif,
+            exchange=exchange,
+        )
 
     def cover(
         self,
@@ -544,6 +617,7 @@ class Broker:
         limit_price: Optional[float] = None,
         stop_price: Optional[float] = None,
         tif: str = "DAY",
+        exchange: str = "SMART",
     ) -> str:
         """
         Buy to cover a short position.
@@ -567,6 +641,11 @@ class Broker:
             Time in force (``"DAY"``, ``"GTC"``, ``"IOC"``, ``"FOK"``).
             MOC orders are silently coerced to ``"DAY"`` — TWS rejects
             any other TIF for MOC.
+        exchange : str
+            Destination exchange for the underlying ``Stock`` contract.
+            Default ``"SMART"`` preserves legacy behaviour. Pass a
+            direct-route code such as ``"ISLAND"`` to force execution
+            on the NASDAQ INET book.
 
         Returns
         -------
@@ -591,7 +670,10 @@ class Broker:
                 f"Use buy() for opening a long."
             )
 
-        return self._place(symbol, quantity, "BUY", order_type, limit_price, stop_price, tif)
+        return self._place(
+            symbol, quantity, "BUY", order_type, limit_price, stop_price, tif,
+            exchange=exchange,
+        )
 
     # ------------------------------------------------------------------
     # Market-on-Close (MOC) convenience wrappers
@@ -604,7 +686,8 @@ class Broker:
     # will reject late submissions with an order status error, not this
     # wrapper. See IB's "Order Type" docs for exact cutoffs.
 
-    def buy_moc(self, symbol: str, quantity: int) -> str:
+    def buy_moc(self, symbol: str, quantity: int,
+                exchange: str = "SMART") -> str:
         """
         Buy shares with a Market-on-Close order.
 
@@ -618,6 +701,11 @@ class Broker:
             Ticker symbol (e.g. ``"AAPL"``).
         quantity : int
             Number of shares. Must be positive and <= ``MAX_ORDER_QTY``.
+        exchange : str
+            Destination exchange. Default ``"SMART"`` preserves legacy
+            behaviour. Pass ``"ISLAND"`` to route the MOC directly to
+            the NASDAQ INET close-cross (the closing auction the
+            NASDAQ-imbalance strategies target).
 
         Returns
         -------
@@ -627,13 +715,16 @@ class Broker:
         Examples
         --------
         >>> b.buy_moc("AAPL", 100)   # buys 100 AAPL at the 4pm ET close
+        >>> b.buy_moc("AAPL", 100, exchange="ISLAND")  # NASDAQ close only
         """
         return self._place(
             symbol, quantity, "BUY",
             order_type="MOC", limit_price=None, stop_price=None, tif="DAY",
+            exchange=exchange,
         )
 
-    def short_moc(self, symbol: str, quantity: int) -> str:
+    def short_moc(self, symbol: str, quantity: int,
+                  exchange: str = "SMART") -> str:
         """
         Short a stock with a Market-on-Close order.
 
@@ -647,6 +738,10 @@ class Broker:
             Ticker symbol.
         quantity : int
             Number of shares to short. Must be positive.
+        exchange : str
+            Destination exchange. Default ``"SMART"`` preserves legacy
+            behaviour. Pass ``"ISLAND"`` to route the MOC directly to
+            the NASDAQ INET close-cross.
 
         Returns
         -------
@@ -661,6 +756,7 @@ class Broker:
         Examples
         --------
         >>> b.short_moc("TSLA", 25)  # shorts 25 TSLA at today's close
+        >>> b.short_moc("TSLA", 25, exchange="ISLAND")  # NASDAQ close only
         """
         # Mirror short()'s safety check: refuse to convert a long into a
         # short via an implicit sell.
@@ -682,6 +778,7 @@ class Broker:
         return self._place(
             symbol, quantity, "SELL",
             order_type="MOC", limit_price=None, stop_price=None, tif="DAY",
+            exchange=exchange,
         )
 
     # ------------------------------------------------------------------
@@ -1079,6 +1176,7 @@ class Broker:
         order_type: str = "MKT",
         close_unlisted: bool = True,
         tif: str = "DAY",
+        exchange: str = "SMART",
     ) -> list[str]:
         """
         Rebalance portfolio to match target positions.
@@ -1096,6 +1194,12 @@ class Broker:
         tif : str
             Time in force for all rebalance orders. Coerced to ``"DAY"``
             for MOC orders inside ``_place()``.
+        exchange : str
+            Destination exchange for every leg placed by the rebalance
+            (both the target-adjust legs and the ``close_unlisted``
+            legs). Default ``"SMART"`` preserves legacy behaviour; pass
+            ``"ISLAND"`` to route every rebalance order to the NASDAQ
+            INET book.
 
         Returns
         -------
@@ -1112,6 +1216,7 @@ class Broker:
         >>> b.rebalance({"AAPL": 100, "TSLA": -50, "MSFT": 200})
         >>> b.rebalance({"AAPL": 100}, tif="IOC")
         >>> b.rebalance({"AAPL": 100, "MSFT": 50}, order_type="MOC")
+        >>> b.rebalance({"AAPL": 100}, exchange="ISLAND")  # NASDAQ direct
         """
         if order_type not in self._REBALANCE_ORDER_TYPES:
             raise ValueError(
@@ -1130,9 +1235,13 @@ class Broker:
             if diff == 0:
                 continue
             elif diff > 0:
-                oid = self.buy(symbol, abs(diff), order_type, tif=tif)
+                oid = self.buy(
+                    symbol, abs(diff), order_type, tif=tif, exchange=exchange,
+                )
             else:
-                oid = self.sell(symbol, abs(diff), order_type, tif=tif)
+                oid = self.sell(
+                    symbol, abs(diff), order_type, tif=tif, exchange=exchange,
+                )
 
             order_ids.append(oid)
             logger.info(
@@ -1144,9 +1253,15 @@ class Broker:
             for symbol, qty in current.items():
                 if symbol not in target_positions and qty != 0:
                     if qty > 0:
-                        oid = self.sell(symbol, abs(qty), order_type, tif=tif)
+                        oid = self.sell(
+                            symbol, abs(qty), order_type,
+                            tif=tif, exchange=exchange,
+                        )
                     else:
-                        oid = self.buy(symbol, abs(qty), order_type, tif=tif)
+                        oid = self.buy(
+                            symbol, abs(qty), order_type,
+                            tif=tif, exchange=exchange,
+                        )
                     order_ids.append(oid)
                     logger.info(f"Rebalance: closing {symbol} (qty={qty})")
 
@@ -1212,6 +1327,7 @@ class Broker:
         symbol: str,
         quantity: int,
         action: str,
+        exchange: str = "SMART",
     ) -> str:
         """
         Place a market order with Immediate-Or-Cancel time-in-force.
@@ -1227,6 +1343,11 @@ class Broker:
             Number of shares.  Must be positive.
         action : str
             ``"BUY"`` or ``"SELL"``.
+        exchange : str
+            Destination exchange for the underlying ``Stock`` contract.
+            Default ``"SMART"`` preserves legacy behaviour. Pass a
+            direct-route code such as ``"ISLAND"`` to force execution
+            on the NASDAQ INET book.
 
         Returns
         -------
@@ -1247,6 +1368,7 @@ class Broker:
         return self._place(
             symbol, quantity, action, order_type="MKT",
             limit_price=None, stop_price=None, tif="IOC",
+            exchange=exchange,
         )
 
     def close_position(
@@ -1254,6 +1376,7 @@ class Broker:
         symbol: str,
         order_type: str = "MKT",
         tif: str = "DAY",
+        exchange: str = "SMART",
     ) -> Optional[str]:
         """
         Close the entire position for a symbol (whether long or short).
@@ -1270,6 +1393,12 @@ class Broker:
         tif : str
             Time in force (``"DAY"``, ``"GTC"``, ``"IOC"``, ``"FOK"``).
             Coerced to ``"DAY"`` for MOC.
+        exchange : str
+            Destination exchange for the closing order's underlying
+            ``Stock`` contract. Default ``"SMART"`` preserves legacy
+            behaviour. Pass a direct-route code such as ``"ISLAND"``
+            (NASDAQ INET) when the strategy requires venue-specific
+            execution even on the flatten.
 
         Returns
         -------
@@ -1282,14 +1411,21 @@ class Broker:
             return None
 
         if pos.quantity > 0:
-            return self.sell(symbol, abs(pos.quantity), order_type, tif=tif)
+            return self.sell(
+                symbol, abs(pos.quantity), order_type,
+                tif=tif, exchange=exchange,
+            )
         else:
-            return self.buy(symbol, abs(pos.quantity), order_type, tif=tif)
+            return self.buy(
+                symbol, abs(pos.quantity), order_type,
+                tif=tif, exchange=exchange,
+            )
 
     def flatten_all(
         self,
         order_type: str = "MKT",
         tif: str = "DAY",
+        exchange: str = "SMART",
     ) -> list[str]:
         """
         Close ALL positions.
@@ -1304,6 +1440,11 @@ class Broker:
             Time in force for the closing orders.  Use ``"IOC"`` for
             end-of-day flattening to avoid stale orders lingering.
             Coerced to ``"DAY"`` for MOC.
+        exchange : str
+            Destination exchange for each closing order. Default
+            ``"SMART"`` preserves legacy behaviour. Pass a direct-route
+            code such as ``"ISLAND"`` to force every leg onto the
+            NASDAQ INET book.
 
         Returns
         -------
@@ -1314,7 +1455,9 @@ class Broker:
         for pos in self.get_positions():
             if pos.quantity == 0:
                 continue
-            oid = self.close_position(pos.symbol, order_type, tif=tif)
+            oid = self.close_position(
+                pos.symbol, order_type, tif=tif, exchange=exchange,
+            )
             if oid:
                 order_ids.append(oid)
         if order_ids:

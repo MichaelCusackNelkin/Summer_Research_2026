@@ -1,42 +1,571 @@
 {
-  "cancelled_entry_oids": [
-    "oid-1",
-    "oid-2",
-    "oid-3",
-    "oid-4",
-    "oid-5",
-    "oid-6",
-    "oid-7",
-    "oid-8",
-    "oid-9",
-    "oid-10",
-    "oid-11",
-    "oid-12",
-    "oid-13",
-    "oid-14",
-    "oid-15",
-    "oid-16",
-    "oid-17",
-    "oid-18",
-    "oid-19",
-    "oid-20",
-    "oid-21",
-    "oid-22",
-    "oid-23",
-    "oid-24",
-    "oid-25",
-    "oid-26",
-    "oid-27",
-    "oid-28",
-    "oid-29",
-    "oid-30",
-    "oid-31",
-    "oid-32",
-    "oid-33",
-    "oid-34",
-    "oid-35",
-    "oid-36",
-    "oid-37",
+  "cancelled_entry_oids": [],
+  "dry_run": false,
+  "empty_snapshot_after_fills": false,
+  "entries": [
+    {
+      "filled_qty": 14,
+      "order_id": "oid-1",
+      "requested_qty": 14,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "ITCI"
+    },
+    {
+      "filled_qty": 15,
+      "order_id": "oid-2",
+      "requested_qty": 15,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "KDP"
+    },
+    {
+      "filled_qty": 2,
+      "order_id": "oid-3",
+      "requested_qty": 2,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "KLAC"
+    },
+    {
+      "filled_qty": 3,
+      "order_id": "oid-4",
+      "requested_qty": 3,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "LRCX"
+    },
+    {
+      "filled_qty": 20,
+      "order_id": "oid-5",
+      "requested_qty": 20,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "LULU"
+    },
+    {
+      "filled_qty": 7,
+      "order_id": "oid-6",
+      "requested_qty": 7,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "MAR"
+    },
+    {
+      "filled_qty": 9,
+      "order_id": "oid-7",
+      "requested_qty": 9,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "MCHP"
+    },
+    {
+      "filled_qty": 17,
+      "order_id": "oid-8",
+      "requested_qty": 17,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "MDB"
+    },
+    {
+      "filled_qty": 6,
+      "order_id": "oid-9",
+      "requested_qty": 6,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "MELI"
+    },
+    {
+      "filled_qty": 17,
+      "order_id": "oid-10",
+      "requested_qty": 17,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "MNST"
+    },
+    {
+      "filled_qty": 12,
+      "order_id": "oid-11",
+      "requested_qty": 12,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "MPWR"
+    },
+    {
+      "filled_qty": 5,
+      "order_id": "oid-12",
+      "requested_qty": 5,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "NXPI"
+    },
+    {
+      "filled_qty": 15,
+      "order_id": "oid-13",
+      "requested_qty": 15,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "OKTA"
+    },
+    {
+      "filled_qty": 10,
+      "order_id": "oid-14",
+      "requested_qty": 10,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "ON"
+    },
+    {
+      "filled_qty": 11,
+      "order_id": "oid-15",
+      "requested_qty": 11,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "ORLY"
+    },
+    {
+      "filled_qty": 1,
+      "order_id": "oid-16",
+      "requested_qty": 1,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "PANW"
+    },
+    {
+      "filled_qty": 1,
+      "order_id": "oid-17",
+      "requested_qty": 1,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "PEP"
+    },
+    {
+      "filled_qty": 3,
+      "order_id": "oid-18",
+      "requested_qty": 3,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "PYPL"
+    },
+    {
+      "filled_qty": 8,
+      "order_id": "oid-19",
+      "requested_qty": 8,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "REGN"
+    },
+    {
+      "filled_qty": 11,
+      "order_id": "oid-20",
+      "requested_qty": 11,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "RGTI"
+    },
+    {
+      "filled_qty": 13,
+      "order_id": "oid-21",
+      "requested_qty": 13,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "ROP"
+    },
+    {
+      "filled_qty": 18,
+      "order_id": "oid-22",
+      "requested_qty": 18,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "ROST"
+    },
+    {
+      "filled_qty": 3,
+      "order_id": "oid-23",
+      "requested_qty": 3,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "SBUX"
+    },
+    {
+      "filled_qty": 6,
+      "order_id": "oid-24",
+      "requested_qty": 6,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "SNPS"
+    },
+    {
+      "filled_qty": 21,
+      "order_id": "oid-25",
+      "requested_qty": 21,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "SOFI"
+    },
+    {
+      "filled_qty": 9,
+      "order_id": "oid-26",
+      "requested_qty": 9,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "TEAM"
+    },
+    {
+      "filled_qty": 11,
+      "order_id": "oid-27",
+      "requested_qty": 11,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "TEM"
+    },
+    {
+      "filled_qty": 20,
+      "order_id": "oid-28",
+      "requested_qty": 20,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "TER"
+    },
+    {
+      "filled_qty": 2,
+      "order_id": "oid-29",
+      "requested_qty": 2,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "TMUS"
+    },
+    {
+      "filled_qty": 3,
+      "order_id": "oid-30",
+      "requested_qty": 3,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "TTD"
+    },
+    {
+      "filled_qty": 8,
+      "order_id": "oid-31",
+      "requested_qty": 8,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "TTWO"
+    },
+    {
+      "filled_qty": 10,
+      "order_id": "oid-32",
+      "requested_qty": 10,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "UAL"
+    },
+    {
+      "filled_qty": 9,
+      "order_id": "oid-33",
+      "requested_qty": 9,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "ULTA"
+    },
+    {
+      "filled_qty": 2,
+      "order_id": "oid-34",
+      "requested_qty": 2,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "VRTX"
+    },
+    {
+      "filled_qty": 10,
+      "order_id": "oid-35",
+      "requested_qty": 10,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "WDAY"
+    },
+    {
+      "filled_qty": 24,
+      "order_id": "oid-36",
+      "requested_qty": 24,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "WDC"
+    },
+    {
+      "filled_qty": 12,
+      "order_id": "oid-37",
+      "requested_qty": 12,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "ZS"
+    }
+  ],
+  "generated_at_ny": "2026-07-17T17:06:36.743009-04:00",
+  "generated_at_utc": "2026-07-17T21:06:36.743009+00:00",
+  "gmv_dollar": 218631.8450899836,
+  "lambda": 5e-05,
+  "moc_batch": [
+    {
+      "oid": "oid-38",
+      "qty": 14,
+      "side": "BUY",
+      "signed_qty": 14,
+      "symbol": "ITCI"
+    },
+    {
+      "oid": "oid-39",
+      "qty": 15,
+      "side": "SELL",
+      "signed_qty": -15,
+      "symbol": "KDP"
+    },
+    {
+      "oid": "oid-40",
+      "qty": 2,
+      "side": "SELL",
+      "signed_qty": -2,
+      "symbol": "KLAC"
+    },
+    {
+      "oid": "oid-41",
+      "qty": 3,
+      "side": "SELL",
+      "signed_qty": -3,
+      "symbol": "LRCX"
+    },
+    {
+      "oid": "oid-42",
+      "qty": 20,
+      "side": "BUY",
+      "signed_qty": 20,
+      "symbol": "LULU"
+    },
+    {
+      "oid": "oid-43",
+      "qty": 7,
+      "side": "BUY",
+      "signed_qty": 7,
+      "symbol": "MAR"
+    },
+    {
+      "oid": "oid-44",
+      "qty": 9,
+      "side": "SELL",
+      "signed_qty": -9,
+      "symbol": "MCHP"
+    },
+    {
+      "oid": "oid-45",
+      "qty": 17,
+      "side": "SELL",
+      "signed_qty": -17,
+      "symbol": "MDB"
+    },
+    {
+      "oid": "oid-46",
+      "qty": 6,
+      "side": "BUY",
+      "signed_qty": 6,
+      "symbol": "MELI"
+    },
+    {
+      "oid": "oid-47",
+      "qty": 17,
+      "side": "BUY",
+      "signed_qty": 17,
+      "symbol": "MNST"
+    },
+    {
+      "oid": "oid-48",
+      "qty": 12,
+      "side": "SELL",
+      "signed_qty": -12,
+      "symbol": "MPWR"
+    },
+    {
+      "oid": "oid-49",
+      "qty": 5,
+      "side": "SELL",
+      "signed_qty": -5,
+      "symbol": "NXPI"
+    },
+    {
+      "oid": "oid-50",
+      "qty": 15,
+      "side": "SELL",
+      "signed_qty": -15,
+      "symbol": "OKTA"
+    },
+    {
+      "oid": "oid-51",
+      "qty": 10,
+      "side": "SELL",
+      "signed_qty": -10,
+      "symbol": "ON"
+    },
+    {
+      "oid": "oid-52",
+      "qty": 11,
+      "side": "SELL",
+      "signed_qty": -11,
+      "symbol": "ORLY"
+    },
+    {
+      "oid": "oid-53",
+      "qty": 1,
+      "side": "BUY",
+      "signed_qty": 1,
+      "symbol": "PANW"
+    },
+    {
+      "oid": "oid-54",
+      "qty": 1,
+      "side": "BUY",
+      "signed_qty": 1,
+      "symbol": "PEP"
+    },
+    {
+      "oid": "oid-55",
+      "qty": 3,
+      "side": "BUY",
+      "signed_qty": 3,
+      "symbol": "PYPL"
+    },
+    {
+      "oid": "oid-56",
+      "qty": 8,
+      "side": "BUY",
+      "signed_qty": 8,
+      "symbol": "REGN"
+    },
+    {
+      "oid": "oid-57",
+      "qty": 11,
+      "side": "BUY",
+      "signed_qty": 11,
+      "symbol": "RGTI"
+    },
+    {
+      "oid": "oid-58",
+      "qty": 13,
+      "side": "BUY",
+      "signed_qty": 13,
+      "symbol": "ROP"
+    },
+    {
+      "oid": "oid-59",
+      "qty": 18,
+      "side": "BUY",
+      "signed_qty": 18,
+      "symbol": "ROST"
+    },
+    {
+      "oid": "oid-60",
+      "qty": 3,
+      "side": "SELL",
+      "signed_qty": -3,
+      "symbol": "SBUX"
+    },
+    {
+      "oid": "oid-61",
+      "qty": 6,
+      "side": "SELL",
+      "signed_qty": -6,
+      "symbol": "SNPS"
+    },
+    {
+      "oid": "oid-62",
+      "qty": 21,
+      "side": "BUY",
+      "signed_qty": 21,
+      "symbol": "SOFI"
+    },
+    {
+      "oid": "oid-63",
+      "qty": 9,
+      "side": "BUY",
+      "signed_qty": 9,
+      "symbol": "TEAM"
+    },
+    {
+      "oid": "oid-64",
+      "qty": 11,
+      "side": "BUY",
+      "signed_qty": 11,
+      "symbol": "TEM"
+    },
+    {
+      "oid": "oid-65",
+      "qty": 20,
+      "side": "BUY",
+      "signed_qty": 20,
+      "symbol": "TER"
+    },
+    {
+      "oid": "oid-66",
+      "qty": 2,
+      "side": "SELL",
+      "signed_qty": -2,
+      "symbol": "TMUS"
+    },
+    {
+      "oid": "oid-67",
+      "qty": 3,
+      "side": "BUY",
+      "signed_qty": 3,
+      "symbol": "TTD"
+    },
+    {
+      "oid": "oid-68",
+      "qty": 8,
+      "side": "SELL",
+      "signed_qty": -8,
+      "symbol": "TTWO"
+    },
+    {
+      "oid": "oid-69",
+      "qty": 10,
+      "side": "SELL",
+      "signed_qty": -10,
+      "symbol": "UAL"
+    },
+    {
+      "oid": "oid-70",
+      "qty": 9,
+      "side": "SELL",
+      "signed_qty": -9,
+      "symbol": "ULTA"
+    },
+    {
+      "oid": "oid-71",
+      "qty": 2,
+      "side": "SELL",
+      "signed_qty": -2,
+      "symbol": "VRTX"
+    },
+    {
+      "oid": "oid-72",
+      "qty": 10,
+      "side": "BUY",
+      "signed_qty": 10,
+      "symbol": "WDAY"
+    },
+    {
+      "oid": "oid-73",
+      "qty": 24,
+      "side": "BUY",
+      "signed_qty": 24,
+      "symbol": "WDC"
+    },
+    {
+      "oid": "oid-74",
+      "qty": 12,
+      "side": "SELL",
+      "signed_qty": -12,
+      "symbol": "ZS"
+    }
+  ],
+  "moc_order_ids": [
     "oid-38",
     "oid-39",
     "oid-40",
@@ -67,634 +596,55 @@
     "oid-65",
     "oid-66",
     "oid-67",
-    "oid-68"
+    "oid-68",
+    "oid-69",
+    "oid-70",
+    "oid-71",
+    "oid-72",
+    "oid-73",
+    "oid-74"
   ],
-  "dry_run": false,
-  "empty_snapshot_after_fills": false,
-  "entries": [
-    {
-      "filled_qty": 0,
-      "order_id": "oid-1",
-      "requested_qty": 5,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "ABNB"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-2",
-      "requested_qty": 6,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "ADBE"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-3",
-      "requested_qty": 1,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "ADP"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-4",
-      "requested_qty": 8,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "ADSK"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-5",
-      "requested_qty": 12,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "AEP"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-6",
-      "requested_qty": 1,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "AMAT"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-7",
-      "requested_qty": 21,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "AXON"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-8",
-      "requested_qty": 2,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "BKNG"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-9",
-      "requested_qty": 16,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "BKR"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-10",
-      "requested_qty": 6,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "CDNS"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-11",
-      "requested_qty": 4,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "CHTR"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-12",
-      "requested_qty": 4,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "CMCSA"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-13",
-      "requested_qty": 6,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "CME"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-14",
-      "requested_qty": 4,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "CRWV"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-15",
-      "requested_qty": 18,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "CSX"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-16",
-      "requested_qty": 17,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "CTAS"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-17",
-      "requested_qty": 11,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "CTSH"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-18",
-      "requested_qty": 12,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "DDOG"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-19",
-      "requested_qty": 11,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "EA"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-20",
-      "requested_qty": 13,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "EBAY"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-21",
-      "requested_qty": 10,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "EQIX"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-22",
-      "requested_qty": 14,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "EXC"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-23",
-      "requested_qty": 21,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "EXE"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-24",
-      "requested_qty": 15,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "EXPE"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-25",
-      "requested_qty": 18,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "FANG"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-26",
-      "requested_qty": 10,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "FSLR"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-27",
-      "requested_qty": 3,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "FTNT"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-28",
-      "requested_qty": 3,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "HON"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-29",
-      "requested_qty": 2,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "HOOD"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-30",
-      "requested_qty": 16,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "IBKR"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-31",
-      "requested_qty": 14,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "IDXX"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-32",
-      "requested_qty": 14,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "ITCI"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-33",
-      "requested_qty": 15,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "KDP"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-34",
-      "requested_qty": 2,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "KLAC"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-35",
-      "requested_qty": 3,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "LRCX"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-36",
-      "requested_qty": 20,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "LULU"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-37",
-      "requested_qty": 7,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "MAR"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-38",
-      "requested_qty": 9,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "MCHP"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-39",
-      "requested_qty": 17,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "MDB"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-40",
-      "requested_qty": 6,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "MELI"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-41",
-      "requested_qty": 17,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "MNST"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-42",
-      "requested_qty": 12,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "MPWR"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-43",
-      "requested_qty": 5,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "NXPI"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-44",
-      "requested_qty": 15,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "OKTA"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-45",
-      "requested_qty": 10,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "ON"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-46",
-      "requested_qty": 11,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "ORLY"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-47",
-      "requested_qty": 1,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "PANW"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-48",
-      "requested_qty": 1,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "PEP"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-49",
-      "requested_qty": 3,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "PYPL"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-50",
-      "requested_qty": 8,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "REGN"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-51",
-      "requested_qty": 11,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "RGTI"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-52",
-      "requested_qty": 13,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "ROP"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-53",
-      "requested_qty": 18,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "ROST"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-54",
-      "requested_qty": 3,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "SBUX"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-55",
-      "requested_qty": 6,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "SNPS"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-56",
-      "requested_qty": 21,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "SOFI"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-57",
-      "requested_qty": 9,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "TEAM"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-58",
-      "requested_qty": 11,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "TEM"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-59",
-      "requested_qty": 20,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "TER"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-60",
-      "requested_qty": 2,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "TMUS"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-61",
-      "requested_qty": 3,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "TTD"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-62",
-      "requested_qty": 8,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "TTWO"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-63",
-      "requested_qty": 10,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "UAL"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-64",
-      "requested_qty": 9,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "ULTA"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-65",
-      "requested_qty": 2,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "VRTX"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-66",
-      "requested_qty": 10,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "WDAY"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-67",
-      "requested_qty": 24,
-      "side": "SELL",
-      "status": "ApiCancelled",
-      "symbol": "WDC"
-    },
-    {
-      "filled_qty": 0,
-      "order_id": "oid-68",
-      "requested_qty": 12,
-      "side": "BUY",
-      "status": "ApiCancelled",
-      "symbol": "ZS"
-    }
-  ],
-  "generated_at_ny": "2026-07-16T17:16:50.188918-04:00",
-  "generated_at_utc": "2026-07-16T21:16:50.188918+00:00",
-  "gmv_dollar": 218631.8450899836,
-  "lambda": 5e-05,
-  "moc_batch": [],
-  "moc_order_ids": [],
   "moc_positions_unknown": false,
-  "moc_signed_by_sym": {},
-  "moc_skipped_past_cutoff": [
-    "ABNB",
-    "ADBE",
-    "ADP",
-    "ADSK",
-    "AEP",
-    "AMAT",
-    "AXON",
-    "BKNG",
-    "BKR",
-    "CDNS",
-    "CHTR",
-    "CMCSA",
-    "CME",
-    "CRWV",
-    "CSX",
-    "CTAS",
-    "CTSH",
-    "DDOG",
-    "EA",
-    "EBAY",
-    "EQIX",
-    "EXC",
-    "EXE",
-    "EXPE",
-    "FANG",
-    "FSLR",
-    "FTNT",
-    "HON",
-    "HOOD",
-    "IBKR",
-    "IDXX",
-    "ITCI",
-    "KDP",
-    "KLAC",
-    "LRCX",
-    "LULU",
-    "MAR",
-    "MCHP",
-    "MDB",
-    "MELI",
-    "MNST",
-    "MPWR",
-    "NXPI",
-    "OKTA",
-    "ON",
-    "ORLY",
-    "PANW",
-    "PEP",
-    "PYPL",
-    "REGN",
-    "RGTI",
-    "ROP",
-    "ROST",
-    "SBUX",
-    "SNPS",
-    "SOFI",
-    "TEAM",
-    "TEM",
-    "TER",
-    "TMUS",
-    "TTD",
-    "TTWO",
-    "UAL",
-    "ULTA",
-    "VRTX",
-    "WDAY",
-    "WDC",
-    "ZS"
-  ],
+  "moc_signed_by_sym": {
+    "ITCI": 14,
+    "KDP": -15,
+    "KLAC": -2,
+    "LRCX": -3,
+    "LULU": 20,
+    "MAR": 7,
+    "MCHP": -9,
+    "MDB": -17,
+    "MELI": 6,
+    "MNST": 17,
+    "MPWR": -12,
+    "NXPI": -5,
+    "OKTA": -15,
+    "ON": -10,
+    "ORLY": -11,
+    "PANW": 1,
+    "PEP": 1,
+    "PYPL": 3,
+    "REGN": 8,
+    "RGTI": 11,
+    "ROP": 13,
+    "ROST": 18,
+    "SBUX": -3,
+    "SNPS": -6,
+    "SOFI": 21,
+    "TEAM": 9,
+    "TEM": 11,
+    "TER": 20,
+    "TMUS": -2,
+    "TTD": 3,
+    "TTWO": -8,
+    "UAL": -10,
+    "ULTA": -9,
+    "VRTX": -2,
+    "WDAY": 10,
+    "WDC": 24,
+    "ZS": -12
+  },
+  "moc_skipped_past_cutoff": [],
   "mode": "paper",
   "nmv_dollar": -14658.454251480074,
   "scale": 20000.0,
@@ -768,76 +718,7 @@
     "WDC": -24,
     "ZS": 12
   },
-  "uncovered_symbols": [
-    "ABNB",
-    "ADBE",
-    "ADP",
-    "ADSK",
-    "AEP",
-    "AMAT",
-    "AXON",
-    "BKNG",
-    "BKR",
-    "CDNS",
-    "CHTR",
-    "CMCSA",
-    "CME",
-    "CRWV",
-    "CSX",
-    "CTAS",
-    "CTSH",
-    "DDOG",
-    "EA",
-    "EBAY",
-    "EQIX",
-    "EXC",
-    "EXE",
-    "EXPE",
-    "FANG",
-    "FSLR",
-    "FTNT",
-    "HON",
-    "HOOD",
-    "IBKR",
-    "IDXX",
-    "ITCI",
-    "KDP",
-    "KLAC",
-    "LRCX",
-    "LULU",
-    "MAR",
-    "MCHP",
-    "MDB",
-    "MELI",
-    "MNST",
-    "MPWR",
-    "NXPI",
-    "OKTA",
-    "ON",
-    "ORLY",
-    "PANW",
-    "PEP",
-    "PYPL",
-    "REGN",
-    "RGTI",
-    "ROP",
-    "ROST",
-    "SBUX",
-    "SNPS",
-    "SOFI",
-    "TEAM",
-    "TEM",
-    "TER",
-    "TMUS",
-    "TTD",
-    "TTWO",
-    "UAL",
-    "ULTA",
-    "VRTX",
-    "WDAY",
-    "WDC",
-    "ZS"
-  ],
+  "uncovered_symbols": [],
   "unfilled_moc_symbols": [],
   "universe_file": "top_100_universe.txt",
   "universe_hash": "90475a475dcb",

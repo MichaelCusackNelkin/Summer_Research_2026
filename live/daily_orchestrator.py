@@ -87,6 +87,7 @@ import polars as pl
 _UTC = timezone.utc
 
 from live import config
+from live.nasdaq_routing import NASDAQ_EXCHANGE
 from live.features import (
     ALPHA_FEATURES,
     build_feature_frame,
@@ -694,19 +695,62 @@ def _prequalify_symbols(broker, symbols: list[str]) -> set[str]:
     it from the extended target so ``rebalance`` won't try to trade it.
 
     Uses the broker's own ``_make_contract`` helper so we go through the
-    same code path ``_place`` uses at trade time. We swallow individual
-    exceptions and log them; one bad name should not kill the batch.
+    same code path ``_place`` uses at trade time — and we pass the same
+    ``NASDAQ_EXCHANGE`` code every entry/exit uses so qualification
+    surfaces a NASDAQ-untradeable name here (drop) instead of at order
+    submission (a lost session slot). See ``live/nasdaq_routing.py``
+    for why NASDAQ-only routing is a hard requirement of this strategy.
+    We swallow individual exceptions and log them; one bad name should
+    not kill the batch.
+
+    NASDAQ-listed eligibility filter
+    --------------------------------
+
+    Direct-routing to ``ISLAND`` is not the same as being NASDAQ-listed.
+    IB will qualify NYSE- or ARCA-primary names on ``ISLAND`` for
+    continuous UTP trading — but the MOC at the close is the
+    *primary listing exchange's* closing cross. So a name whose
+    ``primaryExchange`` is ``"NYSE"`` (or anything other than
+    ``"NASDAQ"``) will pass qualification here, then have its MOC exit
+    mis-print / rejected at the 16:00 close-cross. That silently
+    breaks the strategy (which is calibrated to the NASDAQ auction
+    print).
+
+    We therefore also require ``primaryExchange == "NASDAQ"`` on every
+    qualified contract and DROP any non-NASDAQ-listed name with a loud
+    warning. This is the correct behaviour for a NASDAQ-only strategy:
+    fills off the NASDAQ close-cross are useless.
     """
     ok: set[str] = set()
     for sym in symbols:
         try:
-            broker._make_contract(sym)
-            ok.add(sym)
+            contract = broker._make_contract(sym, exchange=NASDAQ_EXCHANGE)
         except Exception as e:
             logger.warning(
                 "contract qualification failed",
                 extra={"symbol": sym, "error": str(e)[:200]},
             )
+            continue
+        # NASDAQ-listed eligibility: drop names whose primary listing
+        # is not NASDAQ, because their MOC prints on their home
+        # exchange's close-cross, not NASDAQ's. We include the
+        # qualified contract's primaryExchange in the log so the
+        # operator can see WHY the name was dropped.
+        primary = getattr(contract, "primaryExchange", "") or ""
+        if primary != "NASDAQ":
+            logger.warning(
+                "dropping non-NASDAQ-listed symbol from target: MOC "
+                "at close prints on the primary listing's close-cross, "
+                "not NASDAQ's — an ISLAND MOC on this name would "
+                "mis-print or be rejected",
+                extra={
+                    "symbol": sym,
+                    "primary_exchange": primary,
+                    "expected_primary_exchange": "NASDAQ",
+                },
+            )
+            continue
+        ok.add(sym)
     logger.info(
         "contracts pre-qualified",
         extra={"n_ok": len(ok), "n_requested": len(symbols)},
@@ -768,10 +812,17 @@ def _submit_mkt_entries(
         side = "BUY" if diff > 0 else "SELL"
         qty = int(abs(diff))
         try:
+            # NASDAQ-only routing (see live/nasdaq_routing.py): the
+            # strategy is calibrated to the NASDAQ closing auction —
+            # SMART-routed off-venue fills are uncorrelated with the
+            # signal we sized, so every entry MKT is forced to the
+            # NASDAQ INET book.
             if side == "BUY":
-                oid = broker.buy(sym, qty, order_type="MKT")
+                oid = broker.buy(sym, qty, order_type="MKT",
+                                 exchange=NASDAQ_EXCHANGE)
             else:
-                oid = broker.sell(sym, qty, order_type="MKT")
+                oid = broker.sell(sym, qty, order_type="MKT",
+                                  exchange=NASDAQ_EXCHANGE)
         except Exception as e:
             logger.warning(
                 "MKT entry submission failed",
@@ -1006,10 +1057,17 @@ def _submit_moc_flatten(
         assert qty > 0, f"MOC flatten: expected positive qty, got {qty}"
         assert side in ("BUY", "SELL"), f"MOC flatten: bad side {side!r}"
         try:
+            # NASDAQ-only routing (see live/nasdaq_routing.py): the
+            # MOC exit MUST print at the NASDAQ close auction — that
+            # is literally the auction we forecast. Route direct to
+            # the NASDAQ INET book instead of letting SMART pick a
+            # different venue's close-cross.
             if side == "BUY":
-                oid = broker.buy(sym, qty, order_type="MOC")
+                oid = broker.buy(sym, qty, order_type="MOC",
+                                 exchange=NASDAQ_EXCHANGE)
             else:
-                oid = broker.sell(sym, qty, order_type="MOC")
+                oid = broker.sell(sym, qty, order_type="MOC",
+                                  exchange=NASDAQ_EXCHANGE)
         except Exception as e:
             logger.warning(
                 "MOC exit submission failed",

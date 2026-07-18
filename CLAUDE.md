@@ -5,24 +5,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this project is
 
 A Columbia MAFN summer research project (per `README.md`) building an optimal-portfolio
-backtest from three estimated pieces — a return **forecast**, a **covariance** matrix, and
-**spread costs** — solved as a portfolio optimization and backtested on a **point-in-time
-(PIT) universe**. The original close-auction imbalance homework is the alpha seed.
+backtest from estimated pieces — a return **forecast**, a **covariance** matrix, **spread
+costs**, and a square-root market-**impact** model — solved as a portfolio optimization and
+backtested on a **point-in-time (PIT) universe**. The original close-auction imbalance homework
+is the alpha seed. The strategy is now **live (paper-traded)**: the same math runs intraday
+against Interactive Brokers, entering at 15:50 and flattening at the 16:00 NASDAQ close cross.
 
-**All three pieces are now live, each in its own top-level directory** — `forecast/`,
-`covariance/`, and `optimizer/` — and the active branch is `attempt-to-forecast`. The three
-notebooks form a pipeline: `covariance/` fits the risk model and `forecast/` fits the alpha
-model, each **persisting artifacts to disk**; `optimizer/optimal_portfolio.ipynb` loads both
-and runs the daily MVO backtest. The `CAX/` corporate-actions downloader feeds the covariance
-side clean (split/dividend-adjusted) prices. The `README.md` "Notes / Research Direction" list
-is the current open-problem backlog (condition number, GARCH idiosyncratic vol, richer
-forecast features, lambda sweeps, intraday/multi-period variants).
+**The research surface is four notebook directories** — `forecast/`, `covariance/`, `impact/`,
+and `optimizer/` — each **persisting artifacts to disk**; `optimizer/optimal_portfolio.ipynb`
+loads all of them and runs the daily MVO backtest. The `CAX/` corporate-actions downloader
+feeds the covariance side clean (split/dividend-adjusted) prices. The **`live/`** directory is
+the production port of that math (a daily orchestrator + a retrain job that rebuilds the same
+artifacts on a schedule), and **`ibkr_broker/`** is the broker wrapper it trades through. The
+`README.md` "Notes / Research Direction" list is the current open-problem backlog (condition
+number, GARCH idiosyncratic vol, richer forecast features, lambda sweeps, intraday/multi-period
+variants).
 
 **Two deliberately disjoint date windows** run through the pipeline (see commit "none-
 overlapping train sets"): the covariance is fit on **2023-06-01 .. 2025-06-01** daily bars,
 while the forecast and optimizer operate on the **later, non-overlapping 2025-06-11 ..
 2026-06-11** window. Keep them separate when editing — the covariance is a train-period risk
-model consumed out-of-sample by the optimizer.
+model consumed out-of-sample by the optimizer. (In `live/retrain.py` these become rolling
+windows: 24 months for covariance, 12 months for forecast/impact, ending yesterday.)
 
 > History: the repo began as two parallel projects (an execution project under
 > `research-alpha/`/`sim_lib/`, plus this alpha direction). The execution code and the
@@ -43,15 +47,32 @@ model consumed out-of-sample by the optimizer.
 ## Repository layout
 
 - `covariance/` — the risk-model surface. `covariance.ipynb` builds the factor covariance and
-  **saves its artifacts here** as `.npy` (`loadings.npy`, `factor_returns.npy`,
-  `factor_cov_matrix.npy`, `idiosyncratic_diag_vec.npy`, `cov_matrix.npy`). `covariance.py`
-  is an earlier scratch script (exploratory, not wired in, and contains stale column
-  references like `price`/`date` — prefer the notebook).
+  **saves its artifacts here** as `.npy`. There are **two vintages of names on disk**: the
+  older set (`loadings.npy`, `factor_returns.npy`, `idiosyncratic_diag_vec.npy`,
+  `cov_matrix.npy`) and the newer **`_return`-suffixed** set the `live/` system consumes
+  (`loadings_return.npy`, `idiosyncratic_diag_return.npy`, `factor_cov_matrix.npy`,
+  `cov_matrix_return.npy`, plus `name_vol.npy`). `live/retrain.py --refit covariance` writes
+  the `_return` set; the optimizer notebook reads both. `covariance.py` is an earlier scratch
+  script (exploratory, not wired in, stale column references like `price`/`date` — prefer the
+  notebook).
 - `forecast/` — the alpha-model surface. `forecasting.ipynb` builds and cross-validates the
-  return forecast and **persists** the fitted sklearn pipeline to `ridge_pipe.joblib`.
+  return forecast and **persists** the fitted sklearn pipeline to **`forecast_pipe.joblib`**
+  (a `StandardScaler` + **`Lasso(alpha=1e-4)`**; the model choice moved from Ridge to Lasso).
+- `impact/` — the market-impact surface. `impact_estimation.ipynb` calibrates a **square-root
+  impact** model and persists `impact_gamma_vec.npy`, `impact_k_vec.npy`, and
+  `reference_stats.parquet` (per-symbol ADV / daily vol used as the impact & cost denominators).
 - `optimizer/` — `optimal_portfolio.ipynb`, the daily MVO backtest that **loads** the
-  forecast (`../forecast/ridge_pipe.joblib`) and risk model (`../covariance/*.npy`) and solves
-  a parametrized QP per day. (Moved here out of the old `notebook_studies/`.)
+  forecast (`../forecast/forecast_pipe.joblib`), risk model (`../covariance/*.npy`), and impact
+  vectors, then solves a parametrized QP per day. (Moved here out of the old `notebook_studies/`.)
+- `live/` — the **production port** of the research pipeline: a daily orchestrator, a retrain
+  job, and a kill switch, trading through `ibkr_broker/`. Has its own detailed operator guide
+  (`live/README.md`) and a full test suite (`live/tests/`). See the "Live trading system"
+  architecture note below.
+- `ibkr_broker/` — installable package (`ibkr-broker`, editable install), an `ib_async` wrapper
+  exposing a synchronous `Broker` class (`buy`/`sell`/`buy_moc`/`get_positions`/
+  `reconcile_positions`/`flatten_all`, etc.). Port map: 7497 paper, 7496 live, 4002/4001
+  Gateway; live connections require the confirm string `YES_I_WANT_LIVE_TRADING`.
+- `whitepaper/` — `wihtepaper.qmd` (filename typo is intentional/current), the Quarto writeup.
 - `CAX/` — corporate-actions download + recovery (splits & dividends from **yfinance**),
   the input to the covariance adjustment. See the architecture note below. Outputs
   `corporate_actions.csv` and `missing_corporate_actions.txt` next to the scripts.
@@ -66,9 +87,11 @@ model consumed out-of-sample by the optimizer.
   daily dollar volume (`close*volume`) from an `ALL_SYMBOLS` daily-bar scan and writes
   `top_{K}_universe.txt`. Run from the repo root. (Note: the `Path.exists`/`top_k["by"]` calls
   are brittle — treat as a helper, verify output.)
-- `top_50_universe.txt`, `top_100_universe.txt`, `top_250_universe.txt`, `top_500_universe.txt`
-  — tiered ADV-ranked universes produced by `universe_selection.py`. **`top_250_universe.txt`
-  is the active universe** all three pipeline notebooks currently read.
+- `top_49_universe.txt`, `top_50_universe.txt`, `top_100_universe.txt`, `top_250_universe.txt`,
+  `top_500_universe.txt` — tiered ADV-ranked universes produced by `universe_selection.py`.
+  **`top_100_universe.txt` is the active universe** — all four pipeline notebooks read it and
+  it is the `live/` system's default `--universe-file` / `--active-universe-file`. `universe.txt`
+  remains the **broad** pool that `live/retrain.py` scans for the historical fit.
 - `universe.txt` — flat newline-delimited ticker list (~2000 names) used by `data.py`, `CAX/`,
   and as the broad pool. Uses Bloomberg/CRSP-style class delimiters (e.g. `BRK.B`).
 - `data.py` (repo root) — small scratch script: materialize-only fetch of
@@ -83,9 +106,11 @@ Notebooks and scripts import the package as a top-level name
 (`from data_collection.data_adapters import ...`) — there is no `PYTHONPATH` shim, it relies
 on the editable install. **Working-directory matters** (paths are relative): each pipeline
 notebook runs from its own directory and reaches up with `../` — e.g. `covariance.ipynb` reads
-`../CAX/corporate_actions.csv` and `../top_250_universe.txt`; the optimizer reads
-`../forecast/ridge_pipe.joblib` and `../covariance/*.npy`. `CAX/CAX.py`, `data.py`, and
-`universe_selection.py` run from the repo root.
+`../CAX/corporate_actions.csv` and `../top_100_universe.txt`; the optimizer reads
+`../forecast/forecast_pipe.joblib` and `../covariance/*.npy`. `CAX/CAX.py`, `data.py`, and
+`universe_selection.py` run from the repo root. The `live/` package, by contrast, is invoked
+**as a module from the repo root** (`.venv/bin/python -m live.daily_orchestrator`) and resolves
+artifact paths relative to the repo root, not a per-directory `../`.
 
 ## Common commands
 
@@ -111,10 +136,40 @@ Use the project venv explicitly — there is no `activate` step. Python is 3.14.
   file): `.venv/bin/python universe_selection.py`.
 - Re-install after editing `data_collection/pyproject.toml`:
   `.venv/bin/pip install -e ./data_collection`.
+- **Install the broker package** (needed for anything in `live/`):
+  `.venv/bin/pip install -e ./ibkr_broker`.
 - Jupyter: `.venv/bin/jupyter lab` (or run notebooks through the venv `ipykernel`).
 
-`requirements.txt` lists the broad runtime deps; `data_collection/pyproject.toml` is the
-authoritative dependency set for the installed package.
+### Live trading system (`live/`) — run as modules from the repo root
+
+`live/README.md` is the authoritative operator's guide (CLI flags, exit codes, guard matrix,
+timing gotchas). The essentials:
+
+- **Tests (cost 0, run these first):**
+  `.venv/bin/python -m pytest data_collection/tests/ live/tests/ ibkr_broker/tests/`
+  (the `ibkr_broker` `market_hours`-marked tests need a live TWS/market; unit tests do not).
+- **Retrain artifacts** (rebuilds the covariance/forecast/impact sets on disk):
+  `.venv/bin/python -m live.retrain --refit all` (or `covariance`/`forecast`/`impact`).
+  Add `--dry-run` to print the plan without fetching or writing.
+- **Broker-free replay** against cached historical data (validates
+  feed→features→alpha→MVO→sizing without touching TWS):
+  `.venv/bin/python -m live.daily_orchestrator --replay-date 2026-05-13 --paper`.
+- **Paper trading** (real Databento feed, TWS paper port 7497):
+  `.venv/bin/python -m live.daily_orchestrator --paper`.
+- **Live trading** requires the exact confirm string:
+  `.venv/bin/python -m live.daily_orchestrator --live --live-confirm YES_I_WANT_LIVE_TRADING`.
+- **Kill switch** (account-wide flatten): `.venv/bin/python -m live.panic --paper`.
+
+**Two guardrails not to trip over.** (1) Historical reads from `retrain` and
+`--replay-date` route through a **coverage manifest** (`live/cache.py`) that *refuses to fetch*
+from Databento's paid Batch API on a cache miss unless `--allow-fetch` (retrain also needs
+`--yes`) — a stale `--end-date` or a drifted universe file raises `CoverageError` instead of
+silently billing. (2) **Exit codes carry the pager predicate: `rc >= 11` is the ONLY code that
+implies a live book at the close** (overnight exposure — page). Everything in `[2, 10]` is a
+safe pre-order refusal.
+
+`requirements.txt` lists the broad runtime deps; `data_collection/pyproject.toml` and
+`ibkr_broker/pyproject.toml` are the authoritative dependency sets for the installed packages.
 
 ## Required environment
 
@@ -127,10 +182,11 @@ from `./.env`. The cache root the tools expect is `<repo_root>/data/dbn_cache/ge
 
 ## Architecture notes that span multiple files
 
-The pipeline is three notebooks that hand artifacts to each other on disk. The forecast
-and optimizer share the same data-loading preamble (imbalance/tbbo/statistics over the
-2025-06-11 .. 2026-06-11 window, `top_250_universe.txt`); the covariance runs on its own
-earlier daily-bar window.
+The research pipeline is four notebooks that hand artifacts to each other on disk. The forecast,
+impact, and optimizer share the same data-loading preamble (imbalance/tbbo/statistics over the
+2025-06-11 .. 2026-06-11 window, `top_100_universe.txt`); the covariance runs on its own
+earlier daily-bar window. `live/` re-implements the same math for production and is the second
+"span-multiple-files" surface — see its own note at the end.
 
 ### Covariance / risk model (`covariance/covariance.ipynb`)
 
@@ -147,9 +203,11 @@ End to end inside the notebook, producing a **factor covariance** `Σ_r = Lᵀ �
    **idiosyncratic diagonal** `D` from the residual (per-name) variance, so the reconstruction
    `Lᵀ Σ_f L + D` is full-rank/PSD. Sanity-check **condition number** and PSD
    (`eigvalsh ≥ -1e-8`).
-5. **Persist** `loadings.npy`, `factor_returns.npy`, `factor_cov_matrix.npy`,
-   `idiosyncratic_diag_vec.npy`, and the assembled `cov_matrix.npy` — the optimizer reads
-   these directly.
+5. **Persist** the artifacts — the optimizer reads these directly. Note the two on-disk
+   vintages: the older `loadings.npy` / `factor_returns.npy` / `idiosyncratic_diag_vec.npy` /
+   `cov_matrix.npy`, and the `_return`-suffixed set the live system consumes
+   (`loadings_return.npy`, `idiosyncratic_diag_return.npy`, `factor_cov_matrix.npy`,
+   `cov_matrix_return.npy`, `name_vol.npy`).
 
 Open problems (from `README.md`): condition number is still ~11,000 (want ≈10); the
 idiosyncratic term should become **time-varying via GARCH(1,1)** (there is a stub markdown
@@ -161,14 +219,24 @@ Forecasts the **15:50–16:00 return** (the close-auction window) from close-imb
 Pulls `imbalance`, `tbbo`, and `statistics` schemas over the 2025-06-11 .. 2026-06-11 window,
 engineers cross-sectional imbalance features (e.g. rank / pct-of-total net imbalance), and
 runs an **IC study** with a `TimeSeriesSplit` (non-overlapping train sets) before fitting a
-linear model (`Ridge`/`Lasso` compared; **Ridge** is the chosen one). The fitted sklearn
-`Pipeline` (scaler + Ridge) is saved to `ridge_pipe.joblib`. Later cells explore **regime
-detection** — regressing daily IC on day-level features like an absorption ratio — to find
-when the imbalance signal flips between momentum and reversion.
+linear model. The chosen model is **`Lasso(alpha=1e-4)`** (moved off Ridge); the fitted sklearn
+`Pipeline` (`StandardScaler` + `Lasso`) is saved to **`forecast_pipe.joblib`**. Later cells
+explore **regime detection** — regressing daily IC on day-level features like an absorption
+ratio — to find when the imbalance signal flips between momentum and reversion.
+
+### Market impact (`impact/impact_estimation.ipynb`)
+
+Calibrates a **square-root market-impact** model — impact ≈ `gamma · sign(x) · sqrt(|x| / ADV)`
+scaled by daily vol — used as a term in the optimizer's QP objective. Persists a per-name
+`impact_gamma_vec.npy` (and `impact_k_vec.npy`), plus `reference_stats.parquet` holding the
+per-symbol ADV and daily-vol denominators. The optimizer/live path falls back to a scalar
+`--impact-gamma` (default 0.5) if the vector is absent, but the reference-stats parquet is a
+hard prerequisite for a live/replay run (its absence aborts the coverage assertion).
 
 ### Daily MVO backtest (`optimizer/optimal_portfolio.ipynb`)
 
-Loads `../forecast/ridge_pipe.joblib` (alpha) and `../covariance/*.npy` (risk), then solves a
+Loads `../forecast/forecast_pipe.joblib` (alpha), `../covariance/*.npy` (risk), and the impact
+vectors, then solves a
 **per-day mean–variance QP with cvxpy** over the active set. Days are independent (the book is
 flat at every close), so it **fans the days across processes**, compiling the parametrized QP
 **once** per worker and re-solving with each day's alpha/costs plugged into `cp.Parameter`s.
@@ -226,6 +294,46 @@ never decodes raw DBN and never hits the API. Materialize once with `get_data(..
 The canonical pattern: try `scan_data`, and on `FileNotFoundError` call
 `get_data(..., materialize_only=True)`. Blocking SDK calls are wrapped in `asyncio.to_thread`,
 so `get_data` is safe to `await` from a Jupyter event loop.
+
+### Live trading system (`live/`) — production port
+
+`live/` re-implements the research math for live (paper) trading and is the second cross-file
+surface. `live/README.md` is the authoritative operator's guide; the shape:
+
+- **`daily_orchestrator.py`** (the big one, ~2000 lines) runs once per trading day: opens the
+  Databento live feed, snapshots at 15:50 America/New_York, engineers the SAME features the
+  forecast was trained on, predicts alpha, solves the MVO, converts dollar targets to signed
+  shares, and executes a **two-leg batch**. The strategy is **intraday, not overnight** — the
+  book is flat at the 16:00 close.
+- **`retrain.py`** rebuilds the covariance/forecast/impact artifacts on a rolling window (24 /
+  12 / 12 months) and writes them **atomically** (`.tmp` + `os.replace`), so the daily always
+  reads a whole file. It scans the **broad** `universe.txt`, then filters to the active set.
+- **`panic.py`** is the account-wide kill switch (flatten everything).
+- **`features.py`** holds the shared feature engineering — `ALPHA_FEATURES` order is the
+  contract between retrain (fit) and the daily (predict). Change it, retrain, *then* let the
+  daily pick up the new pipeline. Also houses `build_factor_covariance`, `build_impact_frame`,
+  `calibrate_impact_gamma` — the notebook math ported to functions.
+- **`optimizer.py`** — `ForecastModel` / `CostModel` / `ImpactModel` / `Optimizer` and
+  `dollar_positions_to_shares`, the cvxpy QP the notebook backtest also expresses.
+- **`live_feed.py` / `replay_feed.py`** — the live Databento websocket feed and its
+  cache-sourced replay twin; both feed the identical downstream path.
+- **`cache.py`** — the **coverage manifest / resolver** (`CoverageManifest`, `CoverageResolver`,
+  `CoverageError`) that fingerprints on-disk parquets by schema/symbols/date-range and refuses a
+  paid Batch API fetch on a miss unless explicitly authorized. This is the anti-surprise-bill
+  guardrail; see the "universe drift trap" in `live/README.md`.
+- **`nasdaq_routing.py`** — the single source of `NASDAQ_EXCHANGE = "ISLAND"`. Every `live/`
+  order routes direct to the NASDAQ INET book (NOT SMART), because the model is calibrated to
+  the NASDAQ close cross — an off-venue fill is uncorrelated with the sized signal. Any new
+  broker call site in `live/` MUST thread this constant through; enforcement is code review
+  (the broker default stays `SMART` for non-`live/` callers). `_prequalify_symbols` also drops
+  non-NASDAQ-primary names.
+- Non-obvious execution invariant worth knowing before touching the order path: **LEG 2 (the
+  MOC counter-flatten) is sized from a fresh `broker.get_positions()` after the entry fills,
+  NEVER from `target - current`.** This is what prevents a partial entry fill from
+  over-flattening into an opposite overnight exposure; `_submit_moc_flatten` structurally
+  refuses any target-side argument. Logs land in `live/logs/` (`targets/`, `fills/`, and the
+  orchestrator/retrain `.log` files); replay target books are quarantined under
+  `live/logs/targets/replay/`.
 
 ### Security identity (note)
 

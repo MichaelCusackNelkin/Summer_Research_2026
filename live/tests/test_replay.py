@@ -92,7 +92,14 @@ class _FakeBroker:
 
     def _make_contract(self, symbol, exchange="SMART", currency="USD"):
         self.qualified_symbols.append(symbol)
-        return object()
+        # Return an object with the ``primaryExchange`` attribute the
+        # orchestrator's NASDAQ-listed eligibility filter inspects.
+        # This replay broker is only exercised on paths that assume
+        # every seeded symbol is NASDAQ-listed, so a static
+        # ``primaryExchange="NASDAQ"`` is sufficient.
+        return SimpleNamespace(
+            symbol=symbol, exchange=exchange, primaryExchange="NASDAQ",
+        )
 
     def _record_fill(self, oid, symbol, action, requested, order_type):
         filled = int(requested)  # full-fill replay broker

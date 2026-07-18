@@ -72,7 +72,9 @@ class _FakeBroker:
         self.disconnected = False
         self.events: list[str] = []
         self.cancel_all_calls = 0
-        self.close_position_calls: list[tuple[str, str]] = []
+        # (symbol, order_type, exchange) — exchange added so the
+        # NASDAQ-routing regression can assert every leg is ISLAND.
+        self.close_position_calls: list[tuple[str, str, str]] = []
 
     def connect(self, mode="paper", **kwargs):
         self.connected = True
@@ -96,9 +98,12 @@ class _FakeBroker:
         # that survived (e.g. MOC past cutoff).
         self._orders = list(self._residual_orders)
 
-    def close_position(self, symbol, order_type="MKT", tif="DAY"):
+    def close_position(self, symbol, order_type="MKT", tif="DAY",
+                       exchange="SMART"):
         self.events.append(f"close:{symbol}:{order_type}")
-        self.close_position_calls.append((symbol, order_type))
+        # Record the exchange too so the NASDAQ-routing regression can
+        # assert every panic-side flatten leg is direct-routed to ISLAND.
+        self.close_position_calls.append((symbol, order_type, exchange))
         if self._close_side_effect is not None:
             return self._close_side_effect(symbol, order_type)
         # Default: place a synthetic order id and, for MKT, zero the position.
@@ -226,7 +231,12 @@ def test_per_leg_flatten_survives_partial_failure(monkeypatch, capsys):
     # Non-zero rc because BADSYM position remains.
     assert rc == 1, f"expected rc=1 (partial failure), got {rc}"
     # Both legs were attempted (the good one wasn't skipped).
-    assert broker.close_position_calls == [("BADSYM", "MKT"), ("GOOD", "MKT")]
+    # Panic threads NASDAQ_EXCHANGE ("ISLAND") through close_position, so
+    # the recorded tuples include the exchange code.
+    assert broker.close_position_calls == [
+        ("BADSYM", "MKT", "ISLAND"),
+        ("GOOD", "MKT", "ISLAND"),
+    ]
 
 
 def test_lingering_non_panic_order_marks_not_flat(monkeypatch, capsys):
@@ -381,7 +391,7 @@ def test_live_prompt_accepts_panic(monkeypatch):
     rc = panic.main(["--live", "--live-confirm", panic._LIVE_CONFIRM_MSG])
     assert rc == 0
     assert broker.cancel_all_calls == 1
-    assert broker.close_position_calls == [("MSFT", "MKT")]
+    assert broker.close_position_calls == [("MSFT", "MKT", "ISLAND")]
 
 
 def test_moc_startup_warning_after_cutoff(monkeypatch, capsys):
@@ -553,6 +563,60 @@ def test_flatten_loop_get_positions_dropout_continues_to_after(
     assert "=== AFTER ===" in out
     # MSFT is still non-flat, so rc=1 from the normal MKT verdict.
     assert rc == 1, f"expected rc=1 (positions remain after failed flatten), got {rc}"
+
+
+def test_panic_flatten_routes_every_leg_to_nasdaq(monkeypatch):
+    """NASDAQ-only routing regression: every close_position call panic
+    issues during a flatten MUST carry ``exchange="ISLAND"`` — the
+    NASDAQ INET direct-route code. The kill switch is subject to the
+    same NASDAQ-only rule as the daily orchestrator (see
+    ``live/nasdaq_routing.py``); a SMART-routed panic exit would
+    lose the same off-strategy cost an off-venue entry would.
+    """
+    from live.nasdaq_routing import NASDAQ_EXCHANGE
+
+    broker = _FakeBroker(
+        initial_positions=[
+            _FakePosition("AAPL", 100),
+            _FakePosition("MSFT", -50),
+            _FakePosition("NVDA", 25),
+        ],
+    )
+    _install_broker(monkeypatch, broker)
+    rc = panic.main(["--paper", "--yes"])
+    assert rc == 0
+    # Every recorded flatten leg pinned to the NASDAQ direct route.
+    assert broker.close_position_calls, "no flatten legs were attempted"
+    for sym, order_type, exchange in broker.close_position_calls:
+        assert exchange == NASDAQ_EXCHANGE == "ISLAND", (
+            f"panic flatten leg for {sym} ({order_type}) routed to "
+            f"exchange={exchange!r}, expected {NASDAQ_EXCHANGE!r}"
+        )
+
+
+def test_panic_flatten_moc_also_routes_to_nasdaq(monkeypatch):
+    """NASDAQ-only routing regression, MOC branch: even the ``--flatten-with
+    MOC`` end-of-day flatten must direct-route to NASDAQ so the closing
+    print lands on the same auction the strategy targets.
+    """
+    from datetime import datetime as _dt
+    from live.nasdaq_routing import NASDAQ_EXCHANGE
+
+    early = _dt(2026, 6, 15, 14, 30, tzinfo=config.NY_TZ)
+    monkeypatch.setattr(config, "now_ny", lambda: early)
+    broker = _FakeBroker(
+        initial_positions=[_FakePosition("MSFT", 50), _FakePosition("AMZN", -10)],
+    )
+    _install_broker(monkeypatch, broker)
+    rc = panic.main(["--paper", "--flatten-with", "MOC", "--yes"])
+    assert rc == 0
+    assert broker.close_position_calls
+    for sym, order_type, exchange in broker.close_position_calls:
+        assert order_type == "MOC"
+        assert exchange == NASDAQ_EXCHANGE == "ISLAND", (
+            f"panic MOC leg for {sym} routed to exchange={exchange!r}, "
+            f"expected {NASDAQ_EXCHANGE!r}"
+        )
 
 
 def test_confirm_msg_stays_in_sync_with_broker():
