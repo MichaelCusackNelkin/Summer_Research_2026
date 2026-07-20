@@ -1,0 +1,9 @@
+# Quarto render outputs
+/whitepaper.html
+/whitepaper.pdf
+/whitepaper.tex
+/whitepaper_files/
+/.quarto/
+
+# Copied in from the neurips extension at render time (format-resources)
+/neurips_2023.sty

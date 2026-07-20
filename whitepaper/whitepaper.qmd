@@ -1,0 +1,31 @@
+---
+title: "SUMMER RESEARCH 2026"
+date: today
+date-modified: last-modified
+author:
+  - name: Michael Cusack-Nelkin
+    email: mc5882@columbia.edu
+description: |
+  This document constitutes the authors' final project whitepaper for the Statistical Aspects of Finance course taken during the Spring 2026 semester as part of their Master's in the Mathematics of Finance at Columbia University.
+keywords: [optimal, execution, order, splitting, imbalance]
+citation:
+  type: article-journal
+  container-title: "Computo"
+  url: "https://github.com/MichaelCusackNelkin/Summer_Research_2026/whitepaper/whitepaper.qmd"
+google-scholar: true
+github-user: MichaelCusackNelkin
+repo: "Summer_Research_2026"
+draft: false # set to false once the build is running
+published: true # will be set to true once accepted
+format:
+  neurips-pdf: 
+    final: true
+    keep-tex: true
+  neurips-html:
+    final: true
+---
+
+
+# Abstract
+
+LOREM IPSUM
