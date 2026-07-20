@@ -6,8 +6,8 @@ author:
   - name: Michael Cusack-Nelkin
     email: mc5882@columbia.edu
 description: |
-  This document constitutes the authors' final project whitepaper for the Statistical Aspects of Finance course taken during the Spring 2026 semester as part of their Master's in the Mathematics of Finance at Columbia University.
-keywords: [optimal, execution, order, splitting, imbalance]
+  This document constitutes the author's final work on a summmer research project while completing their Master's in the Mathematics of Finance at Columbia University.
+keywords: [alpha, forecasting, covariance, impact, portfolio optimization]
 citation:
   type: article-journal
   container-title: "Computo"
@@ -18,7 +18,7 @@ repo: "Summer_Research_2026"
 draft: false # set to false once the build is running
 published: true # will be set to true once accepted
 format:
-  neurips-pdf: 
+  neurips-pdf:
     final: true
     keep-tex: true
   neurips-html:

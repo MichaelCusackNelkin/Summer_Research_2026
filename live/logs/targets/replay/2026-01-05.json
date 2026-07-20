@@ -1,17 +1,9 @@
 {
-  "cancelled_entry_oids": [],
   "dry_run": false,
-  "empty_snapshot_after_fills": false,
-  "entries": [],
-  "generated_at_ny": "2026-07-20T13:06:45.734460-04:00",
-  "generated_at_utc": "2026-07-20T17:06:45.734460+00:00",
+  "generated_at_ny": "2026-07-20T13:21:05.212498-04:00",
+  "generated_at_utc": "2026-07-20T17:21:05.212498+00:00",
   "gmv_dollar": 930546.1162682902,
   "lambda": 5e-05,
-  "moc_batch": [],
-  "moc_order_ids": [],
-  "moc_positions_unknown": false,
-  "moc_signed_by_sym": {},
-  "moc_skipped_past_cutoff": [],
   "mode": "replay",
   "nmv_dollar": 37211.368307457735,
   "replay_date": "2026-01-05",
@@ -64,8 +56,6 @@
     "TXN": 232,
     "VRTX": -5
   },
-  "uncovered_symbols": [],
-  "unfilled_moc_symbols": [],
   "universe_file": "top_49_universe.txt",
   "universe_hash": "315feaa7b2f8",
   "vol_cap": 5000.0
