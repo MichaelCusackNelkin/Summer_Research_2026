@@ -25,6 +25,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import polars as pl
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -149,6 +150,105 @@ def test_replay_submit_writes_replay_parquet(monkeypatch, tmp_path):
     df = pl.read_parquet(parquets[0])
     assert set(df["mode"].to_list()) == {"replay"}
     assert set(df["replay_date"].to_list()) == {"2026-05-13"}
+    # Impact-decay curve columns MUST be populated on the replay
+    # path — synchronous walk-back over the historical tbbo. This
+    # pins the orchestrator wiring: deleting the
+    # ``capture_marks_from_tbbo`` call from daily_orchestrator would
+    # leave every other assertion green but this one red.
+    entry_rows = df.filter(pl.col("leg") == "entry")
+    assert entry_rows.height > 0
+    for n in (1, 2, 3, 4, 5):
+        col = f"t{n}min_price"
+        non_null = entry_rows.filter(pl.col(col).is_not_null()).height
+        assert non_null > 0, (
+            f"replay path produced 0 non-null {col} — the orchestrator's "
+            f"capture_marks_from_tbbo call may be missing or the "
+            f"synchronous walk-back on tbbo_at_decision is broken"
+        )
+
+
+def test_paper_run_populates_impact_decay_curve_columns(
+    monkeypatch, tmp_path,
+):
+    """Orchestrator-wiring proof for the LIVE/PAPER path: after
+    main() returns, the recorder parquet has the T+1..T+5 mark
+    columns populated (or at least present with the right type).
+
+    Guards against silently deleting ``schedule_marks_capture_from_feed``
+    from daily_orchestrator — no other integration test greps for a
+    ``t{n}min_*`` column.
+
+    The paper path uses a BACKGROUND thread that wakes at
+    ``decision + max(offsets)``. In tests, ``decision`` is
+    ~``config.now_ny()``, so the T+5 target is 5 min in the FUTURE
+    — the thread doesn't finish before ``finalize()`` on the
+    finally, and ``wait_for_marks(350)`` is called but the test
+    monkey-patches ``_sleep_until`` so the whole run finishes
+    sub-second. We therefore assert the marks WIRING is correct
+    (columns present, correctly typed) rather than that they
+    populated — the actual populate path is exercised
+    deterministically by the replay test above.
+    """
+    monkeypatch.setattr(daily_orchestrator, "_TRADES_DIR", tmp_path / "trades")
+    universe = config.load_active_universe()
+    feed = _prepopulate_live_feed(universe)
+    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
+    monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+
+    scheduled_calls = {"n": 0}
+    orig_schedule = trade_recorder.TradeRecorder.schedule_marks_capture_from_feed
+
+    def _tracking_schedule(self, *args, **kwargs):
+        scheduled_calls["n"] += 1
+        return orig_schedule(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        trade_recorder.TradeRecorder,
+        "schedule_marks_capture_from_feed",
+        _tracking_schedule,
+    )
+
+    fake_broker = _FakeBroker()
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    rc = daily_orchestrator.main(_base_argv())
+    assert rc == 0
+
+    # WIRING: the paper path must have scheduled the marks capture.
+    assert scheduled_calls["n"] >= 1, (
+        "daily_orchestrator did not call recorder.schedule_marks_capture_"
+        "from_feed on the paper path — the impact-decay curve columns "
+        "will silently stay null for every live/paper run"
+    )
+
+    # SCHEMA: parquet has all 15 mark columns with correct types.
+    today = config.now_ny().date().isoformat()
+    parquets = list(
+        (tmp_path / "trades" / "paper" / today).glob("*.parquet")
+    )
+    assert len(parquets) == 1
+    tbl = pq.read_table(parquets[0])
+    for n in (1, 2, 3, 4, 5):
+        for suffix, dtype in (
+            ("price", pa.float64()),
+            ("ts_utc", pa.timestamp("us", tz="UTC")),
+            ("staleness_secs", pa.float64()),
+        ):
+            col = f"t{n}min_{suffix}"
+            assert col in tbl.schema.names, (
+                f"paper parquet missing column {col}"
+            )
+            assert tbl.schema.field(col).type.equals(dtype), (
+                f"{col}: expected {dtype}, got "
+                f"{tbl.schema.field(col).type}"
+            )
 
 
 def test_dry_run_writes_no_recorder_parquet(monkeypatch, tmp_path):
@@ -227,8 +327,10 @@ def test_recorder_method_exception_does_not_break_order_path(monkeypatch, tmp_pa
         "record_targets",
         "record_submission",
         "record_fill",
-        "capture_t5min_from_tbbo",
-        "schedule_t5min_capture_from_feed",
+        "record_marks",
+        "capture_marks_from_tbbo",
+        "schedule_marks_capture_from_feed",
+        "wait_for_marks",
         "finalize",
     ):
         monkeypatch.setattr(trade_recorder.TradeRecorder, name, _boom)
@@ -509,18 +611,17 @@ def test_stuck_entry_does_not_starve_moc_audit(monkeypatch, tmp_path):
 
 def test_rc_11_returns_promptly_regardless_of_recorder(monkeypatch, tmp_path):
     """CRITICAL round-3 regression: on the OVERNIGHT-EXPOSURE path,
-    NOTHING recording-related — ``wait_for_t5min``, ``_fill_audit``,
+    NOTHING recording-related — ``wait_for_marks``, ``_fill_audit``,
     or ``finalize`` — may run before ``return 11``. This pattern has
     now bitten twice (round 1 removed a 30s ``finalize()`` wait from
-    the ``finally``; round 2 moved a 350s ``wait_for_t5min`` into
-    exactly the same seat, one function up). This test pins on the
-    TIMING, not just the return code.
+    the ``finally``; round 2 moved a 350s wait into exactly the same
+    seat, one function up). This test pins on the TIMING, not just
+    the return code.
 
     Setup: force MOC snapshot failure (``moc_positions_unknown=True``)
-    AND monkey-patch ``TradeRecorder.wait_for_t5min`` /
-    ``_fill_audit`` to each sleep 30s if called. If either fires on
-    the exposure path the whole run takes 30+ seconds; the assertion
-    caps at <5s.
+    AND monkey-patch every wait/audit method to each sleep 30s if
+    called. If any fires on the exposure path the whole run takes
+    30+ seconds; the assertion caps at <5s.
     """
     import time as _t
     monkeypatch.setattr(daily_orchestrator, "_TRADES_DIR", tmp_path / "trades")
@@ -541,13 +642,13 @@ def test_rc_11_returns_promptly_regardless_of_recorder(monkeypatch, tmp_path):
 
     monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
 
-    # If wait_for_t5min is called on the exposure path we notice
-    # via a 30s sleep. On the correct-behavior path it isn't called
-    # at all before `return 11`.
-    slow_calls: dict[str, int] = {"wait_for_t5min": 0, "fill_audit": 0}
+    # If any wait is called on the exposure path we notice via a
+    # 30s sleep. On the correct-behavior path none of these fire
+    # before `return 11`.
+    slow_calls: dict[str, int] = {"wait_for_marks": 0, "fill_audit": 0}
 
-    def _slow_wait(self, timeout=None):
-        slow_calls["wait_for_t5min"] += 1
+    def _slow_wait_marks(self, timeout=None):
+        slow_calls["wait_for_marks"] += 1
         _t.sleep(30.0)
         return False
 
@@ -555,7 +656,9 @@ def test_rc_11_returns_promptly_regardless_of_recorder(monkeypatch, tmp_path):
         slow_calls["fill_audit"] += 1
         _t.sleep(30.0)
 
-    monkeypatch.setattr(trade_recorder.TradeRecorder, "wait_for_t5min", _slow_wait)
+    monkeypatch.setattr(
+        trade_recorder.TradeRecorder, "wait_for_marks", _slow_wait_marks,
+    )
     monkeypatch.setattr(daily_orchestrator, "_fill_audit", _slow_audit)
 
     t0 = _t.time()
@@ -565,13 +668,13 @@ def test_rc_11_returns_promptly_regardless_of_recorder(monkeypatch, tmp_path):
     assert rc == 11, f"expected rc=11 (OVERNIGHT EXPOSURE), got {rc}"
     assert elapsed < 5.0, (
         f"rc=11 returned after {elapsed:.2f}s — a recording-related "
-        f"wait ran before the operator page. wait_for_t5min calls: "
-        f"{slow_calls['wait_for_t5min']}, _fill_audit calls: "
+        f"wait ran before the operator page. wait_for_marks calls: "
+        f"{slow_calls['wait_for_marks']}, _fill_audit calls: "
         f"{slow_calls['fill_audit']}. Both MUST be zero on the "
         f"exposure path."
     )
-    assert slow_calls["wait_for_t5min"] == 0, (
-        "wait_for_t5min was called on the rc=11 path — recording "
+    assert slow_calls["wait_for_marks"] == 0, (
+        "wait_for_marks was called on the rc=11 path — recording "
         "must never gate the operator page"
     )
     assert slow_calls["fill_audit"] == 0, (

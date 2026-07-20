@@ -1828,11 +1828,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Cache the tbbo snapshot at decision time ONLY on the replay
     # path — replay's snapshot covers the full historical day already,
-    # so we can pull the 15:55 mid synchronously without keeping any
-    # stream alive. In live/paper we let the recorder's background
-    # T+5min thread call ``feed.snapshot()`` at ~15:55; taking a
-    # redundant copy at 15:50 would burn ~1s on the critical path
-    # (~0.9s/M records) for nothing.
+    # so we can pull the T+1..T+5 mids synchronously without keeping
+    # any stream alive. In live/paper we let the recorder's background
+    # marks thread call ``feed.snapshot()`` once at ~15:55 (T+MAX)
+    # and walk that snapshot back to derive every earlier T+N mark;
+    # taking a redundant copy at 15:50 would burn ~1s on the critical
+    # path (~0.9s/M records) for nothing.
     tbbo_at_decision: pl.DataFrame = pl.DataFrame()
     snapshot_completed_at_utc: Optional[datetime] = None
     last_mid_ts_by_sym: dict[str, datetime] = {}
@@ -1868,9 +1869,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     # For replay / dry-run we stop the feed now — replay tbbo is
     # already fully materialised in ``tbbo_at_decision``, and dry-run
     # never trades. For live/paper the feed stays alive so the
-    # recorder's background T+5min capture can call ``feed.snapshot()``
-    # again around 15:55; the outer ``finally`` at end-of-main stops
-    # it on every exit path (including rc=3/4/5/8 early returns).
+    # recorder's background marks capture can call ``feed.snapshot()``
+    # once around 15:55 (T+MAX); the outer ``finally`` at end-of-main
+    # stops it on every exit path (including rc=3/4/5/8 early returns).
     if feed is not None and (replay_mode or args.dry_run):
         try:
             feed.stop()
@@ -2138,20 +2139,24 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "target_shares": _ts,
             }
         trade_recorder.safe_call(recorder.record_targets, _targets_map)
-        # T+5min mark. In replay, tbbo_at_decision already covers the
-        # whole historical day — extract synchronously. In live/paper,
-        # spawn a background thread that snapshots the still-running
-        # feed at decision + 5min; the thread is bounded and the main
-        # path never blocks on it.
+        # Impact-decay-curve marks at T+1..T+5min. In replay,
+        # tbbo_at_decision already covers the whole historical day —
+        # extract synchronously per offset. In live/paper, spawn a
+        # single background thread that snapshots the still-running
+        # feed at decision + MAX(offsets) (~15:55) and walks that one
+        # snapshot back to derive each earlier mark; the thread is
+        # bounded and the main path never blocks on it. See
+        # ``schedule_marks_capture_from_feed`` docstring for why
+        # one-wake-then-walkback is strictly better than five timers.
         if replay_mode:
             trade_recorder.safe_call(
-                recorder.capture_t5min_from_tbbo,
+                recorder.capture_marks_from_tbbo,
                 tbbo_at_decision,
                 decision_ts_utc,
             )
         elif feed is not None:
             trade_recorder.safe_call(
-                recorder.schedule_t5min_capture_from_feed,
+                recorder.schedule_marks_capture_from_feed,
                 feed=feed,
                 decision_ts_utc=decision_ts_utc,
             )
@@ -2459,7 +2464,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         # R3 + RR1 + RRR1: distinct rc for the OVERNIGHT-EXPOSURE state.
         # rc=11 is THE pager predicate (per CLAUDE.md), so NOTHING
-        # recording-related may run before this return — a T+5min
+        # recording-related may run before this return — a marks
         # wait or a MOC fill audit here would delay the operator's
         # window to run ``live.panic`` before the 16:00 close. This
         # is the second time the pattern has bitten (round 1 removed
@@ -2502,7 +2507,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         # None of this runs on the rc=11 path (above) so it can't
         # delay the operator page.
 
-        # Stop the live feed EARLY — as soon as the recorder's T+5min
+        # Stop the live feed EARLY — as soon as the recorder's marks
         # background thread has landed (or given up). Otherwise
         # ``_fill_audit`` blocks to ~16:00 for MOC fills and the
         # Databento buffers accumulate the whole closing auction's
@@ -2511,12 +2516,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         # is a no-op (the feed was already stopped at feature-build
         # time).
         if recorder is not None:
-            # Bounded wait: 5min for the target instant + some slack
-            # for the snapshot itself. If the thread hasn't landed by
-            # then we still stop the feed — the T+5min column just
-            # stays null on those rows.
+            # Bounded wait: 5min for the T+MAX target instant + some
+            # slack for the snapshot itself. If the thread hasn't
+            # landed by then we still stop the feed — the per-mark
+            # columns just stay null on those rows. This wait is
+            # AFTER the rc=11 exposure gate above, so a delay here
+            # never gates the operator page.
             trade_recorder.safe_call(
-                recorder.wait_for_t5min, timeout=350.0,
+                recorder.wait_for_marks, timeout=350.0,
             )
         _stop_feed_safe(feed)
 
@@ -2544,17 +2551,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         except Exception:
             logger.exception("fill audit failed (non-fatal)")
     finally:
-        # Finalize the recorder WITHOUT waiting for the T+5min thread
+        # Finalize the recorder WITHOUT waiting for the marks thread
         # — the ``finally`` fires on the rc=11 OVERNIGHT-EXPOSURE
         # page too, and a 30s wait between the exposure detection and
         # the ``return 11`` would delay the operator alert. On the
-        # happy path the T+5min thread has already fired (MOC audit
+        # happy path the marks thread has already fired (MOC audit
         # takes it past 15:55 anyway); on any early-exit path the
-        # T+5min column simply stays null. Post-trade analysis is
+        # per-mark columns simply stay null. Post-trade analysis is
         # never real-time and can tolerate the loss.
         if recorder is not None:
             try:
-                recorder.finalize(wait_for_t5min=None)
+                recorder.finalize(wait_for_marks=None)
             except Exception:
                 logger.exception(
                     "trade recorder finalize failed (non-fatal)"

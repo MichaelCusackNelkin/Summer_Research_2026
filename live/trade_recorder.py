@@ -22,9 +22,15 @@ contaminate real trading records.
               commission (from ``broker._trades[oid]``).
     stage D — MOC submission (~15:50:13): leg=moc rows created, oid,
               side, sent_ts.
-    stage E — T+5min mark (~15:55:10): observed mid at (or before)
-              decision + 5min; recorded WITH the observed ts and the
-              staleness gap so an analyst can filter thin-book rows.
+    stage E — impact-decay curve at T+1..T+5min (~15:55:10): a single
+              feed snapshot is taken at T+MAX (~15:55), then filtered
+              back to observed mid at (or before) each of decision +
+              N minutes for N in ``MARK_OFFSETS_MINUTES``. Each mark
+              records its own observed ts and staleness so an analyst
+              can filter thin-book rows PER MARK. The T+1 mark reflects
+              only data at or before T+1, even though it's CAPTURED at
+              T+5 wall clock (property of the per-mark filter, not the
+              capture time). See ``schedule_marks_capture_from_feed``.
     stage F — MOC fills settle (~16:00): fill qty, fill price for MOC.
     stage G — finalize (end of run): atomic parquet write.
   Each stage merges into an in-memory row dict keyed by (leg, symbol).
@@ -50,6 +56,17 @@ contaminate real trading records.
   is UTC to sidestep DST edge cases. Naive datetimes are REJECTED at
   the API boundary — silent naive==UTC coercion has bitten us before.
 
+## Reading across schema vintages
+
+Use ``trade_recorder.read_trades(paths)`` — not a raw
+``pyarrow.dataset`` or ``pl.read_parquet`` — for any glob that spans
+schema versions (a date range straddling a deploy). The helper hands
+pyarrow the CURRENT schema so v3 files back-fill the new v4 columns
+as typed nulls; the naive readers infer from the first fragment and
+either silently drop the new columns (analyst reads T+5 only and
+calibrates a bogus decay curve) or raise depending on file ordering.
+See ``read_trades`` for the failure modes it protects against.
+
 ## Column semantics for downstream analysts
 
 - ``decision_ts_utc``: the scheduled 15:50 anchor (``snapshot_at``).
@@ -63,13 +80,32 @@ contaminate real trading records.
 - ``observed_ts_utc``: wall clock when ``_fill_audit`` picked the fill
   up. Always populated on filled/timeout rows.
 - ``arrival_ts_utc``: the tbbo tick that produced the arrival mid.
-  ``arrival_staleness_secs = decision_ts_utc - arrival_ts_utc`` — a
-  thin name whose last print was 15:41 shows up here as ~540s.
-- ``t5min_ts_utc``: the tbbo tick that produced the T+5min mid.
-  ``t5min_staleness_secs = <intended target> - t5min_ts_utc`` — an
-  illiquid name whose last print was at 15:50:02 with T+5 target
-  15:55:10 gives ``t5min_price == arrival_price`` (by construction)
-  with staleness ~308s so the analyst can filter it out.
+  ``arrival_staleness_secs = (snapshot_ts_utc or decision_ts_utc) -
+  arrival_ts_utc``: the baseline is ``snapshot_ts_utc`` when present
+  (the actual snapshot completion instant, ~decision + 1-2s) and
+  falls back to ``decision_ts_utc`` otherwise; snapshot_ts_utc is
+  preferred so a tick delivered just past 15:50:00 doesn't record a
+  spuriously-negative staleness (see Round 2 review #7).
+- ``arrival_price``: the last mid in the feed's snapshot buffer at
+  snapshot completion time. NOT time-filtered to ``decision_ts_utc``
+  — the snapshot naturally completes ~1-10s past the decision anchor
+  depending on feed latency. So the realized offset between arrival
+  and the first mark is not exactly 60s; it varies with per-run
+  snapshot latency. Use ``t{n}min_ts_utc - arrival_ts_utc`` as the
+  x-axis for a decay-curve fit, NOT ``n * 60``.
+- ``t{n}min_ts_utc`` (n in 1..5): the tbbo tick that produced the
+  T+Nmin mid. ``t{n}min_staleness_secs = <intended T+N target> -
+  t{n}min_ts_utc`` — an illiquid name whose last print was at 15:50:02
+  yields the same ``t1..t5min_price`` (== ``arrival_price``, by
+  construction) with monotonically-increasing staleness so the analyst
+  can filter it out per mark. The impact-decay curve for a single
+  trade is ``[t1min_price, t2min_price, ..., t5min_price]``, each
+  paired with its own timestamp and staleness gap. **The x-axis
+  distances between marks are NOMINALLY 60s each, but the REALIZED
+  elapsed times are ``t{n}min_ts_utc - arrival_ts_utc`` — use those
+  for the decay fit; both endpoints drift (arrival by snapshot
+  latency, marks by book thinness), and fitting on the nominal grid
+  biases the decay exponent upward.**
 - ``rel_spread_at_decision``: FULL relative spread ``(ask-bid)/mid``,
   NOT half. Same definition as ``features.py::spread_return`` (which
   has an inaccurate half-spread comment in it; that fix is out of
@@ -109,10 +145,11 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import polars as pl
 import pyarrow as pa
+import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from live import config
@@ -124,71 +161,131 @@ _UTC = timezone.utc
 # Version stamped into every row so downstream readers can pin against a
 # specific column layout. Bump on ANY schema change (add / rename / drop /
 # type change).
-SCHEMA_VERSION: int = 3
+#
+# v4: added per-minute impact-decay marks at T+1, T+2, T+3, T+4 (T+5
+#     already existed in v3). Each mark has a price / observed-ts /
+#     staleness triple. The old t5min columns keep their v3 names and
+#     semantics so v3 parquets stay readable and any downstream code
+#     that reads a t5min column continues to work — T+5 is now one
+#     point on the decay curve, not a renamed thing.
+SCHEMA_VERSION: int = 4
 
-# Explicit pyarrow schema. Inferred types on all-null columns would
-# collapse to ``null`` and refuse to concatenate across daily files —
-# spell every column out.
-TRADE_RECORD_SCHEMA: pa.Schema = pa.schema([
-    ("schema_version", pa.int32()),
-    ("mode", pa.string()),           # "paper" | "live" | "replay"
-    ("leg", pa.string()),            # "entry" | "moc"
-    ("symbol", pa.string()),
-    ("side", pa.string()),           # "BUY" | "SELL"
-    ("order_type", pa.string()),
-    ("tif", pa.string()),
-    ("exchange", pa.string()),       # "ISLAND" for NASDAQ-only routing
-    ("account", pa.string()),
-    ("order_id", pa.string()),
-    ("perm_id", pa.int64()),
-    ("client_id", pa.int64()),
-    ("exec_id", pa.string()),
-    # All timestamps are timezone-aware UTC. Convert on read.
-    ("decision_ts_utc", pa.timestamp("us", tz="UTC")),
-    ("snapshot_ts_utc", pa.timestamp("us", tz="UTC")),
-    ("sent_ts_utc", pa.timestamp("us", tz="UTC")),
-    ("fill_ts_utc", pa.timestamp("us", tz="UTC")),
-    # Where ``fill_ts_utc`` came from:
-    #   "execution" — TWS ``execution.time`` from the fill's execution
-    #                 report (accurate to the exchange fill instant).
-    #   "observed"  — wall-clock fallback (``_fill_audit`` return
-    #                 time). With MOC audit resequencing this is
-    #                 ~5-10 minutes AFTER the true fill; latency
-    #                 computed off "observed" rows is not comparable
-    #                 to "execution" rows. Filter on this column.
-    ("fill_ts_source", pa.string()),
-    ("observed_ts_utc", pa.timestamp("us", tz="UTC")),
-    ("arrival_ts_utc", pa.timestamp("us", tz="UTC")),
-    ("t5min_ts_utc", pa.timestamp("us", tz="UTC")),
-    ("order_qty", pa.int64()),       # signed by side (+BUY / -SELL)
-    ("requested_qty", pa.int64()),   # unsigned qty as sent
-    ("filled_qty", pa.float64()),    # IB may report fractional
-    ("signed_filled_qty", pa.float64()),
-    ("remaining_qty", pa.float64()),
-    ("cancelled_qty", pa.float64()),
-    ("fill_price", pa.float64()),    # VWAP across partial fills
-    ("arrival_price", pa.float64()),
-    ("bid_at_decision", pa.float64()),      # DERIVED from mid + spread
-    ("ask_at_decision", pa.float64()),      # DERIVED from mid + spread
-    ("rel_spread_at_decision", pa.float64()),   # (ask-bid)/mid; NOT half
-    ("arrival_staleness_secs", pa.float64()),
-    ("t5min_staleness_secs", pa.float64()),
-    ("target_dollars", pa.float64()),   # entry rows only; MOC rows null
-    ("target_shares", pa.int64()),      # entry rows only; MOC rows null
-    ("achieved_dollars", pa.float64()),
-    ("t5min_price", pa.float64()),
-    ("order_status", pa.string()),
-    ("error", pa.string()),
-    ("commission", pa.float64()),
-    ("commission_currency", pa.string()),
-    ("realized_pnl", pa.float64()),
-    ("liquidity", pa.string()),
-    ("venue", pa.string()),
-    ("replay_date", pa.string()),
-    ("universe_hash", pa.string()),
-    ("run_id", pa.string()),
-    ("decision_context_json", pa.string()),
-])
+# Every minute-offset the recorder captures a post-decision mark at.
+# Each n in this tuple contributes THREE columns to the schema:
+# ``t{n}min_price``, ``t{n}min_ts_utc``, ``t{n}min_staleness_secs``.
+# Change this list and every downstream helper — column generation,
+# row backfill, timestamp coercion — picks it up.
+MARK_OFFSETS_MINUTES: tuple[int, ...] = (1, 2, 3, 4, 5)
+
+
+def _mark_column_names(offset_minutes: int) -> tuple[str, str, str]:
+    """Return ``(price_col, ts_col, staleness_col)`` for a mark offset."""
+    return (
+        f"t{offset_minutes}min_price",
+        f"t{offset_minutes}min_ts_utc",
+        f"t{offset_minutes}min_staleness_secs",
+    )
+
+
+def _mark_stash_key_ts(offset_minutes: int) -> str:
+    """Key under ``self._arrival_prices[sym]`` for the observed ts of
+    a mark. The stash-side and row-side names differ deliberately —
+    the row column is ``t{n}min_ts_utc``, the stash key is
+    ``t{n}min_observed_ts_utc`` — so a symbol whose marks were
+    captured BEFORE its row existed can be backfilled without a
+    naming collision with the row column itself.
+    """
+    return f"t{offset_minutes}min_observed_ts_utc"
+
+
+def _build_trade_record_schema() -> pa.Schema:
+    """Assemble the v4 schema. Every column is spelled out explicitly
+    (so an all-null column keeps its declared type through a
+    ``pa.Table.from_pylist(..., schema=...)`` build) — the per-mark
+    block is generated programmatically to keep it in lockstep with
+    ``MARK_OFFSETS_MINUTES``.
+    """
+    fields: list[tuple[str, pa.DataType]] = [
+        ("schema_version", pa.int32()),
+        ("mode", pa.string()),           # "paper" | "live" | "replay"
+        ("leg", pa.string()),            # "entry" | "moc"
+        ("symbol", pa.string()),
+        ("side", pa.string()),           # "BUY" | "SELL"
+        ("order_type", pa.string()),
+        ("tif", pa.string()),
+        ("exchange", pa.string()),       # "ISLAND" for NASDAQ-only routing
+        ("account", pa.string()),
+        ("order_id", pa.string()),
+        ("perm_id", pa.int64()),
+        ("client_id", pa.int64()),
+        ("exec_id", pa.string()),
+        # All timestamps are timezone-aware UTC. Convert on read.
+        ("decision_ts_utc", pa.timestamp("us", tz="UTC")),
+        ("snapshot_ts_utc", pa.timestamp("us", tz="UTC")),
+        ("sent_ts_utc", pa.timestamp("us", tz="UTC")),
+        ("fill_ts_utc", pa.timestamp("us", tz="UTC")),
+        # Where ``fill_ts_utc`` came from:
+        #   "execution" — TWS ``execution.time`` from the fill's execution
+        #                 report (accurate to the exchange fill instant).
+        #   "observed"  — wall-clock fallback (``_fill_audit`` return
+        #                 time). With MOC audit resequencing this is
+        #                 ~5-10 minutes AFTER the true fill; latency
+        #                 computed off "observed" rows is not comparable
+        #                 to "execution" rows. Filter on this column.
+        ("fill_ts_source", pa.string()),
+        ("observed_ts_utc", pa.timestamp("us", tz="UTC")),
+        ("arrival_ts_utc", pa.timestamp("us", tz="UTC")),
+        # t5min columns stay in their v3 positions to keep the on-disk
+        # field ordering for v3-shared columns identical to v3 files.
+        # The remaining mark columns (T+1..T+4) are appended below.
+        ("t5min_ts_utc", pa.timestamp("us", tz="UTC")),
+        ("order_qty", pa.int64()),       # signed by side (+BUY / -SELL)
+        ("requested_qty", pa.int64()),   # unsigned qty as sent
+        ("filled_qty", pa.float64()),    # IB may report fractional
+        ("signed_filled_qty", pa.float64()),
+        ("remaining_qty", pa.float64()),
+        ("cancelled_qty", pa.float64()),
+        ("fill_price", pa.float64()),    # VWAP across partial fills
+        ("arrival_price", pa.float64()),
+        ("bid_at_decision", pa.float64()),      # DERIVED from mid + spread
+        ("ask_at_decision", pa.float64()),      # DERIVED from mid + spread
+        ("rel_spread_at_decision", pa.float64()),   # (ask-bid)/mid; NOT half
+        ("arrival_staleness_secs", pa.float64()),
+        ("t5min_staleness_secs", pa.float64()),
+        ("target_dollars", pa.float64()),   # entry rows only; MOC rows null
+        ("target_shares", pa.int64()),      # entry rows only; MOC rows null
+        ("achieved_dollars", pa.float64()),
+        ("t5min_price", pa.float64()),
+        ("order_status", pa.string()),
+        ("error", pa.string()),
+        ("commission", pa.float64()),
+        ("commission_currency", pa.string()),
+        ("realized_pnl", pa.float64()),
+        ("liquidity", pa.string()),
+        ("venue", pa.string()),
+        ("replay_date", pa.string()),
+        ("universe_hash", pa.string()),
+        ("run_id", pa.string()),
+        ("decision_context_json", pa.string()),
+    ]
+    seen = {name for name, _ in fields}
+    for n in MARK_OFFSETS_MINUTES:
+        price_col, ts_col, stale_col = _mark_column_names(n)
+        for name, dtype in (
+            (price_col, pa.float64()),
+            (ts_col, pa.timestamp("us", tz="UTC")),
+            (stale_col, pa.float64()),
+        ):
+            if name in seen:
+                # Already spelled out above (T+5 lives in the v3
+                # positions for on-disk stability).
+                continue
+            fields.append((name, dtype))
+            seen.add(name)
+    return pa.schema(fields)
+
+
+TRADE_RECORD_SCHEMA: pa.Schema = _build_trade_record_schema()
 
 # Terminal statuses on which we CAN commit ``achieved_dollars=0.0`` for a
 # zero-fill row (the trade was definitively rejected / cancelled). Any
@@ -440,12 +537,17 @@ def extract_broker_extras(broker: Any, oid: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class _T5MinCapture:
-    """Handle for the background T+5min-mark thread."""
+class _MarksCapture:
+    """Handle for the background multi-mark impact-decay-curve thread.
+
+    ``result`` is keyed by ``offset_minutes`` -> per-symbol
+    ``(mid, observed_ts)`` — the same shape ``_mid_at_or_before``
+    returns for each individual target instant.
+    """
     thread: Optional[threading.Thread]
     done: threading.Event
-    result: dict[str, tuple[float, datetime]] = field(default_factory=dict)
-    target_ts_utc: Optional[datetime] = None
+    result: dict[int, dict[str, tuple[float, datetime]]] = field(default_factory=dict)
+    target_ts_by_offset: dict[int, datetime] = field(default_factory=dict)
 
 
 class TradeRecorder:
@@ -455,9 +557,9 @@ class TradeRecorder:
     is safe to call from ``safe_call``; a raise is swallowed by the
     caller and the order path continues unaffected.
 
-    Thread safety: the background T+5min capture updates rows through
-    ``record_t5min_mark``, which takes ``self._lock``. All other
-    mutators also take the lock.
+    Thread safety: the background marks capture updates rows through
+    ``record_marks``, which takes ``self._lock``. All other mutators
+    also take the lock.
     """
 
     def __init__(
@@ -492,7 +594,7 @@ class TradeRecorder:
         self._decision_context: dict[str, Any] = {}
         self._arrival_prices: dict[str, dict[str, Any]] = {}
         self._targets: dict[str, dict[str, Any]] = {}
-        self._t5min: Optional[_T5MinCapture] = None
+        self._marks: Optional[_MarksCapture] = None
         self._finalized = False
         # Prep the parent dir. The journal is NOT unlinked here — a
         # crash-and-restart's earlier journal must be preserved for
@@ -592,15 +694,19 @@ class TradeRecorder:
                 row["arrival_staleness_secs"] = (
                     baseline - row["arrival_ts_utc"]
                 ).total_seconds()
-        # T+5min may have been captured before the row existed.
-        if arr.get("t5min_price") is not None:
-            row["t5min_price"] = _finite(arr.get("t5min_price"))
-        if arr.get("t5min_observed_ts_utc") is not None:
-            row["t5min_ts_utc"] = arr.get("t5min_observed_ts_utc")
-        if arr.get("t5min_staleness_secs") is not None:
-            row["t5min_staleness_secs"] = _finite(
-                arr.get("t5min_staleness_secs")
-            )
+        # Per-mark decay-curve columns may have been captured before
+        # the row existed. Backfill each configured offset from the
+        # per-symbol stash. Uniform loop so a change to
+        # ``MARK_OFFSETS_MINUTES`` propagates automatically.
+        for _n in MARK_OFFSETS_MINUTES:
+            price_col, ts_col, stale_col = _mark_column_names(_n)
+            stash_ts_key = _mark_stash_key_ts(_n)
+            if arr.get(price_col) is not None:
+                row[price_col] = _finite(arr.get(price_col))
+            if arr.get(stash_ts_key) is not None:
+                row[ts_col] = arr.get(stash_ts_key)
+            if arr.get(stale_col) is not None:
+                row[stale_col] = _finite(arr.get(stale_col))
 
     def _apply_target_to_row(
         self, row: dict[str, Any], tgt: dict[str, Any],
@@ -824,165 +930,288 @@ class TradeRecorder:
         })
 
     # ------------------------------------------------------------------
-    # Stage E: T+5min mark
+    # Stage E: impact-decay-curve marks at T+1..T+5min
     # ------------------------------------------------------------------
 
-    def record_t5min_mark(
+    def record_marks(
         self,
         *,
-        mid_and_ts_by_sym: dict[str, tuple[float, datetime]],
-        target_ts_utc: datetime,
+        marks_by_offset_minutes: dict[int, dict[str, tuple[float, datetime]]],
+        target_ts_by_offset_minutes: dict[int, datetime],
     ) -> None:
-        """Attach per-symbol observed mid at (or before) ``target_ts_utc``.
+        """Attach per-symbol observed mids at (or before) each of a
+        series of target instants — the post-decision impact-decay
+        curve. ``marks_by_offset_minutes[n][sym] = (mid, observed_ts)``
+        for offset ``n`` minutes after decision.
 
-        ``mid_and_ts_by_sym`` is ``{sym: (mid, observed_ts)}``. Recorded
-        columns:
-          - ``t5min_price``: the observed mid.
-          - ``t5min_ts_utc``: the observed tick's ts (NOT the intended
-            target).
-          - ``t5min_staleness_secs``: ``target_ts_utc - observed_ts``.
-            Zero if the tick landed at the target; positive if the
-            last tick was earlier (illiquid); analyst filters on this.
+        Each mark records the OBSERVED tick timestamp and a staleness
+        computed against its OWN target — never a fabricated ts, never
+        the outer capture time. A thin name whose only tick was
+        pre-decision yields the same price across all 5 marks with
+        increasing staleness (and is therefore filterable per-mark).
+
+        Bad inputs are skipped granularly rather than aborting the
+        whole call:
+          - offset keys outside ``MARK_OFFSETS_MINUTES`` warn+skip
+            (the schema has no column);
+          - naive ``observed_ts`` on an individual sym warn+skip that
+            sym only (symmetric with the per-offset target handling —
+            a single bad tick in the snapshot mustn't drop every
+            other symbol's mark for that offset).
         """
-        target = _to_utc(target_ts_utc)
+        normalized_targets: dict[int, datetime] = {}
+        for n, tgt in target_ts_by_offset_minutes.items():
+            try:
+                normalized_targets[int(n)] = _to_utc(tgt)
+            except ValueError:
+                logger.warning(
+                    "trade recorder: naive target ts for T+%dmin — skipping",
+                    int(n),
+                )
+        # Assemble the journal payload while walking the input so
+        # dropped syms / offsets don't leak into the journal (an
+        # analyst rebuilding from journal must not see a mark for
+        # something the row-side skipped).
+        journal_marks: dict[str, dict[str, dict[str, Any]]] = {}
         with self._lock:
-            for sym, (mid, observed_ts) in mid_and_ts_by_sym.items():
-                obs = _to_utc(observed_ts)
-                stale = (target - obs).total_seconds() if obs else None
-                arr = self._arrival_prices.setdefault(sym, {})
-                arr["t5min_price"] = _finite(mid)
-                arr["t5min_observed_ts_utc"] = obs
-                arr["t5min_staleness_secs"] = stale
-                for (leg, s), row in self._rows.items():
-                    if s != sym:
+            for n, mid_and_ts_by_sym in marks_by_offset_minutes.items():
+                n_int = int(n)
+                if n_int not in MARK_OFFSETS_MINUTES:
+                    logger.warning(
+                        "trade recorder: unknown mark offset %d — schema has "
+                        "no column, skipping",
+                        n_int,
+                    )
+                    continue
+                target = normalized_targets.get(n_int)
+                if target is None:
+                    continue
+                price_col, ts_col, stale_col = _mark_column_names(n_int)
+                stash_ts_key = _mark_stash_key_ts(n_int)
+                per_offset_journal: dict[str, dict[str, Any]] = {}
+                for sym, (mid, observed_ts) in mid_and_ts_by_sym.items():
+                    try:
+                        obs = _to_utc(observed_ts)
+                    except ValueError:
+                        logger.warning(
+                            "trade recorder: naive observed ts for %s at "
+                            "T+%dmin — skipping this sym only",
+                            sym, n_int,
+                        )
                         continue
-                    row["t5min_price"] = _finite(mid)
-                    row["t5min_ts_utc"] = obs
-                    row["t5min_staleness_secs"] = stale
+                    if obs is None:
+                        continue
+                    price_finite = _finite(mid)
+                    stale = (target - obs).total_seconds()
+                    arr = self._arrival_prices.setdefault(sym, {})
+                    arr[price_col] = price_finite
+                    arr[stash_ts_key] = obs
+                    arr[stale_col] = stale
+                    for (leg, s), row in self._rows.items():
+                        if s != sym:
+                            continue
+                        row[price_col] = price_finite
+                        row[ts_col] = obs
+                        row[stale_col] = stale
+                    per_offset_journal[sym] = {
+                        # NaN gets filtered out here symmetric with the
+                        # row-side ``_finite`` filter — a bare NaN in
+                        # the JSONL journal parses under Python's json
+                        # but strict JSON parsers reject it.
+                        "mid": price_finite,
+                        "observed_ts_utc": obs.isoformat(),
+                    }
+                if per_offset_journal:
+                    journal_marks[str(n_int)] = per_offset_journal
+        # Only journal offsets whose target was valid AND that landed
+        # on at least one row — matches what an analyst reading the
+        # journal would see reconstructed on the row side. The target
+        # list uses the same `normalized_targets` map so the two
+        # halves of the payload can't disagree.
         self._journal({
-            "kind": "t5min",
-            "target_ts_utc": target.isoformat() if target else None,
-            "mid_and_ts_by_sym": {
-                s: {"mid": float(m), "observed_ts_utc": _to_utc(t).isoformat()}
-                for s, (m, t) in mid_and_ts_by_sym.items()
-                if _to_utc(t) is not None
+            "kind": "marks",
+            "target_ts_by_offset_minutes": {
+                str(n): t.isoformat()
+                for n, t in normalized_targets.items()
             },
+            "marks_by_offset_minutes": journal_marks,
         })
 
-    # ------------------------------------------------------------------
-    # T+5min capture — replay (synchronous) and live (background thread)
-    # ------------------------------------------------------------------
-
-    def capture_t5min_from_tbbo(
+    def capture_marks_from_tbbo(
         self,
         tbbo: pl.DataFrame,
         decision_ts_utc: datetime,
-        offset: timedelta = timedelta(minutes=5),
+        offsets_minutes: tuple[int, ...] = MARK_OFFSETS_MINUTES,
     ) -> None:
-        """Synchronous — reads a tbbo frame already in memory (replay
-        path). Picks per-symbol last mid at or before ``decision_ts +
-        offset`` and records the OBSERVED tick ts.
+        """Synchronous walk-back for each offset — used on the replay
+        path where the historical tbbo already covers the whole day
+        in memory.
+
+        Every offset filters ``ts_event <= (decision + offset)`` on
+        the same frame, so no look-ahead across marks is possible.
+        A pre-decision-only tick yields the same price at every
+        offset with monotonically-increasing staleness.
         """
-        target_ts = _to_utc(decision_ts_utc) + offset
-        try:
-            mids = _mid_at_or_before(tbbo, target_ts)
-        except Exception:
-            logger.exception(
-                "trade recorder: T+5min replay extraction failed (non-fatal)",
-            )
-            return
-        self.record_t5min_mark(
-            mid_and_ts_by_sym=mids, target_ts_utc=target_ts,
+        decision = _to_utc(decision_ts_utc)
+        marks_by_offset: dict[int, dict[str, tuple[float, datetime]]] = {}
+        target_ts_by_offset: dict[int, datetime] = {}
+        for n in offsets_minutes:
+            n_int = int(n)
+            target_ts = decision + timedelta(minutes=n_int)
+            target_ts_by_offset[n_int] = target_ts
+            try:
+                mids = _mid_at_or_before(tbbo, target_ts)
+            except Exception:
+                logger.exception(
+                    "trade recorder: T+%dmin replay extraction failed "
+                    "(non-fatal)",
+                    n_int,
+                )
+                continue
+            marks_by_offset[n_int] = mids
+        self.record_marks(
+            marks_by_offset_minutes=marks_by_offset,
+            target_ts_by_offset_minutes=target_ts_by_offset,
         )
 
-    def schedule_t5min_capture_from_feed(
+    def schedule_marks_capture_from_feed(
         self,
         feed: Any,
         decision_ts_utc: datetime,
-        offset: timedelta = timedelta(minutes=5),
+        offsets_minutes: tuple[int, ...] = MARK_OFFSETS_MINUTES,
         max_wait_secs: Optional[float] = None,
     ) -> None:
-        """Background thread. Sleeps until decision + offset, then reads
-        ``feed.snapshot()`` and picks per-symbol last mid at or before
-        that instant. Non-blocking for the caller.
+        """Background thread — SINGLE snapshot at ``decision + max(offsets)``
+        (typically T+5), then walk-back through the same frame for
+        each earlier offset.
 
-        The parent's ``finally`` intentionally does NOT wait for this
-        thread. If it lands after ``finalize()``, ``_journal`` and
-        ``record_t5min_mark`` become no-ops via the ``_finalized``
-        guard so no state or journal file is resurrected.
+        Design rationale (worth calling out because it looks like
+        it should be five timers):
+        - One thread, one wake, one ``feed.snapshot()`` call — the
+          feed's buffer at T+5 already contains every tick from the
+          whole day, so a per-offset ``_mid_at_or_before`` filter
+          gives the T+1 last-mid without a T+1-wall-clock capture.
+        - No additional feed lifetime — the feed still stops right
+          after this one capture (via ``wait_for_marks``).
+        - No look-ahead — each mark filters ``ts_event <= its own
+          target``, not the capture time. The T+1 mark is CAPTURED
+          at T+5 wall clock but reflects only data at or before T+1.
+        - The rc=11 overnight-exposure path is unchanged: the wait
+          budget for the thread is set by the caller
+          (``max_wait_secs``) and the main path never blocks on it
+          — the orchestrator uses ``wait_for_marks(timeout=350)``
+          AFTER the exposure check, so a recording delay never
+          gates the operator page.
+
+        The parent's ``finally`` intentionally does NOT wait for
+        this thread. If it lands after ``finalize()``, ``_journal``
+        and ``record_marks`` become no-ops via the ``_finalized``
+        guard.
         """
-        target_ts = _to_utc(decision_ts_utc) + offset
+        decision = _to_utc(decision_ts_utc)
+        target_ts_by_offset: dict[int, datetime] = {
+            int(n): decision + timedelta(minutes=int(n))
+            for n in offsets_minutes
+        }
+        if not target_ts_by_offset:
+            return
+        max_target = max(target_ts_by_offset.values())
         done = threading.Event()
-        capture = _T5MinCapture(thread=None, done=done, target_ts_utc=target_ts)
+        capture = _MarksCapture(
+            thread=None, done=done, target_ts_by_offset=target_ts_by_offset,
+        )
 
         def _worker():
             try:
-                budget = max_wait_secs if max_wait_secs is not None else float("inf")
+                budget = (
+                    max_wait_secs if max_wait_secs is not None
+                    else float("inf")
+                )
                 start_wall = time.time()
                 while True:
                     now = _now_utc()
-                    remaining = (target_ts - now).total_seconds()
+                    remaining = (max_target - now).total_seconds()
                     if remaining <= 0:
                         break
                     elapsed = time.time() - start_wall
                     if elapsed >= budget:
                         break
-                    time.sleep(min(remaining, 5.0))
+                    # Cap each sleep chunk at BOTH the remaining budget
+                    # AND ~5s so a stopped feed / early cancel returns
+                    # promptly, and a short unit-test budget
+                    # (max_wait_secs=0.1) doesn't get stuck for 5s
+                    # before re-checking the budget.
+                    sleep_secs = min(remaining, 5.0)
+                    if budget != float("inf"):
+                        sleep_secs = min(sleep_secs, max(0.001, budget - elapsed))
+                    time.sleep(sleep_secs)
                 if self._finalized:
                     return
                 snapshot = feed.snapshot()
                 tbbo = snapshot.get("tbbo", pl.DataFrame())
                 if tbbo.is_empty():
                     logger.warning(
-                        "trade recorder: T+5min snapshot returned empty tbbo",
+                        "trade recorder: marks snapshot returned empty tbbo",
                     )
                     return
-                mids = _mid_at_or_before(tbbo, target_ts)
-                capture.result = mids
-                self.record_t5min_mark(
-                    mid_and_ts_by_sym=mids, target_ts_utc=target_ts,
+                # Walk back: one filter per target on the same frame.
+                marks_by_offset: dict[
+                    int, dict[str, tuple[float, datetime]]
+                ] = {}
+                for n, target_ts in target_ts_by_offset.items():
+                    try:
+                        marks_by_offset[n] = _mid_at_or_before(tbbo, target_ts)
+                    except Exception:
+                        logger.exception(
+                            "trade recorder: T+%dmin walk-back failed "
+                            "(non-fatal)",
+                            n,
+                        )
+                        continue
+                capture.result = marks_by_offset
+                self.record_marks(
+                    marks_by_offset_minutes=marks_by_offset,
+                    target_ts_by_offset_minutes=target_ts_by_offset,
                 )
             except Exception:
                 logger.exception(
-                    "trade recorder: T+5min capture thread failed (non-fatal)",
+                    "trade recorder: marks capture thread failed (non-fatal)",
                 )
             finally:
                 done.set()
 
         t = threading.Thread(
             target=_worker,
-            name="trade-recorder-t5min",
+            name="trade-recorder-marks",
             daemon=True,
         )
         capture.thread = t
-        self._t5min = capture
+        self._marks = capture
         t.start()
         logger.info(
-            "trade recorder: T+5min capture scheduled",
-            extra={"target_ts_utc": target_ts.isoformat()},
+            "trade recorder: marks capture scheduled",
+            extra={
+                "max_target_ts_utc": max_target.isoformat(),
+                "offsets_minutes": list(target_ts_by_offset.keys()),
+            },
         )
 
-    # ------------------------------------------------------------------
-    # T+5min wait handle (used by the orchestrator to stop the feed
-    # early once the capture is done, instead of leaving buffers to
-    # grow through the entire closing auction).
-    # ------------------------------------------------------------------
-
-    def wait_for_t5min(self, timeout: Optional[float] = None) -> bool:
-        """Block until the background T+5min thread finishes (or
+    def wait_for_marks(self, timeout: Optional[float] = None) -> bool:
+        """Block until the background marks thread finishes (or
         ``timeout`` elapses). Returns True iff the thread signalled
         completion; False if the wait timed out or there is no
         scheduled capture.
 
-        Used by the orchestrator so it can stop the Databento feed
-        as soon as the T+5min snapshot is in — instead of holding
-        it open through the 10-minute ``_fill_audit`` wait and
-        accumulating tbbo buffer memory for the closing auction.
+        The orchestrator uses this to stop the Databento feed as
+        soon as the marks snapshot is in, instead of holding it
+        open through the 10-minute ``_fill_audit`` wait. Called
+        only AFTER the rc=11 exposure gate so a bounded wait here
+        never delays the operator page.
         """
-        if self._t5min is None:
+        if self._marks is None:
             return False
         try:
-            return bool(self._t5min.done.wait(timeout=timeout))
+            return bool(self._marks.done.wait(timeout=timeout))
         except Exception:
             return False
 
@@ -993,32 +1222,32 @@ class TradeRecorder:
     def finalize(
         self,
         *,
-        wait_for_t5min: Optional[float] = None,
+        wait_for_marks: Optional[float] = None,
     ) -> Optional[Path]:
         """Materialise the parquet atomically. Idempotent.
 
-        ``wait_for_t5min`` defaults to ``None`` — do NOT block in the
+        ``wait_for_marks`` defaults to ``None`` — do NOT block in the
         common case. The orchestrator's ``finally`` calls this on
         every exit path (including the rc=11 OVERNIGHT-EXPOSURE page),
         and a wait would delay the operator alert. Pass a positive
         number only in tests that need to synchronise the background
-        thread; production callers should never pass one.
+        marks thread; production callers should never pass one.
         """
         with self._lock:
             if self._finalized:
                 return self.final_path
-        # Wait for the T+5min thread OUTSIDE the lock so it can still
-        # call ``record_t5min_mark`` (which takes the lock). Also do
-        # not set ``_finalized = True`` yet — the thread's post-sleep
+        # Wait for the marks thread OUTSIDE the lock so it can still
+        # call ``record_marks`` (which takes the lock). Also do not
+        # set ``_finalized = True`` yet — the thread's post-sleep
         # early-out checks that flag to avoid resurrecting a deleted
         # journal after the parquet is written; setting it here would
         # race with a wait we actually want to succeed.
-        if self._t5min is not None and wait_for_t5min:
+        if self._marks is not None and wait_for_marks:
             try:
-                self._t5min.done.wait(timeout=wait_for_t5min)
+                self._marks.done.wait(timeout=wait_for_marks)
             except Exception:
                 logger.exception(
-                    "trade recorder: T+5min wait failed (non-fatal)",
+                    "trade recorder: marks wait failed (non-fatal)",
                 )
         with self._lock:
             if self._finalized:
@@ -1076,9 +1305,14 @@ class TradeRecorder:
         out: dict[str, Any] = {}
         for name in TRADE_RECORD_SCHEMA.names:
             out[name] = row.get(name)
-        for k in ("decision_ts_utc", "snapshot_ts_utc", "sent_ts_utc",
-                  "fill_ts_utc", "observed_ts_utc", "arrival_ts_utc",
-                  "t5min_ts_utc"):
+        ts_cols: list[str] = [
+            "decision_ts_utc", "snapshot_ts_utc", "sent_ts_utc",
+            "fill_ts_utc", "observed_ts_utc", "arrival_ts_utc",
+        ]
+        for _n in MARK_OFFSETS_MINUTES:
+            _, ts_col, _ = _mark_column_names(_n)
+            ts_cols.append(ts_col)
+        for k in ts_cols:
             v = out.get(k)
             if v is None:
                 continue
@@ -1181,7 +1415,7 @@ def _mid_at_or_before(
     """Return per-symbol ``(mid, observed_ts)`` for the latest tbbo tick
     at or before ``target_ts_utc``.
 
-    The OBSERVED ts is returned so ``record_t5min_mark`` can compute a
+    The OBSERVED ts is returned so ``record_marks`` can compute a
     staleness gap — a thin name whose last print was minutes ago must
     NOT be recorded as if the price were fresh at the target instant.
     """
@@ -1241,7 +1475,62 @@ def _atomic_write_arrow(path: Path, table: pa.Table) -> None:
         raise
 
 
+# ---------------------------------------------------------------------------
+# Cross-vintage reader — MUST be used for any glob spanning schema
+# versions (e.g. a date range straddling a deploy).
+# ---------------------------------------------------------------------------
+
+def read_trades(
+    paths: Iterable[Any],
+    schema: pa.Schema = TRADE_RECORD_SCHEMA,
+) -> pa.Table:
+    """Read one or more trade parquets across schema vintages.
+
+    Passing the CURRENT ``schema`` explicitly makes pyarrow back-fill
+    any columns a v3 (or older) file lacks as **typed nulls**, so a
+    concat over a version boundary retains every v4 column. This is
+    the ONLY safe reader for a multi-file glob whose files may span
+    the v3 -> v4 boundary:
+
+    - ``pyarrow.dataset(paths).to_table()`` (no ``schema=``) infers
+      from the FIRST fragment — depending on filesystem ordering,
+      you get either 49 columns (v3 first, v4 columns silently
+      dropped, no warning) or 61 (v4 first, v3 rows show typed
+      nulls for the new columns). The **silent-drop path** produces
+      an analyst-facing decay-curve fit calibrated on T+5 only,
+      which is precisely the single-point failure v4 exists to
+      escape.
+    - ``pl.read_parquet([v3, v4])`` raises ``SchemaError``; the
+      remedy it suggests (``extra_columns="ignore"``) also silently
+      drops the new columns.
+
+    Use this helper. If a Polars frame is wanted, wrap the return
+    with ``pl.from_arrow(read_trades(paths))``.
+
+    ``paths``: any iterable of paths (str or ``Path``). One path
+    is fine — the same code path handles single-file reads.
+    ``schema``: defaults to the CURRENT ``TRADE_RECORD_SCHEMA``.
+    Pin an older schema only when you deliberately want an older
+    view (e.g. reproducing a historical downstream aggregation).
+
+    **Distinguishing null-from-vintage from null-from-failure**: for
+    a row whose ``t{n}min_price`` is null, filter on
+    ``schema_version < 4`` to identify the "column didn't exist"
+    case (v3 row, back-filled by this helper), and
+    ``schema_version == 4`` to identify the "mark genuinely didn't
+    populate" case (e.g. no tick at or before the target, or the
+    background thread never ran). Downstream calibration must
+    exclude both, but the two mean different things about the day.
+    """
+    str_paths = [str(p) for p in paths]
+    if not str_paths:
+        return pa.Table.from_pylist([], schema=schema)
+    dataset = ds.dataset(str_paths, format="parquet", schema=schema)
+    return dataset.to_table()
+
+
 __all__ = [
+    "MARK_OFFSETS_MINUTES",
     "SCHEMA_VERSION",
     "TRADE_RECORD_SCHEMA",
     "TRADES_DIR",
@@ -1249,6 +1538,7 @@ __all__ = [
     "arrival_prices_from_day_df",
     "extract_broker_extras",
     "make_run_id",
+    "read_trades",
     "resolve_journal_path",
     "resolve_output_path",
     "safe_call",
