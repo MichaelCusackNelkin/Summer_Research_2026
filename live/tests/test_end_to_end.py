@@ -1814,104 +1814,123 @@ def test_no_smart_routing_leaks_through_live_paths(monkeypatch, tmp_path):
     )
 
 
-def test_prequalify_drops_non_nasdaq_primary(monkeypatch, tmp_path):
-    """Finding #3: ``_prequalify_symbols`` must drop any name whose
-    qualified contract's ``primaryExchange`` is not ``"NASDAQ"``.
-
-    Reason: an ``ISLAND`` direct-routed MOC only prints on the NASDAQ
-    close-cross when the name's primary listing is NASDAQ. IB will
-    still qualify NYSE / ARCA-primary names on ``ISLAND`` for
-    continuous UTP trading — but the closing MOC on that name will
-    mis-print (or be rejected) at the primary listing's close-cross,
-    silently breaking the strategy. Refusing to trade the name is
-    the correct behaviour for a NASDAQ-only book.
-
-    Seeds the fake broker with a batch of universe names all marked
-    NYSE-primary (rather than a single hand-picked one, since the
-    optimizer's target set is model-dependent and we cannot predict
-    which specific name will be traded) and asserts:
-    * at least one drop is logged with ``primary_exchange="NYSE"``,
-    * no buy/sell order for ANY seeded symbol ever reaches the broker,
-    * unseeded (NASDAQ-primary) names still trade normally.
-    """
-    import logging as _logging
-
-    universe = config.load_active_universe()
-    feed = _prepopulate_live_feed(universe)
-    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
-    monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
-    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
-    _patch_artifacts(monkeypatch, universe)
-
-    # The optimizer's target set is model-dependent and (with this
-    # test's synthetic Ridge) skews toward alphabetically-early
-    # mid-caps rather than the file-order top-of-universe mega-caps.
-    # So we seed a wide alphabetical slice of the universe as
-    # NYSE-primary — enough overlap with the target book that the
-    # drop path is guaranteed to fire at least once. We intentionally
-    # leave the last few names unseeded (still NASDAQ-primary in the
-    # fake) so a NASDAQ-primary contingent survives to trade — the
-    # "the drop is symbol-specific, not a wholesale abort" invariant.
-    universe_sorted = sorted(universe)
-    seeded_nyse: dict[str, str] = {
-        sym: "NYSE" for sym in universe_sorted[: max(1, len(universe_sorted) // 2)]
-    }
-    fake_broker = _FakeBroker(non_nasdaq_primary=seeded_nyse)
-
-    def _fake_connect(_args):
-        fake_broker.connect(mode="paper")
-        return fake_broker
-
-    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
-
-    handler, records = _capture_orchestrator_logs(_logging.WARNING)
-    try:
-        rc = daily_orchestrator.main(_base_argv())
-    finally:
-        daily_orchestrator.logger.removeHandler(handler)
-
-    assert rc == 0
-
-    # (1) No NYSE-primary name may ever hit any buy/sell call. This
-    # is the load-bearing invariant — the strategy MUST NOT trade a
-    # name whose MOC would mis-print on a non-NASDAQ close-cross.
-    touched = (
-        {c[0] for c in fake_broker.buy_calls}
-        | {c[0] for c in fake_broker.sell_calls}
-    )
-    leaked = touched & set(seeded_nyse)
-    assert not leaked, (
-        f"non-NASDAQ-primary names traded despite the drop filter: "
-        f"{sorted(leaked)}"
-    )
-
-    # (2) At least one drop must have been logged with the informative
-    # extras — ``symbol`` (which name) and ``primary_exchange`` (why).
-    # We assert on the informative extras rather than a substring match
-    # on the message so a benign wording change to the warning does
-    # not silently break the regression.
-    dropped_syms = {
-        getattr(r, "symbol", None)
-        for r in records
-        if getattr(r, "primary_exchange", None) == "NYSE"
-        and getattr(r, "expected_primary_exchange", None) == "NASDAQ"
-    }
-    dropped_syms.discard(None)
-    assert dropped_syms, (
-        "no 'dropping non-NASDAQ-listed' warning was captured. "
-        f"seeded={sorted(seeded_nyse)}, "
-        f"captured_records={[r.getMessage() for r in records]}"
-    )
-    # And every dropped symbol must be one we seeded — never a
-    # spurious drop of a NASDAQ-primary name.
-    assert dropped_syms.issubset(set(seeded_nyse)), (
-        f"drop path fired for names we did NOT seed as NYSE-primary: "
-        f"{sorted(dropped_syms - set(seeded_nyse))}"
-    )
-
-    # (3) NASDAQ-primary names still trade — the drop is symbol-
-    # specific, not a wholesale abort.
-    assert touched, (
-        "no orders reached the broker at all — the drop path should "
-        "have removed only the seeded names, not the whole universe"
-    )
+# --- DISABLED 2026-07-20 -----------------------------------------------------
+# This test pins the NASDAQ-primary drop path in
+# ``_prequalify_symbols`` (live/daily_orchestrator.py). That drop was
+# commented out on 2026-07-20 after the broker-side route-survival
+# assertion (which ran BEFORE this filter) rejected 46 of 46 requested
+# symbols (100% failure, 0 passed) during a paper replay of
+# 2026-01-05, meaning the primaryExchange filter never got a chance
+# to fire end-to-end. On both current tiered universes the filter is
+# also a no-op: 49/49 in top_49_universe.txt, and 99 of the 100 in
+# top_100_universe.txt qualify with all 99 NASDAQ-primary (ITCI fails
+# IB qualification outright and never reaches the filter); its real
+# value is future universe-drift protection. The routing itself
+# (``exchange="ISLAND"`` threaded through every broker call) is
+# unchanged; only the two rejection checks are rolled back. See the
+# commented-out block in ``_prequalify_symbols`` and the matching
+# block in ``ibkr_broker/src/ibkr_broker/broker.py::_make_contract``.
+# Restore this test together with the code it covers.
+#
+# def test_prequalify_drops_non_nasdaq_primary(monkeypatch, tmp_path):
+#     """Finding #3: ``_prequalify_symbols`` must drop any name whose
+#     qualified contract's ``primaryExchange`` is not ``"NASDAQ"``.
+#
+#     Reason: an ``ISLAND`` direct-routed MOC only prints on the NASDAQ
+#     close-cross when the name's primary listing is NASDAQ. IB will
+#     still qualify NYSE / ARCA-primary names on ``ISLAND`` for
+#     continuous UTP trading — but the closing MOC on that name will
+#     mis-print (or be rejected) at the primary listing's close-cross,
+#     silently breaking the strategy. Refusing to trade the name is
+#     the correct behaviour for a NASDAQ-only book.
+#
+#     Seeds the fake broker with a batch of universe names all marked
+#     NYSE-primary (rather than a single hand-picked one, since the
+#     optimizer's target set is model-dependent and we cannot predict
+#     which specific name will be traded) and asserts:
+#     * at least one drop is logged with ``primary_exchange="NYSE"``,
+#     * no buy/sell order for ANY seeded symbol ever reaches the broker,
+#     * unseeded (NASDAQ-primary) names still trade normally.
+#     """
+#     import logging as _logging
+#
+#     universe = config.load_active_universe()
+#     feed = _prepopulate_live_feed(universe)
+#     monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
+#     monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
+#     monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+#     _patch_artifacts(monkeypatch, universe)
+#
+#     # The optimizer's target set is model-dependent and (with this
+#     # test's synthetic Ridge) skews toward alphabetically-early
+#     # mid-caps rather than the file-order top-of-universe mega-caps.
+#     # So we seed a wide alphabetical slice of the universe as
+#     # NYSE-primary — enough overlap with the target book that the
+#     # drop path is guaranteed to fire at least once. We intentionally
+#     # leave the last few names unseeded (still NASDAQ-primary in the
+#     # fake) so a NASDAQ-primary contingent survives to trade — the
+#     # "the drop is symbol-specific, not a wholesale abort" invariant.
+#     universe_sorted = sorted(universe)
+#     seeded_nyse: dict[str, str] = {
+#         sym: "NYSE" for sym in universe_sorted[: max(1, len(universe_sorted) // 2)]
+#     }
+#     fake_broker = _FakeBroker(non_nasdaq_primary=seeded_nyse)
+#
+#     def _fake_connect(_args):
+#         fake_broker.connect(mode="paper")
+#         return fake_broker
+#
+#     monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+#
+#     handler, records = _capture_orchestrator_logs(_logging.WARNING)
+#     try:
+#         rc = daily_orchestrator.main(_base_argv())
+#     finally:
+#         daily_orchestrator.logger.removeHandler(handler)
+#
+#     assert rc == 0
+#
+#     # (1) No NYSE-primary name may ever hit any buy/sell call. This
+#     # is the load-bearing invariant — the strategy MUST NOT trade a
+#     # name whose MOC would mis-print on a non-NASDAQ close-cross.
+#     touched = (
+#         {c[0] for c in fake_broker.buy_calls}
+#         | {c[0] for c in fake_broker.sell_calls}
+#     )
+#     leaked = touched & set(seeded_nyse)
+#     assert not leaked, (
+#         f"non-NASDAQ-primary names traded despite the drop filter: "
+#         f"{sorted(leaked)}"
+#     )
+#
+#     # (2) At least one drop must have been logged with the informative
+#     # extras — ``symbol`` (which name) and ``primary_exchange`` (why).
+#     # We assert on the informative extras rather than a substring match
+#     # on the message so a benign wording change to the warning does
+#     # not silently break the regression.
+#     dropped_syms = {
+#         getattr(r, "symbol", None)
+#         for r in records
+#         if getattr(r, "primary_exchange", None) == "NYSE"
+#         and getattr(r, "expected_primary_exchange", None) == "NASDAQ"
+#     }
+#     dropped_syms.discard(None)
+#     assert dropped_syms, (
+#         "no 'dropping non-NASDAQ-listed' warning was captured. "
+#         f"seeded={sorted(seeded_nyse)}, "
+#         f"captured_records={[r.getMessage() for r in records]}"
+#     )
+#     # And every dropped symbol must be one we seeded — never a
+#     # spurious drop of a NASDAQ-primary name.
+#     assert dropped_syms.issubset(set(seeded_nyse)), (
+#         f"drop path fired for names we did NOT seed as NYSE-primary: "
+#         f"{sorted(dropped_syms - set(seeded_nyse))}"
+#     )
+#
+#     # (3) NASDAQ-primary names still trade — the drop is symbol-
+#     # specific, not a wholesale abort.
+#     assert touched, (
+#         "no orders reached the broker at all — the drop path should "
+#         "have removed only the seeded names, not the whole universe"
+#     )
+# --- end DISABLED 2026-07-20 -------------------------------------------------

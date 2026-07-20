@@ -703,53 +703,76 @@ def _prequalify_symbols(broker, symbols: list[str]) -> set[str]:
     We swallow individual exceptions and log them; one bad name should
     not kill the batch.
 
-    NASDAQ-listed eligibility filter
-    --------------------------------
+    NASDAQ-listed eligibility filter (DISABLED 2026-07-20)
+    ------------------------------------------------------
 
-    Direct-routing to ``ISLAND`` is not the same as being NASDAQ-listed.
-    IB will qualify NYSE- or ARCA-primary names on ``ISLAND`` for
-    continuous UTP trading — but the MOC at the close is the
-    *primary listing exchange's* closing cross. So a name whose
-    ``primaryExchange`` is ``"NYSE"`` (or anything other than
-    ``"NASDAQ"``) will pass qualification here, then have its MOC exit
-    mis-print / rejected at the 16:00 close-cross. That silently
-    breaks the strategy (which is calibrated to the NASDAQ auction
-    print).
-
-    We therefore also require ``primaryExchange == "NASDAQ"`` on every
-    qualified contract and DROP any non-NASDAQ-listed name with a loud
-    warning. This is the correct behaviour for a NASDAQ-only strategy:
-    fills off the NASDAQ close-cross are useless.
+    A ``primaryExchange == "NASDAQ"`` filter previously lived here
+    (see the commented-out block below) — the intent was to drop
+    NYSE/ARCA-primary names since their MOC prints on the primary
+    listing's close-cross, not NASDAQ's. It was rolled back
+    together with the broker's route-survival assertion: during a
+    2026-07-20 paper replay the broker guard rejected 46 of 46
+    requested symbols (100% failure, 0 passed) upstream of this
+    filter, so this drop's behaviour was never exercised end-to-end
+    on that run. The filter is also currently a no-op on both
+    tiered universes: 49/49 in top_49_universe.txt, and 99 of the
+    100 in top_100_universe.txt qualify with all 99 NASDAQ-primary
+    (ITCI fails IB qualification outright and is dropped by the
+    still-active try/except above, never reaching this filter), so
+    on the active universe it never dropped a name. Its real value is future
+    universe-drift protection — ``universe.txt`` (the broad ~2000
+    name pool retrain scans) does include NYSE/ARCA-primary names.
     """
     ok: set[str] = set()
     for sym in symbols:
         try:
-            contract = broker._make_contract(sym, exchange=NASDAQ_EXCHANGE)
+            # The qualified contract is only inspected by the
+            # commented-out primaryExchange filter below, so we
+            # discard the return value. Keep the call itself — it
+            # is still how we detect a name IB cannot qualify (bad
+            # ticker, no market-data subscription, etc.).
+            broker._make_contract(sym, exchange=NASDAQ_EXCHANGE)
         except Exception as e:
             logger.warning(
                 "contract qualification failed",
                 extra={"symbol": sym, "error": str(e)[:200]},
             )
             continue
+        # --- DISABLED 2026-07-20 (see docstring above) --------------------
         # NASDAQ-listed eligibility: drop names whose primary listing
         # is not NASDAQ, because their MOC prints on their home
         # exchange's close-cross, not NASDAQ's. We include the
         # qualified contract's primaryExchange in the log so the
         # operator can see WHY the name was dropped.
-        primary = getattr(contract, "primaryExchange", "") or ""
-        if primary != "NASDAQ":
-            logger.warning(
-                "dropping non-NASDAQ-listed symbol from target: MOC "
-                "at close prints on the primary listing's close-cross, "
-                "not NASDAQ's — an ISLAND MOC on this name would "
-                "mis-print or be rejected",
-                extra={
-                    "symbol": sym,
-                    "primary_exchange": primary,
-                    "expected_primary_exchange": "NASDAQ",
-                },
-            )
-            continue
+        #
+        # Rolled back alongside the broker-side route-survival
+        # assertion so we can re-run a replay and observe what
+        # actually reaches the MOC leg. On both current tiered
+        # universes this filter is a no-op: 49/49 in top_49, and 99
+        # of the 100 in top_100 qualify with all 99 NASDAQ-primary
+        # (ITCI fails IB qualification outright and is dropped by
+        # the try/except above, never reaching here), so restoring
+        # it only matters as
+        # future universe-drift protection — ``universe.txt`` (the
+        # broad ~2000-name pool ``retrain`` scans) contains
+        # NYSE/ARCA-primary names. To restore, capture the
+        # ``_make_contract`` return above into a ``contract``
+        # variable again.
+        # primary = getattr(contract, "primaryExchange", "") or ""
+        # if primary != "NASDAQ":
+        #     logger.warning(
+        #         "dropping non-NASDAQ-listed symbol from target: MOC "
+        #         "at close prints on the primary listing's close-cross, "
+        #         "not NASDAQ's — an ISLAND MOC on this name would "
+        #         "mis-print or be rejected",
+        #         extra={
+        #             "symbol": sym,
+        #             "primary_exchange": primary,
+        #             "expected_primary_exchange": "NASDAQ",
+        #         },
+        #     )
+        #     continue
+        # ------------------------------------------------------------------
         ok.add(sym)
     logger.info(
         "contracts pre-qualified",

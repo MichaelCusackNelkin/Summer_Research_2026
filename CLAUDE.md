@@ -325,8 +325,13 @@ surface. `live/README.md` is the authoritative operator's guide; the shape:
   order routes direct to the NASDAQ INET book (NOT SMART), because the model is calibrated to
   the NASDAQ close cross — an off-venue fill is uncorrelated with the sized signal. Any new
   broker call site in `live/` MUST thread this constant through; enforcement is code review
-  (the broker default stays `SMART` for non-`live/` callers). `_prequalify_symbols` also drops
-  non-NASDAQ-primary names.
+  (the broker default stays `SMART` for non-`live/` callers). `_prequalify_symbols` previously
+  also dropped non-NASDAQ-primary names via a `primaryExchange == "NASDAQ"` check; that filter
+  is currently **disabled** (rolled back 2026-07-20 with the broker's route-survival
+  assertion). It's a no-op on both current tiered universes — 49/49 in `top_49_universe.txt`,
+  and 99 of the 100 in `top_100_universe.txt` qualify with all 99 NASDAQ-primary (ITCI fails IB
+  qualification outright and is dropped before the filter) — so nothing changes today; its real
+  value is future universe-drift protection.
 - Non-obvious execution invariant worth knowing before touching the order path: **LEG 2 (the
   MOC counter-flatten) is sized from a fresh `broker.get_positions()` after the entry fills,
   NEVER from `target - current`.** This is what prevents a partial entry fill from

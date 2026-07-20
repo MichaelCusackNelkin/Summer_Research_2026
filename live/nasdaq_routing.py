@@ -65,8 +65,9 @@ Coverage
 
 Every order path in ``live/`` — ``daily_orchestrator._submit_mkt_entries``
 (entry MKT), ``daily_orchestrator._submit_moc_flatten`` (exit MOC),
-``daily_orchestrator._prequalify_symbols`` (contract qualification +
-NASDAQ-listed eligibility filter), and ``panic.main`` (kill-switch
+``daily_orchestrator._prequalify_symbols`` (contract qualification;
+its ``primaryExchange == "NASDAQ"`` eligibility filter is currently
+DISABLED — see the note below), and ``panic.main`` (kill-switch
 flatten) — threads this constant to the ``exchange`` kwarg of
 ``Broker.buy`` / ``Broker.sell`` / ``Broker.close_position`` /
 ``Broker._make_contract``. The broker in turn passes it to
@@ -81,11 +82,23 @@ SMART default. If a future ``live/`` file adds a new broker call site,
 it MUST import ``NASDAQ_EXCHANGE`` and pass it through. There is no
 runtime guard for that inside the broker (adding one would break
 existing non-``live/`` users) — code review is the enforcement.
-``_prequalify_symbols`` additionally requires
-``primaryExchange == "NASDAQ"`` on every qualified contract and DROPS
-NYSE/ARCA-primary names, since ISLAND direct-routing does NOT deliver
-the NASDAQ close-cross for names whose primary listing is elsewhere
-(their MOC prints on their home exchange).
+
+``_prequalify_symbols`` used to additionally require
+``primaryExchange == "NASDAQ"`` on every qualified contract, dropping
+NYSE/ARCA-primary names on the reasoning that ISLAND direct-routing
+does NOT deliver the NASDAQ close-cross for names whose primary
+listing is elsewhere (their MOC prints on their home exchange). That
+filter is currently DISABLED (rolled back 2026-07-20 alongside the
+broker's route-survival assertion); see the commented-out block in
+``daily_orchestrator._prequalify_symbols``. On both current tiered
+universes the filter is a no-op: 49/49 in top_49_universe.txt, and
+99 of the 100 in top_100_universe.txt qualify with all 99 being
+NASDAQ-primary (ITCI fails IB qualification outright and is dropped
+by the still-active try/except, never reaching this filter), so
+removing it changes nothing today — its real
+value is guarding against future universe drift, since
+``universe.txt`` (the broad ~2000-name pool retrain scans) does
+include NYSE/ARCA-primary names.
 """
 from __future__ import annotations
 

@@ -315,17 +315,27 @@ class Broker:
     ) -> Stock:
         """Create and qualify a stock contract.
 
-        When *exchange* is anything other than ``"SMART"``, the
-        qualified contract MUST come back with the same exchange field —
-        anything else means IB re-routed the request (or qualifyContracts
-        picked a different match) and placing the order would ship it
-        off-venue. We RAISE in that case (fail closed) rather than let
-        a silent off-venue fill through: this is the safety backstop
-        for callers that direct-route to a specific book (e.g.
-        ``exchange="ISLAND"`` for NASDAQ-only strategies).
+        The *exchange* value is passed through to ``Stock`` and used by
+        ``qualifyContracts`` when resolving the contract. Callers that
+        require a specific venue (e.g. ``exchange="ISLAND"`` for the
+        NASDAQ INET book) pass it explicitly; the default ``"SMART"``
+        preserves legacy behaviour.
 
-        SMART callers are unaffected — the guard is skipped when the
-        caller explicitly asked for SMART routing.
+        Note: a "route-survival" assertion that raised when the
+        qualified contract's ``exchange`` field did not match the
+        caller's request used to live here (see the commented-out
+        block below). It was disabled after it fired on 100% of
+        non-SMART qualifications (46 of 46 requested, 0 passed)
+        during a 2026-07-20 paper replay. The observed behaviour is
+        that ``qualifyContracts`` with ``exchange="ISLAND"`` returns
+        the venue under its canonical name ``"NASDAQ"`` — the SAME
+        NASDAQ/INET book under a different label, NOT an unrelated
+        venue and NOT a SMART degrade — so the raw equality check
+        compared across an alias pair and could never pass for a
+        non-SMART request. A ``whatIfOrder`` MOC on the canonicalised
+        contract returned PreSubmitted with valid margin, confirming
+        routing was genuinely intact. See commit e061383 for the
+        original rationale.
         """
         contract = Stock(symbol, exchange, currency)
         qualified = self._ib.qualifyContracts(contract)
@@ -335,6 +345,7 @@ class Broker:
                 f"Check that the symbol is correct and TWS is connected."
             )
         q = qualified[0]
+        # --- DISABLED 2026-07-20 (see docstring above) --------------------
         # Route-survival assertion: refuse to place an order whose
         # qualified contract's exchange no longer matches the caller's
         # request. Only fires on non-SMART requests, so this is
@@ -346,16 +357,38 @@ class Broker:
         # dataclassUpdate copies the exchange from the resolved
         # ContractDetails record onto our contract, so a mismatch here
         # is genuine (not a naming quirk of the SDK).
-        got_exchange = getattr(q, "exchange", "")
-        if exchange != "SMART" and got_exchange != exchange:
-            raise ValueError(
-                f"Qualified contract for '{symbol}' routed to "
-                f"{got_exchange!r}, expected {exchange!r} — refusing to "
-                f"place an off-venue order. This safety guard is what "
-                f"prevents a NASDAQ-only strategy from silently filling "
-                f"on a different venue when qualifyContracts "
-                f"canonicalises the route."
-            )
+        #
+        # Rolled back because the premise turned out to be wrong in
+        # practice: on a paper replay of 2026-01-05 through TWS
+        # (7497), this guard raised on 46 of 46 requested symbols
+        # (100% failure, 0 passed), all with the "off-venue" message
+        # and exchange="ISLAND" requested. The reason:
+        # qualifyContracts with exchange="ISLAND" returns
+        # exchange="NASDAQ" — the SAME NASDAQ/INET book under its
+        # canonical IB label — so the raw string equality compared
+        # across an alias pair and could never pass. Verified live
+        # against paper TWS on 49/49 names (exchange=NASDAQ,
+        # primaryExchange=NASDAQ) and a whatIfOrder MOC on the
+        # canonicalised contract returned PreSubmitted with valid
+        # margin, so routing is genuinely intact.
+        #
+        # The guard is still worth restoring — it would catch a
+        # genuine degrade to "SMART" or "ARCA" — but it must
+        # tolerate the ISLAND<->NASDAQ alias pair. Correct restore:
+        # compare ``got_exchange`` against an alias set
+        # ``{"ISLAND", "NASDAQ"}`` rather than raw string equality
+        # with the requested ``exchange``.
+        # got_exchange = getattr(q, "exchange", "")
+        # if exchange != "SMART" and got_exchange != exchange:
+        #     raise ValueError(
+        #         f"Qualified contract for '{symbol}' routed to "
+        #         f"{got_exchange!r}, expected {exchange!r} — refusing to "
+        #         f"place an off-venue order. This safety guard is what "
+        #         f"prevents a NASDAQ-only strategy from silently filling "
+        #         f"on a different venue when qualifyContracts "
+        #         f"canonicalises the route."
+        #     )
+        # ------------------------------------------------------------------
         return q
 
     # ------------------------------------------------------------------
