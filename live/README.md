@@ -936,6 +936,11 @@ next run rebuilds it cheaply (one streaming group-by per parquet).
 
 ### Log locations
 
+**See `live/LOGS.md` for a field-by-field reader's guide to every log
+format** — what each key means, the milestone sequence of a healthy run,
+and how to tell real records from test-suite output (the 07-15..07-17
+files are heavily contaminated; see that doc before trusting them).
+
 - `live/logs/live.daily_orchestrator.log` — human-readable stream +
   JSON-lines file, nightly rotation with 30-day retention.
 - `live/logs/live.retrain.log` — same shape for retrain runs.
