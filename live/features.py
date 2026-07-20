@@ -13,6 +13,13 @@ The optimizer also needs a handful of PER-DAY inputs beyond the alpha
 features — ``entry_price``, ``spread_return``, ``ADV``, ``vol`` — so those
 are computed here too and joined into the same live feature frame.
 
+Note on ``spread_return``: it is the FULL relative spread
+``(ask - bid) / mid``. The CostModel in ``optimizer.py`` reads it and
+multiplies by ``0.5`` to get the half — halving here would produce a 2x
+error in the cost term that prices every trade. See
+``trade_recorder.py::rel_spread_at_decision``, which stores the same
+value under a name that leaves no room for misinterpretation.
+
 Key design decision: the feature frame column names EXACTLY match what the
 sklearn Pipeline expects (the notebook's ``features`` list). Renaming would
 silently break predictions.
@@ -41,7 +48,7 @@ TARGET_COLUMN = "close_return_xm"
 
 OPTIMIZER_INPUT_COLUMNS: list[str] = [
     "entry_price",   # $ — used to convert dollar positions -> shares
-    "spread_return", # return-space half-spread proxy for the cost model
+    "spread_return", # FULL relative spread (ask-bid)/mid; CostModel halves it
     "ADV",           # causal $-volume — impact denominator
     "vol",           # causal daily return vol — impact numerator
 ]
@@ -57,13 +64,17 @@ def compute_close_trades(
     entry_window_start: str = "15:49:55",
     entry_window_end: str = "15:50:00",
 ) -> pl.LazyFrame:
-    """Per-(date, symbol) entry price and half-spread from the last few
-    seconds before the 15:50 print.
+    """Per-(date, symbol) entry price and FULL relative spread from the
+    last few seconds before the 15:50 print.
 
     Matches ``optimizer/optimal_portfolio.ipynb`` verbatim (last mid in the
     window, mean spread as spread_return). We take the LAST mid because a
     single blip can knock the mean around; the auction cross is done off the
     last-touch anyway.
+
+    ``spread_return = (ask - bid) / mid`` is the FULL relative spread. The
+    CostModel in ``optimizer.py`` reads this and multiplies by 0.5 to get
+    a half-spread. Do NOT halve it here.
     """
     from datetime import time as _time
     hs, ms, ss = [int(x) for x in entry_window_start.split(":")]

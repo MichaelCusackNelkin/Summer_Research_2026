@@ -74,7 +74,9 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -88,6 +90,7 @@ _UTC = timezone.utc
 
 from live import config
 from live.nasdaq_routing import NASDAQ_EXCHANGE
+from live import trade_recorder
 from live.features import (
     ALPHA_FEATURES,
     build_feature_frame,
@@ -502,16 +505,25 @@ def _build_live_day_frame(
         reference_stats=reference_stats,
     )
 
-    # Last mid per symbol for share sizing (fresher than entry_price if we
-    # kept streaming after the 15:50 print).
+    # Last mid + last-observed ts per symbol. The mid is used for share
+    # sizing (fresher than ``entry_price`` if we kept streaming after
+    # the 15:50 print). The ts is threaded into the trade recorder so
+    # ``arrival_ts_utc`` / ``arrival_staleness_secs`` can flag thin
+    # names whose last print was minutes ago — those rows would
+    # otherwise pool with clean rows under an analyst's naive
+    # decision-time slippage average.
     last_mid = (
         tbbo
         .sort("ts_event")
         .with_columns(((pl.col("ask_px_00") + pl.col("bid_px_00")) / 2).alias("mid"))
         .group_by("symbol", maintain_order=False)
-        .agg(pl.col("mid").last().alias("last_mid"))
+        .agg(
+            pl.col("mid").last().alias("last_mid"),
+            pl.col("ts_event").last().alias("last_mid_ts"),
+        )
     )
     last_mid_by_sym = dict(zip(last_mid["symbol"].to_list(), last_mid["last_mid"].to_list()))
+    last_mid_ts_by_sym = dict(zip(last_mid["symbol"].to_list(), last_mid["last_mid_ts"].to_list()))
 
     # C2 hard coverage assertion: refuse to hand back a thin day_df. A live
     # snapshot at 15:50 should cover most of the top-100 — anything less
@@ -532,7 +544,7 @@ def _build_live_day_frame(
             "coverage": coverage,
         },
     )
-    return day_df, last_mid_by_sym
+    return day_df, last_mid_by_sym, last_mid_ts_by_sym
 
 
 def _compute_share_targets(
@@ -587,6 +599,21 @@ def _connect_broker(args: argparse.Namespace):
 # Timing helpers
 # ---------------------------------------------------------------------------
 
+def _stop_feed_safe(feed) -> None:
+    """Best-effort idempotent ``feed.stop()`` — every early-return
+    path in ``main()`` calls this so the feed's daemon thread doesn't
+    outlive the process on rc=3/4/5/8. ``LiveFeed.stop`` is already
+    idempotent internally; wrap it in a try/except so an exception
+    during shutdown doesn't propagate up over the return code.
+    """
+    if feed is None:
+        return
+    try:
+        feed.stop()
+    except Exception:
+        logger.exception("feed stop failed (non-fatal)")
+
+
 def _sleep_until(target: datetime, poll: float = 5.0) -> None:
     """Block until ``target`` (America/New_York timezone).
 
@@ -607,6 +634,130 @@ def _sleep_until(target: datetime, poll: float = 5.0) -> None:
 
 _TARGETS_DIR = config.LIVE_LOG_DIR / "targets"
 _FILLS_DIR = config.LIVE_LOG_DIR / "fills"
+# Per-trade parquet output root. Kept as a module-level so tests can
+# monkey-patch to an isolated ``tmp_path`` (same idiom as the two dirs
+# above).
+_TRADES_DIR = config.LIVE_LOG_DIR / "trades"
+
+# Per-process scratch dir used only when the safeguard in
+# ``_resolve_trades_dir`` decides the current run is not producing
+# real fills (fake broker, notebook, test harness). Prevents
+# fabricated rows from silently appending to ``live/logs/trades/``.
+_PYTEST_TRADES_SCRATCH: Optional[Path] = None
+
+
+def _cleanup_pytest_trades_scratch() -> None:
+    """Best-effort atexit cleanup of ``_PYTEST_TRADES_SCRATCH``.
+
+    Gated on ``PYTEST_CURRENT_TEST`` so a PRODUCTION misdetection of
+    the broker type (see ``_resolve_trades_dir``) leaves the recorded
+    fills on disk for the operator to recover from
+    ``/tmp/live-trade-recorder-scratch-*``. Under pytest we still
+    rmtree so the scratch dir doesn't accumulate.
+
+    Deliberately silent — this runs at interpreter shutdown, when
+    the logging handlers' file streams may already be closed. The
+    WARNING that operators would need to see in the production
+    misdetection case was already emitted at redirect time in
+    ``_resolve_trades_dir``; this function only decides whether to
+    delete.
+    """
+    global _PYTEST_TRADES_SCRATCH
+    if _PYTEST_TRADES_SCRATCH is None:
+        return
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        # Not a test run — the redirect fired due to a broker-type
+        # misdetection in production. DO NOT DELETE. The parquet in
+        # scratch may be the ONLY record of the day's trades.
+        return
+    try:
+        import shutil as _shutil
+        _shutil.rmtree(_PYTEST_TRADES_SCRATCH, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _is_real_ibkr_broker(broker: object) -> bool:
+    """True iff ``broker`` is a live ``ibkr_broker.Broker`` instance.
+
+    Fake test-broker classes (``_FakeBroker`` in the test files, or
+    any user-side stub) do NOT satisfy this — the recorder safeguard
+    uses this to redirect their output to a scratch dir. Any failure
+    to import ``ibkr_broker`` is treated as "not real" (safer than
+    silently allowing fabricated rows through).
+
+    Known limitations we deliberately accept:
+
+    - ``MagicMock(spec=Broker)`` fakes ``__class__`` and will pass
+      ``isinstance``. Not a realistic production risk (the autouse
+      test fixture patches ``_TRADES_DIR`` before this ever runs
+      against a mocked broker) but worth naming.
+    - A duplicate ``ibkr_broker`` module identity (editable install
+      re-imported through a different ``sys.path`` prefix, an
+      ``importlib.reload``, or a future subclass) can make the
+      isinstance check miss. This is why ``_cleanup_pytest_trades_scratch``
+      gates its rmtree on ``PYTEST_CURRENT_TEST`` — a false negative
+      here trades to scratch but the file stays on disk for recovery.
+    """
+    if broker is None:
+        return False
+    try:
+        from ibkr_broker.broker import Broker as _RealBroker
+    except Exception:
+        return False
+    return isinstance(broker, _RealBroker)
+
+
+def _resolve_trades_dir(broker: object = None) -> Path:
+    """Return the effective trade-recorder output root.
+
+    - Production: honours ``_TRADES_DIR`` (defaults to
+      ``live/logs/trades``) IF the run is producing real fills, i.e.
+      ``broker`` is an actual ``ibkr_broker.Broker`` instance connected
+      to TWS.
+    - Otherwise (fake broker in a notebook, test harness, or a broker
+      class whose ``isinstance`` check misses for any reason):
+      redirect to a per-process temp directory. In PRODUCTION this
+      also emits a WARNING naming the broker type and scratch path so
+      an operator can find the recorded fills if the misdetection
+      was legitimate.
+    - Tests that WANT to inspect recorder output should still
+      monkeypatch ``_TRADES_DIR`` to their own ``tmp_path``; the
+      scratch redirect is a defence-in-depth safeguard, not a feature.
+
+    Explicit ``_TRADES_DIR`` overrides (e.g. tests' monkeypatch) are
+    always honoured — the caller has clearly said "put it here".
+    """
+    global _PYTEST_TRADES_SCRATCH
+    default = config.LIVE_LOG_DIR / "trades"
+    if _TRADES_DIR != default:
+        # Caller explicitly picked a location. Trust them.
+        return _TRADES_DIR
+    if _is_real_ibkr_broker(broker):
+        return _TRADES_DIR
+    # Redirect. Anything that ends up here is EITHER fake fills (test
+    # / notebook, expected) OR a real broker whose type check missed
+    # (production, must not be silent).
+    if _PYTEST_TRADES_SCRATCH is None:
+        _PYTEST_TRADES_SCRATCH = Path(
+            tempfile.mkdtemp(prefix="live-trade-recorder-scratch-")
+        )
+        import atexit as _atexit
+        _atexit.register(_cleanup_pytest_trades_scratch)
+    # A WARNING (not INFO) so a production misdetection is impossible
+    # to miss in the logs. The broker type name is included so the
+    # operator can see WHY the check failed (e.g. duplicate module
+    # identity via an editable install / sys.path variant).
+    logger.warning(
+        "trade recorder: redirecting output to scratch dir %s "
+        "(broker type: %s). If this fired during a real paper/live "
+        "run, the isinstance check missed — check the scratch dir "
+        "for the recorded parquet; it will NOT be deleted at exit "
+        "unless PYTEST_CURRENT_TEST is set.",
+        str(_PYTEST_TRADES_SCRATCH),
+        type(broker).__name__ if broker is not None else "None",
+    )
+    return _PYTEST_TRADES_SCRATCH
 
 
 def _hash_universe(universe: list[str]) -> str:
@@ -1302,52 +1453,217 @@ def _coverage_cross_check(
     return sorted(uncovered)
 
 
-def _fill_audit(broker, order_ids: list[str], timeout_seconds: int = 900) -> None:
-    """Wait for fills up to ``timeout_seconds`` and append a JSONL entry per
-    order to ``live/logs/fills/YYYY-MM-DD.jsonl``.
+# Terminal statuses that end a fill audit for a given oid.
+_FILL_AUDIT_TERMINAL_STATES: frozenset[str] = frozenset({
+    "Filled", "Cancelled", "ApiCancelled", "Inactive",
+})
 
-    The MOC prints at 16:00; we cap the poll so the process doesn't hang
-    if TWS never updates one of the terminal states.
+# Per-oid wait cap for ENTRY legs during the fill audit. Entries are
+# either terminal by the time the audit runs (they were placed at
+# 15:50, filled or cancelled within milliseconds, and passed through
+# the belt-and-braces cancel loop) OR stuck non-terminal (halted /
+# illiquid tape / PendingCancel that TWS hasn't cleared yet). The
+# latter would otherwise burn the audit's whole remaining budget on
+# a wait that only settles at 16:00, starving every subsequent MOC's
+# rc verdict of a real fill and pushing `broker.disconnect()` past
+# 16:05. Cap the entry wait; MOCs get the full remaining budget
+# because they legitimately need to block until the close cross.
+_ENTRY_AUDIT_TIMEOUT_SECS: float = 10.0
+
+
+def _fill_audit(
+    broker,
+    order_ids: list[str],
+    timeout_seconds: int = 900,
+    recorder: Optional["trade_recorder.TradeRecorder"] = None,
+    oid_to_leg_sym: Optional[dict[str, tuple[str, str]]] = None,
+) -> None:
+    """Poll each order for a terminal state, up to a WHOLE-audit deadline.
+
+    Previously each order got ``timeout_seconds / len(order_ids)``
+    seconds — for a ~136-oid book that's ~6.6s per order, and MOC
+    orders sit ``Submitted`` until the 16:00 close cross, so every MOC
+    timed out and was recorded as ``filled_qty=0``. That's the exit
+    leg of a close-auction strategy — visible in a downstream sum as
+    "the exit never happened".
+
+    The corrected design gives EACH oid the full remaining budget in
+    a sequential ``wait_for_fill`` loop. Entries fill within
+    milliseconds and return immediately; the first MOC blocks until
+    ~16:00 (when the close cross prints); the remaining MOCs are
+    already ``Filled`` by then and their ``wait_for_fill`` returns
+    immediately. Total wall-clock ≈ 10 minutes on the happy path
+    starting at 15:50.
+
+    ``wait_for_fill``'s internal ``self._ib.sleep(0.2)`` pumps the
+    ib_async event loop, so status updates are actually delivered to
+    ``broker._trades[oid]`` during the wait (bare ``time.sleep`` would
+    stall event delivery).
+
+    Anything still non-terminal at the whole-audit deadline is
+    recorded as ``status="timeout"`` and, in the parquet, gets a null
+    ``filled_qty`` / ``achieved_dollars`` — a subsequent
+    ``sum(achieved_dollars)`` correctly ignores it rather than
+    silently treating it as $0.
+
+    All recorder calls are ``safe_call``-wrapped so a raise inside the
+    recorder cannot leak into the audit and lose the JSONL log for
+    subsequent orders.
     """
     _FILLS_DIR.mkdir(parents=True, exist_ok=True)
     today = config.now_ny().date().isoformat()
     fills_path = _FILLS_DIR / f"{today}.jsonl"
     deadline = time.time() + timeout_seconds
-    per_order_wait = max(1.0, timeout_seconds / max(len(order_ids), 1))
+    oid_to_leg_sym = oid_to_leg_sym or {}
+
+    # Audit MOC oids FIRST. MOCs need the whole ~10-minute window
+    # (they don't fill until 16:00). Entries then get a capped wait
+    # each — they're either already terminal (fast return) or stuck
+    # non-terminal, in which case the cap keeps one bad entry from
+    # eating the whole audit budget and pushing broker.disconnect()
+    # past 16:05.
+    moc_ids = [o for o in order_ids if oid_to_leg_sym.get(o, ("", ""))[0] == "moc"]
+    entry_ids = [o for o in order_ids if oid_to_leg_sym.get(o, ("", ""))[0] != "moc"]
+    ordered_ids = moc_ids + entry_ids
+
+    def _record_terminal_to_recorder(oid: str, info, observed_ts_utc: datetime) -> None:
+        if recorder is None:
+            return
+        leg_sym = oid_to_leg_sym.get(oid)
+        if leg_sym is None:
+            return
+        leg, sym = leg_sym
+        # extract_broker_extras is defensive but wrap the whole call
+        # in a try so a raise here doesn't cost us the fill row.
+        try:
+            extras = trade_recorder.extract_broker_extras(broker, oid)
+        except Exception:
+            logger.exception(
+                "extract_broker_extras raised (non-fatal); recording fill without extras",
+                extra={"order_id": oid, "symbol": sym},
+            )
+            extras = {}
+        filled_val = getattr(info, "filled", 0)
+        try:
+            filled_qty: Optional[float] = (
+                float(filled_val) if filled_val is not None else 0.0
+            )
+        except (TypeError, ValueError):
+            filled_qty = 0.0
+        fill_price_val = getattr(info, "avg_fill_price", None)
+        try:
+            fill_price: Optional[float] = (
+                float(fill_price_val) if fill_price_val is not None else None
+            )
+        except (TypeError, ValueError):
+            fill_price = None
+        trade_recorder.safe_call(
+            recorder.record_fill,
+            leg=leg,
+            symbol=sym,
+            order_id=oid,
+            filled_qty=filled_qty,
+            fill_price=fill_price,
+            status=getattr(info, "status", None),
+            observed_ts_utc=observed_ts_utc,
+            extras=extras,
+        )
+
+    def _record_timeout_to_recorder(oid: str, status: str, observed_ts_utc: datetime) -> None:
+        if recorder is None:
+            return
+        leg_sym = oid_to_leg_sym.get(oid)
+        if leg_sym is None:
+            return
+        leg, sym = leg_sym
+        # Timeout / error — filled_qty stays NULL so downstream sums
+        # don't confuse it with a definitive zero-fill.
+        trade_recorder.safe_call(
+            recorder.record_fill,
+            leg=leg,
+            symbol=sym,
+            order_id=oid,
+            filled_qty=None,
+            fill_price=None,
+            status=status,
+            observed_ts_utc=observed_ts_utc,
+        )
+
+    n_terminal = 0
+    n_timeout = 0
+    n_error = 0
     with fills_path.open("a") as fh:
-        for oid in order_ids:
+        for oid in ordered_ids:
+            leg = oid_to_leg_sym.get(oid, ("moc", ""))[0]
             remaining = max(0.0, deadline - time.time())
-            wait = min(per_order_wait, remaining)
-            if wait <= 0:
-                logger.warning("fill audit deadline reached", extra={"order_id": oid})
-                break
+            if remaining <= 0:
+                logger.warning(
+                    "fill audit deadline reached; remaining orders recorded as timeout",
+                    extra={"order_id": oid, "leg": leg},
+                )
+                observed = datetime.now(_UTC)
+                fh.write(json.dumps({
+                    "ts": config.now_ny().isoformat(),
+                    "order_id": oid, "status": "timeout",
+                }, default=str) + "\n")
+                _record_timeout_to_recorder(oid, "timeout", observed)
+                n_timeout += 1
+                continue
+            # Cap ENTRY waits at ~10s so a stuck non-terminal entry
+            # (PendingCancel, halted symbol) can't burn the whole
+            # remaining budget. MOCs get the full budget because
+            # they legitimately need to wait for the 16:00 print.
+            per_wait = (
+                min(remaining, _ENTRY_AUDIT_TIMEOUT_SECS)
+                if leg == "entry" else remaining
+            )
             try:
-                info = broker.wait_for_fill(oid, timeout=wait)
-                entry = {
-                    "ts": config.now_ny().isoformat(),
-                    "order_id": info.order_id,
-                    "symbol": info.symbol,
-                    "action": info.action,
-                    "quantity": info.quantity,
-                    "status": info.status,
-                    "filled": info.filled,
-                    "avg_fill_price": info.avg_fill_price,
-                }
+                # Sequential wait_for_fill. Entries return in ms
+                # (or hit the ~10s cap); the first MOC blocks until
+                # ~16:00, later MOCs return immediately.
+                info = broker.wait_for_fill(oid, timeout=per_wait)
             except TimeoutError:
-                entry = {
+                observed = datetime.now(_UTC)
+                fh.write(json.dumps({
                     "ts": config.now_ny().isoformat(),
-                    "order_id": oid,
-                    "status": "timeout",
-                }
+                    "order_id": oid, "status": "timeout",
+                }, default=str) + "\n")
+                _record_timeout_to_recorder(oid, "timeout", observed)
+                n_timeout += 1
+                continue
             except Exception as e:
-                entry = {
+                observed = datetime.now(_UTC)
+                fh.write(json.dumps({
                     "ts": config.now_ny().isoformat(),
-                    "order_id": oid,
-                    "status": "error",
+                    "order_id": oid, "status": "error",
                     "error": str(e)[:200],
-                }
-            fh.write(json.dumps(entry, default=str) + "\n")
-    logger.info("fills audited", extra={"n_orders": len(order_ids), "path": str(fills_path)})
+                }, default=str) + "\n")
+                _record_timeout_to_recorder(oid, "error", observed)
+                n_error += 1
+                continue
+            observed = datetime.now(_UTC)
+            fh.write(json.dumps({
+                "ts": config.now_ny().isoformat(),
+                "order_id": getattr(info, "order_id", oid),
+                "symbol": getattr(info, "symbol", None),
+                "action": getattr(info, "action", None),
+                "quantity": getattr(info, "quantity", None),
+                "status": getattr(info, "status", None),
+                "filled": getattr(info, "filled", None),
+                "avg_fill_price": getattr(info, "avg_fill_price", None),
+            }, default=str) + "\n")
+            _record_terminal_to_recorder(oid, info, observed)
+            n_terminal += 1
+    logger.info(
+        "fills audited",
+        extra={
+            "n_orders": len(order_ids),
+            "n_terminal": n_terminal,
+            "n_timeout": n_timeout,
+            "n_error": n_error,
+            "path": str(fills_path),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1510,26 +1826,56 @@ def main(argv: Optional[list[str]] = None) -> int:
     # 3) Snapshot + feature engineering
     # ------------------------------------------------------------------
 
+    # Cache the tbbo snapshot at decision time ONLY on the replay
+    # path — replay's snapshot covers the full historical day already,
+    # so we can pull the 15:55 mid synchronously without keeping any
+    # stream alive. In live/paper we let the recorder's background
+    # T+5min thread call ``feed.snapshot()`` at ~15:55; taking a
+    # redundant copy at 15:50 would burn ~1s on the critical path
+    # (~0.9s/M records) for nothing.
+    tbbo_at_decision: pl.DataFrame = pl.DataFrame()
+    snapshot_completed_at_utc: Optional[datetime] = None
+    last_mid_ts_by_sym: dict[str, datetime] = {}
     try:
         if feed is None:
             day_df = pl.DataFrame()
             last_mid_by_sym: dict[str, float] = {}
         else:
-            day_df, last_mid_by_sym = _build_live_day_frame(
+            day_df, last_mid_by_sym, last_mid_ts_by_sym = _build_live_day_frame(
                 feed, universe, reference_stats,
                 min_coverage=args.min_universe_coverage,
             )
+            snapshot_completed_at_utc = datetime.now(_UTC)
+            if replay_mode:
+                try:
+                    tbbo_at_decision = feed.snapshot().get("tbbo", pl.DataFrame())
+                except Exception:
+                    logger.exception(
+                        "replay tbbo snapshot for recorder failed (non-fatal)"
+                    )
     except Exception as e:
         logger.exception("feature build failed", extra={"error": str(e)})
         if args.on_feed_failure == "abort":
             if feed is not None:
-                feed.stop()
+                try:
+                    feed.stop()
+                except Exception:
+                    logger.exception("feed stop failed (non-fatal)")
             return 2
         day_df = pl.DataFrame()
         last_mid_by_sym = {}
 
-    if feed is not None:
-        feed.stop()
+    # For replay / dry-run we stop the feed now — replay tbbo is
+    # already fully materialised in ``tbbo_at_decision``, and dry-run
+    # never trades. For live/paper the feed stays alive so the
+    # recorder's background T+5min capture can call ``feed.snapshot()``
+    # again around 15:55; the outer ``finally`` at end-of-main stops
+    # it on every exit path (including rc=3/4/5/8 early returns).
+    if feed is not None and (replay_mode or args.dry_run):
+        try:
+            feed.stop()
+        except Exception:
+            logger.exception("feed stop failed (non-fatal)")
 
     # ------------------------------------------------------------------
     # 4) Alpha + MVO
@@ -1572,6 +1918,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         dollar_positions = optimizer.solve(alpha_vec, cost_vec, impact_coeff_vec)
     except Exception as e:
         logger.exception("solver failed", extra={"error": str(e)})
+        _stop_feed_safe(feed)
         return 3
     gmv = float(np.abs(dollar_positions).sum())
     nmv = float(dollar_positions.sum())
@@ -1616,6 +1963,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "(safe skip — no book was created)",
             extra={"now": now.isoformat(), "submit_by": submit_by_at.isoformat()},
         )
+        _stop_feed_safe(feed)
         return 4
 
     # L1: refuse to route an empty book into a rebalance() — with
@@ -1624,6 +1972,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # coverage check above.
     if not share_targets and not args.dry_run:
         logger.error("empty share_targets — refusing to touch the broker")
+        _stop_feed_safe(feed)
         return 5
 
     # M2: persist the intended book to disk before any broker call. This is
@@ -1658,6 +2007,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "DRY RUN — printing target book, no broker connection",
             extra={"targets": share_targets},
         )
+        _stop_feed_safe(feed)
         return 0
 
     # F2: default replay behavior is broker-free — validate the whole
@@ -1669,6 +2019,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "connection. Pass --replay-submit to exercise the order path.",
             extra={"targets": share_targets},
         )
+        _stop_feed_safe(feed)
         return 0
 
     try:
@@ -1679,7 +2030,138 @@ def main(argv: Optional[list[str]] = None) -> int:
         # expected port, or a bad client_id collision. No orders have been
         # placed; exit with a coded rc rather than a bare traceback.
         logger.exception("broker connect failed", extra={"error": str(e)})
+        _stop_feed_safe(feed)
         return 8
+
+    # ------------------------------------------------------------------
+    # Trade recorder — captures one parquet row per trade for post-trade
+    # slippage / impact analysis. Every call site is wrapped in
+    # ``trade_recorder.safe_call`` (or an inline try/except) so a
+    # recorder exception (I/O, schema, missing field) cannot propagate
+    # into the order path. Created here rather than earlier so a
+    # broker-connect failure (rc=8) leaves no half-populated recorder
+    # rows to finalize.
+    # ------------------------------------------------------------------
+    recorder: Optional[trade_recorder.TradeRecorder] = None
+    try:
+        if replay_mode:
+            from datetime import date as _date
+            rd = args.replay_date.split("-")
+            _replay_date_obj = _date(int(rd[0]), int(rd[1]), int(rd[2]))
+            # Anchor the historical decision time at HH:MM then ADD
+            # print-wait-secs as a timedelta — ``second=<int>`` on the
+            # datetime constructor raises ``ValueError`` for values
+            # >= 60, and a swallowed exception would silently disable
+            # the recorder for the whole day.
+            decision_dt_ny = datetime(
+                _replay_date_obj.year, _replay_date_obj.month,
+                _replay_date_obj.day, reb_hh, reb_mm,
+                0, tzinfo=config.NY_TZ,
+            ) + timedelta(seconds=float(args.print_wait_secs))
+            recorder_trading_date = args.replay_date
+        else:
+            decision_dt_ny = snapshot_at
+            recorder_trading_date = config.now_ny().date().isoformat()
+        decision_ts_utc = decision_dt_ny.astimezone(_UTC)
+        recorder = trade_recorder.TradeRecorder(
+            mode=record_mode,
+            decision_ts_utc=decision_ts_utc,
+            universe=universe,
+            trading_date=recorder_trading_date,
+            base_dir=_resolve_trades_dir(broker=broker),
+            replay_date=args.replay_date if replay_mode else None,
+            universe_hash=universe_hash,
+            snapshot_ts_utc=snapshot_completed_at_utc,
+        )
+        _decision_context = {
+            "mode": record_mode,
+            "lambda": float(args.lam),
+            "scale": float(scale),
+            "vol_cap": float(args.vol_cap),
+            "gmv_dollar": float(gmv),
+            "nmv_dollar": float(nmv),
+            "solver_status": str(getattr(optimizer.problem, "status", "")),
+            "objective_value": (
+                float(optimizer.problem.value)
+                if getattr(optimizer, "problem", None) is not None
+                and optimizer.problem.value is not None else None
+            ),
+            "impact_gamma_kind": (
+                "vector" if isinstance(impact_gamma, np.ndarray) else "scalar"
+            ),
+            "impact_gamma_scalar": (
+                float(impact_gamma) if not isinstance(impact_gamma, np.ndarray)
+                else None
+            ),
+            "universe_file": args.universe_file,
+            "universe_size": int(len(universe)),
+            "universe_hash": universe_hash,
+            "replay_date": args.replay_date if replay_mode else None,
+            "min_universe_coverage": float(args.min_universe_coverage),
+            "print_wait_secs": float(args.print_wait_secs),
+            "rebalance_time": args.rebalance_time,
+            "submit_by": args.submit_by,
+            "artifact_paths": {
+                "forecast_pipe": str(
+                    config.FORECAST_DIR / config.FORECAST_PIPE_NAME
+                ),
+                "cov_loadings": str(
+                    config.COV_DIR / config.COV_LOADINGS_NAME
+                ),
+                "cov_matrix": str(
+                    config.COV_DIR / config.COV_MATRIX_NAME
+                ),
+                "impact_gamma_vec": str(
+                    config.IMPACT_DIR / config.IMPACT_GAMMA_NAME
+                ),
+                "reference_stats": (
+                    args.reference_stats_path
+                    or str(config.IMPACT_DIR / config.REF_STATS_NAME)
+                ),
+            },
+        }
+        trade_recorder.safe_call(
+            recorder.record_decision_context, _decision_context,
+        )
+        _arrivals = trade_recorder.arrival_prices_from_day_df(
+            day_df, last_mid_by_sym, last_mid_ts_by_sym,
+        )
+        trade_recorder.safe_call(recorder.record_arrival_prices, _arrivals)
+        _targets_map: dict[str, dict] = {}
+        for _i, _sym in enumerate(universe):
+            _td = float(dollar_positions[_i])
+            _ts = share_targets.get(_sym, 0)
+            if _td == 0 and _ts == 0:
+                continue
+            _targets_map[_sym] = {
+                "target_dollars": _td,
+                "target_shares": _ts,
+            }
+        trade_recorder.safe_call(recorder.record_targets, _targets_map)
+        # T+5min mark. In replay, tbbo_at_decision already covers the
+        # whole historical day — extract synchronously. In live/paper,
+        # spawn a background thread that snapshots the still-running
+        # feed at decision + 5min; the thread is bounded and the main
+        # path never blocks on it.
+        if replay_mode:
+            trade_recorder.safe_call(
+                recorder.capture_t5min_from_tbbo,
+                tbbo_at_decision,
+                decision_ts_utc,
+            )
+        elif feed is not None:
+            trade_recorder.safe_call(
+                recorder.schedule_t5min_capture_from_feed,
+                feed=feed,
+                decision_ts_utc=decision_ts_utc,
+            )
+    except Exception:
+        # A recorder-init failure is non-fatal; the order path continues
+        # exactly as before. Leaving ``recorder=None`` disables every
+        # later call site.
+        logger.exception("trade recorder init failed (non-fatal)")
+        recorder = None
+
     try:
         # M2 (part 2): reconcile against yesterday's saved book, if any.
         prev = _load_previous_target_record()
@@ -1778,6 +2260,25 @@ def main(argv: Optional[list[str]] = None) -> int:
             current=current,
             managed_universe=universe_set,
         )
+        # Recorder — one entry submission row per attempted MKT. Even
+        # failed submissions (``order_id is None``) get a row so post-
+        # trade analysis sees the intended trade that never made it.
+        if recorder is not None:
+            _entry_sent_ts = datetime.now(_UTC)
+            for _e in entries:
+                trade_recorder.safe_call(
+                    recorder.record_submission,
+                    leg="entry",
+                    symbol=_e.get("symbol", ""),
+                    side=_e.get("side", ""),
+                    requested_qty=int(_e.get("requested_qty", 0) or 0),
+                    order_type="MKT",
+                    order_id=_e.get("order_id"),
+                    sent_ts_utc=_entry_sent_ts,
+                    exchange=NASDAQ_EXCHANGE,
+                    tif="DAY",
+                    error=_e.get("error"),
+                )
         logger.info(
             "MKT entry batch submitted",
             extra={
@@ -1826,6 +2327,25 @@ def main(argv: Optional[list[str]] = None) -> int:
         moc_signed_by_sym = {leg["symbol"]: leg["signed_qty"]
                              for leg in moc_batch}
         moc_oid_to_sym = {leg["oid"]: leg["symbol"] for leg in moc_batch}
+        # Recorder — one MOC submission row per successful leg. Skipped
+        # symbols (past cutoff / snapshot failed) don't have oids and
+        # aren't recorded here; the exposure verdict picks them up in
+        # the target-record persistence path.
+        if recorder is not None:
+            _moc_sent_ts = datetime.now(_UTC)
+            for _leg in moc_batch:
+                trade_recorder.safe_call(
+                    recorder.record_submission,
+                    leg="moc",
+                    symbol=_leg["symbol"],
+                    side=_leg["side"],
+                    requested_qty=int(_leg["qty"]),
+                    order_type="MOC",
+                    order_id=_leg["oid"],
+                    sent_ts_utc=_moc_sent_ts,
+                    exchange=NASDAQ_EXCHANGE,
+                    tif=None,  # MOC has no meaningful TIF at IB
+                )
         n_filled_entries = sum(
             1 for e in entries if int(e.get("filled_qty", 0) or 0) > 0
         )
@@ -1937,32 +2457,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         except Exception:
             logger.exception("target record write failed (non-fatal)")
 
-        # M2 (part 3): JSONL fill audit — best-effort logging only,
-        # NOT tied to the rc gate (RRR2). Fills happen at 16:00 close,
-        # so we cap the wait at 15 minutes past submit-by to avoid
-        # the process lingering past the trading day. The MOC
-        # acceptance audit above is the rc-gating check.
-        audit_ids = [e["order_id"] for e in entries if e.get("order_id")]
-        audit_ids += moc_order_ids
-        try:
-            _fill_audit(broker, audit_ids, timeout_seconds=900)
-        except Exception:
-            logger.exception("fill audit failed (non-fatal)")
-
         # R3 + RR1 + RRR1: distinct rc for the OVERNIGHT-EXPOSURE state.
-        # rc=4  → past MOC submit cutoff BEFORE any orders placed (safe
-        #         skip; no book).
-        # rc=11 → entries submitted but the MOC exit could not fully
-        #         cover the resulting book: legs skipped past cutoff,
-        #         get_positions failed/returned stale-empty, the
-        #         cross-check found uncovered symbols (partial snapshot
-        #         / budget-exhausted-with-real-fill / staleness-brownout),
-        #         or the MOC acceptance audit found exchange rejections
-        #         (submission past ~15:50). The book may be riding
-        #         unhedged into the auction — operator must page.
+        # rc=11 is THE pager predicate (per CLAUDE.md), so NOTHING
+        # recording-related may run before this return — a T+5min
+        # wait or a MOC fill audit here would delay the operator's
+        # window to run ``live.panic`` before the 16:00 close. This
+        # is the second time the pattern has bitten (round 1 removed
+        # ``finalize(wait=30)`` from the ``finally``, round 2 moved
+        # a 350s wait into the exact same seat). The ``finally``
+        # below does the minimal safe cleanup: ``finalize(wait=None)``
+        # (fast), ``_stop_feed_safe`` (fast, idempotent),
+        # ``broker.disconnect()``.
         if exposure:
-            # RR4 / RRR1: name the concrete remedy so an operator paged
-            # at 15:57 doesn't have to remember the command.
             panic_cmd = ("python -m live.panic --paper --flatten-with MKT "
                          "(or --live --live-confirm=... --yes for live)")
             unfilled_list = sorted(unfilled_moc_syms)
@@ -1991,7 +2497,69 @@ def main(argv: Optional[list[str]] = None) -> int:
                 },
             )
             return 11
+
+        # Non-exposure path from here on: recorder finalization work.
+        # None of this runs on the rc=11 path (above) so it can't
+        # delay the operator page.
+
+        # Stop the live feed EARLY — as soon as the recorder's T+5min
+        # background thread has landed (or given up). Otherwise
+        # ``_fill_audit`` blocks to ~16:00 for MOC fills and the
+        # Databento buffers accumulate the whole closing auction's
+        # worth of tbbo per name in the meantime, which is pure
+        # memory growth on a long-running live box. On replay this
+        # is a no-op (the feed was already stopped at feature-build
+        # time).
+        if recorder is not None:
+            # Bounded wait: 5min for the target instant + some slack
+            # for the snapshot itself. If the thread hasn't landed by
+            # then we still stop the feed — the T+5min column just
+            # stays null on those rows.
+            trade_recorder.safe_call(
+                recorder.wait_for_t5min, timeout=350.0,
+            )
+        _stop_feed_safe(feed)
+
+        # M2 (part 3): JSONL fill audit — best-effort logging only,
+        # NOT tied to the rc gate (RRR2). Fills happen at 16:00 close,
+        # so we cap the wait at 15 minutes past submit-by to avoid
+        # the process lingering past the trading day. The MOC
+        # acceptance audit above is the rc-gating check.
+        audit_ids = [e["order_id"] for e in entries if e.get("order_id")]
+        audit_ids += moc_order_ids
+        # (leg, symbol) index for the trade recorder — needed so the
+        # audit can attach each returned OrderInfo to the correct row.
+        _oid_to_leg_sym: dict[str, tuple[str, str]] = {}
+        for _e in entries:
+            _oid = _e.get("order_id")
+            if _oid is not None:
+                _oid_to_leg_sym[str(_oid)] = ("entry", _e["symbol"])
+        for _leg in moc_batch:
+            _oid_to_leg_sym[str(_leg["oid"])] = ("moc", _leg["symbol"])
+        try:
+            _fill_audit(
+                broker, audit_ids, timeout_seconds=900,
+                recorder=recorder, oid_to_leg_sym=_oid_to_leg_sym,
+            )
+        except Exception:
+            logger.exception("fill audit failed (non-fatal)")
     finally:
+        # Finalize the recorder WITHOUT waiting for the T+5min thread
+        # — the ``finally`` fires on the rc=11 OVERNIGHT-EXPOSURE
+        # page too, and a 30s wait between the exposure detection and
+        # the ``return 11`` would delay the operator alert. On the
+        # happy path the T+5min thread has already fired (MOC audit
+        # takes it past 15:55 anyway); on any early-exit path the
+        # T+5min column simply stays null. Post-trade analysis is
+        # never real-time and can tolerate the loss.
+        if recorder is not None:
+            try:
+                recorder.finalize(wait_for_t5min=None)
+            except Exception:
+                logger.exception(
+                    "trade recorder finalize failed (non-fatal)"
+                )
+        _stop_feed_safe(feed)
         broker.disconnect()
 
     return 0
