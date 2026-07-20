@@ -23,10 +23,43 @@ Connection ports:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
+
+# ---------------------------------------------------------------------------
+# CRITICAL — must run BEFORE ``from ib_async import ...`` below.
+#
+# On Python 3.10+ (this repo is 3.14), ``asyncio.get_event_loop()`` no
+# longer auto-creates a loop on the main thread when none exists — it
+# raises ``RuntimeError: There is no current event loop in thread
+# 'MainThread'.``. ``ib_async`` transitively imports ``eventkit``, whose
+# ``eventkit/util.py`` executes ``asyncio.get_event_loop_policy().
+# get_event_loop()`` at module-load time. That means a plain-script CLI
+# entry point (e.g. ``python -m live.panic``) blows up *during import*,
+# and later ``IB.connect()`` — which drives the event loop via
+# ``loop.run_until_complete`` — needs a current loop for the same reason.
+#
+# Jupyter and pytest are already covered: a Jupyter kernel installs a
+# running loop before any user code runs, and this package's pytest
+# ``conftest.py`` primes one via ``asyncio.set_event_loop(
+# asyncio.new_event_loop())`` before importing ``ibkr_broker``. The plain-
+# script case is what this hook fixes. It is idempotent — only creates a
+# fresh loop when one is not already established — so the Jupyter and
+# conftest-primed paths are untouched.
+# ---------------------------------------------------------------------------
+def _ensure_event_loop() -> None:
+    try:
+        asyncio.get_event_loop()
+        return
+    except RuntimeError:
+        pass
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+
+_ensure_event_loop()
 
 # Support both ib_async (actively maintained) and ib_insync (archived).
 # They have identical APIs — ib_async is the community fork after
