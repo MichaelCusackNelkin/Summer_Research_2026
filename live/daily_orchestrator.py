@@ -89,7 +89,7 @@ import polars as pl
 _UTC = timezone.utc
 
 from live import config
-from live.nasdaq_routing import NASDAQ_EXCHANGE
+from live.nasdaq_routing import ACTIVE_ROUTING
 from live import trade_recorder
 from live.features import (
     ALPHA_FEATURES,
@@ -847,87 +847,132 @@ def _prequalify_symbols(broker, symbols: list[str]) -> set[str]:
 
     Uses the broker's own ``_make_contract`` helper so we go through the
     same code path ``_place`` uses at trade time — and we pass the same
-    ``NASDAQ_EXCHANGE`` code every entry/exit uses so qualification
-    surfaces a NASDAQ-untradeable name here (drop) instead of at order
+    ``ACTIVE_ROUTING`` code every entry/exit uses so qualification
+    surfaces an IB-untradeable name here (drop) instead of at order
     submission (a lost session slot). See ``live/nasdaq_routing.py``
-    for why NASDAQ-only routing is a hard requirement of this strategy.
+    for the current routing choice and its rationale.
     We swallow individual exceptions and log them; one bad name should
     not kill the batch.
 
-    NASDAQ-listed eligibility filter (DISABLED 2026-07-20)
-    ------------------------------------------------------
+    NASDAQ-primary eligibility filter (ACTIVE)
+    ------------------------------------------
 
-    A ``primaryExchange == "NASDAQ"`` filter previously lived here
-    (see the commented-out block below) — the intent was to drop
-    NYSE/ARCA-primary names since their MOC prints on the primary
-    listing's close-cross, not NASDAQ's. It was rolled back
-    together with the broker's route-survival assertion: during a
-    2026-07-20 paper replay the broker guard rejected 46 of 46
+    Every qualified contract is inspected for ``primaryExchange ==
+    "NASDAQ"``; names failing that check are dropped and logged with
+    ``primary_exchange`` set to the observed value so the operator
+    can see WHY the name was dropped. Re-enabled 2026-07-21 alongside
+    the SMART routing switch — see ``live/nasdaq_routing.py``.
+
+    The filter was previously disabled (rolled back 2026-07-20
+    together with the broker's route-survival assertion) after a
+    paper replay in which the broker guard rejected 46 of 46
     requested symbols (100% failure, 0 passed) upstream of this
     filter, so this drop's behaviour was never exercised end-to-end
-    on that run. The filter is also currently a no-op on both
-    tiered universes: 49/49 in top_49_universe.txt, and 99 of the
-    100 in top_100_universe.txt qualify with all 99 NASDAQ-primary
-    (ITCI fails IB qualification outright and is dropped by the
-    still-active try/except above, never reaching this filter), so
-    on the active universe it never dropped a name. Its real value is future
-    universe-drift protection — ``universe.txt`` (the broad ~2000
-    name pool retrain scans) does include NYSE/ARCA-primary names.
+    on that run. It is now re-enabled because under SMART routing
+    the NASDAQ-primary premise is load-bearing for the MOC exit leg
+    (a SMART MOC on a non-NASDAQ-primary name would route to the
+    home exchange's close cross, not NASDAQ's — the wrong auction).
+
+    What this filter **does** buy you: a guarantee that every name
+    we send an order for is NASDAQ-primary, so universe drift (the
+    broad ``universe.txt`` pool retrain scans does include NYSE /
+    ARCA-primary names) can no longer silently introduce a name
+    whose MOC belongs to another exchange's close cross.
+
+    What it does **not** buy you: verification that IB's SMART
+    router actually routes an MOC for a NASDAQ-primary name to the
+    NASDAQ close cross specifically (rather than a different
+    NASDAQ-eligible venue's post-close mechanism). That is a
+    separate, still-unverified question — see the pre-live paper-
+    session gate in the ``live/nasdaq_routing.py`` docstring
+    (confirm every ``leg="moc"`` trade-recorder row has
+    ``venue in {"ISLAND", "NASDAQ"}``).
+
+    Expected filter behaviour on today's tiered universes:
+
+    * ``top_49_universe.txt`` — **TWS-observed** no-op: 49/49
+      qualify with ``primaryExchange == "NASDAQ"`` (recorded in
+      ``ibkr_broker/src/ibkr_broker/broker.py:370-372`` from a real
+      paper-TWS session).
+    * ``top_100_universe.txt`` (the currently active universe) —
+      **expected but not yet observed on this system**: 99 of the
+      100 should qualify with all 99 NASDAQ-primary (ITCI fails IB
+      qualification outright and is dropped by the still-active
+      try/except above, never reaching this filter). No paper-TWS
+      observation exists yet for the 100-name set; the one paper
+      run that would have exercised it (2026-07-20) rejected 46 of
+      46 requested symbols at the broker guard upstream of this
+      filter. The ``contracts pre-qualified`` log line below is the
+      operator signal — the pre-live gate in
+      ``live/nasdaq_routing.py`` calls for ``n_ok == n_requested``
+      (or ``n_ok == n_requested - 1`` for the ITCI drop) on the
+      first paper session to settle the claim.
+
+    Its value is future universe-drift protection.
     """
     ok: set[str] = set()
     for sym in symbols:
         try:
-            # The qualified contract is only inspected by the
-            # commented-out primaryExchange filter below, so we
-            # discard the return value. Keep the call itself — it
-            # is still how we detect a name IB cannot qualify (bad
-            # ticker, no market-data subscription, etc.).
-            broker._make_contract(sym, exchange=NASDAQ_EXCHANGE)
+            # Capture the qualified contract so the primary-exchange
+            # filter below can read its ``primaryExchange`` field. The
+            # call itself also detects a name IB cannot qualify (bad
+            # ticker, no market-data subscription, etc.) — that error
+            # path drops the name via the ``except`` branch.
+            contract = broker._make_contract(sym, exchange=ACTIVE_ROUTING)
         except Exception as e:
             logger.warning(
                 "contract qualification failed",
                 extra={"symbol": sym, "error": str(e)[:200]},
             )
             continue
-        # --- DISABLED 2026-07-20 (see docstring above) --------------------
-        # NASDAQ-listed eligibility: drop names whose primary listing
-        # is not NASDAQ, because their MOC prints on their home
-        # exchange's close-cross, not NASDAQ's. We include the
-        # qualified contract's primaryExchange in the log so the
-        # operator can see WHY the name was dropped.
-        #
-        # Rolled back alongside the broker-side route-survival
-        # assertion so we can re-run a replay and observe what
-        # actually reaches the MOC leg. On both current tiered
-        # universes this filter is a no-op: 49/49 in top_49, and 99
-        # of the 100 in top_100 qualify with all 99 NASDAQ-primary
-        # (ITCI fails IB qualification outright and is dropped by
-        # the try/except above, never reaching here), so restoring
-        # it only matters as
-        # future universe-drift protection — ``universe.txt`` (the
-        # broad ~2000-name pool ``retrain`` scans) contains
-        # NYSE/ARCA-primary names. To restore, capture the
-        # ``_make_contract`` return above into a ``contract``
-        # variable again.
-        # primary = getattr(contract, "primaryExchange", "") or ""
-        # if primary != "NASDAQ":
-        #     logger.warning(
-        #         "dropping non-NASDAQ-listed symbol from target: MOC "
-        #         "at close prints on the primary listing's close-cross, "
-        #         "not NASDAQ's — an ISLAND MOC on this name would "
-        #         "mis-print or be rejected",
-        #         extra={
-        #             "symbol": sym,
-        #             "primary_exchange": primary,
-        #             "expected_primary_exchange": "NASDAQ",
-        #         },
-        #     )
-        #     continue
-        # ------------------------------------------------------------------
+        # NASDAQ-primary eligibility: drop names whose primary listing
+        # is not NASDAQ. Their MOC prints on their home exchange's
+        # close-cross, not NASDAQ's — the strategy is calibrated to
+        # the NASDAQ close auction, so an off-auction MOC fill is
+        # uncorrelated with the signal we sized. The filter runs
+        # regardless of routing choice (SMART or ISLAND): under SMART
+        # the router would send the MOC to the primary listing's
+        # close cross (i.e. the wrong auction) for a non-NASDAQ-
+        # primary name; under ISLAND direct routing IB may reject
+        # the MOC or mis-print it. We include ``primary_exchange``
+        # in the log so the operator can see WHY the name was
+        # dropped.
+        primary = getattr(contract, "primaryExchange", "") or ""
+        if primary != "NASDAQ":
+            logger.warning(
+                "dropping non-NASDAQ-listed symbol from target: MOC "
+                "at close prints on the primary listing's close-cross, "
+                "not NASDAQ's — a MOC on this name would print on the "
+                "wrong auction (or be rejected under a direct route)",
+                extra={
+                    "symbol": sym,
+                    "primary_exchange": primary,
+                    "expected_primary_exchange": "NASDAQ",
+                },
+            )
+            continue
         ok.add(sym)
-    logger.info(
+    # A drop is financially fail-safe (the missing name just doesn't
+    # trade, and any held position still flattens because the MOC leg
+    # is sized off ``managed_universe`` — the intersection of the
+    # active universe with ``get_positions``, NOT the qualified set),
+    # but a smaller-than-expected book still deserves an operator
+    # signal. Escalate to WARNING when any name dropped so the
+    # aggregate change is visible in the log stream; the per-symbol
+    # WARNINGs above still carry the WHY (IB unqualified vs. non-
+    # NASDAQ-primary). On today's universes this is expected to be
+    # an INFO no-op — see the "runtime no-op" claim in
+    # ``live/nasdaq_routing.py`` (still awaiting paper-TWS
+    # verification on top_100).
+    n_dropped = len(symbols) - len(ok)
+    log_fn = logger.warning if n_dropped > 0 else logger.info
+    log_fn(
         "contracts pre-qualified",
-        extra={"n_ok": len(ok), "n_requested": len(symbols)},
+        extra={
+            "n_ok": len(ok),
+            "n_requested": len(symbols),
+            "n_dropped": n_dropped,
+        },
     )
     return ok
 
@@ -986,17 +1031,16 @@ def _submit_mkt_entries(
         side = "BUY" if diff > 0 else "SELL"
         qty = int(abs(diff))
         try:
-            # NASDAQ-only routing (see live/nasdaq_routing.py): the
-            # strategy is calibrated to the NASDAQ closing auction —
-            # SMART-routed off-venue fills are uncorrelated with the
-            # signal we sized, so every entry MKT is forced to the
-            # NASDAQ INET book.
+            # Routing pulled from live/nasdaq_routing.py::ACTIVE_ROUTING.
+            # Under SMART, the entry MKT is filled against the national
+            # best bid/offer rather than being confined to the NASDAQ
+            # top-of-book — see the module docstring for the rationale.
             if side == "BUY":
                 oid = broker.buy(sym, qty, order_type="MKT",
-                                 exchange=NASDAQ_EXCHANGE)
+                                 exchange=ACTIVE_ROUTING)
             else:
                 oid = broker.sell(sym, qty, order_type="MKT",
-                                  exchange=NASDAQ_EXCHANGE)
+                                  exchange=ACTIVE_ROUTING)
         except Exception as e:
             logger.warning(
                 "MKT entry submission failed",
@@ -1231,17 +1275,17 @@ def _submit_moc_flatten(
         assert qty > 0, f"MOC flatten: expected positive qty, got {qty}"
         assert side in ("BUY", "SELL"), f"MOC flatten: bad side {side!r}"
         try:
-            # NASDAQ-only routing (see live/nasdaq_routing.py): the
-            # MOC exit MUST print at the NASDAQ close auction — that
-            # is literally the auction we forecast. Route direct to
-            # the NASDAQ INET book instead of letting SMART pick a
-            # different venue's close-cross.
+            # Routing pulled from live/nasdaq_routing.py::ACTIVE_ROUTING.
+            # SMART on a NASDAQ-primary name still prints the MOC on
+            # the NASDAQ close cross (each name routes to its own
+            # primary close auction), so the same-auction contract the
+            # strategy needs is preserved. See the module docstring.
             if side == "BUY":
                 oid = broker.buy(sym, qty, order_type="MOC",
-                                 exchange=NASDAQ_EXCHANGE)
+                                 exchange=ACTIVE_ROUTING)
             else:
                 oid = broker.sell(sym, qty, order_type="MOC",
-                                  exchange=NASDAQ_EXCHANGE)
+                                  exchange=ACTIVE_ROUTING)
         except Exception as e:
             logger.warning(
                 "MOC exit submission failed",
@@ -2280,7 +2324,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     order_type="MKT",
                     order_id=_e.get("order_id"),
                     sent_ts_utc=_entry_sent_ts,
-                    exchange=NASDAQ_EXCHANGE,
+                    exchange=ACTIVE_ROUTING,
                     tif="DAY",
                     error=_e.get("error"),
                 )
@@ -2348,7 +2392,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     order_type="MOC",
                     order_id=_leg["oid"],
                     sent_ts_utc=_moc_sent_ts,
-                    exchange=NASDAQ_EXCHANGE,
+                    exchange=ACTIVE_ROUTING,
                     tif=None,  # MOC has no meaningful TIF at IB
                 )
         n_filled_entries = sum(

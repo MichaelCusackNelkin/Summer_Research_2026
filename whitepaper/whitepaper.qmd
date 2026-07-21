@@ -29,3 +29,35 @@ format:
 # Abstract
 
 LOREM IPSUM
+
+# Motivation and Main Ideas {#sec-intro}
+
+## Underperformance of the Naive Approach to Trading
+
+## Portfolio Optimization to the Rescue
+
+
+# Methodological Choices and Innovations {#sec-methods}
+
+## Universe Selection
+
+## Single vs Multi Period Optimization
+
+## Forecasting
+
+## Covariance Estimation
+
+## Price Impact Modeling
+
+## Hyperparameters
+
+
+# Empirical Findings {#sec-findings}
+
+## Verification of Expected Behavior via Hyperparameter Tuning
+
+
+## Backtest Results
+
+# Future Work {#sec-future}
+

@@ -141,9 +141,10 @@ class _FakeBroker:
     - ``non_nasdaq_primary``: mapping ``{symbol: primary_exchange}``
       injected onto the qualified contract's ``primaryExchange`` field
       so tests can exercise ``_prequalify_symbols``'s NASDAQ-listing
-      drop path (a NYSE-primary name direct-routed to ISLAND passes
-      qualification but its MOC would mis-print at the close; the
-      orchestrator drops it during prequalify).
+      drop path (a NYSE-primary name passes qualification but its MOC
+      would print on the primary listing's close-cross rather than the
+      NASDAQ close cross the strategy targets; the orchestrator drops
+      it during prequalify when that filter is enabled).
     """
 
     LIVE_CONFIRM_MSG = "YES_I_WANT_LIVE_TRADING"
@@ -259,13 +260,22 @@ class _FakeBroker:
             rows = rows[:keep]
         return rows
 
-    def _make_contract(self, symbol, exchange="SMART", currency="USD"):
+    def _make_contract(self, symbol, exchange=None, currency="USD"):
+        # ``exchange`` defaults to ``None`` (not the real broker's
+        # ``"SMART"``) so a call site that omits the kwarg is
+        # OBSERVABLE in ``make_contract_calls`` — a ``(sym, None)``
+        # tuple in the recorded list tells the routing regression
+        # the caller relied on the implicit default. Under the real
+        # broker's ``exchange="SMART"`` default and the current
+        # ``ACTIVE_ROUTING == "SMART"``, an omission would otherwise
+        # be indistinguishable from a correctly-threaded constant
+        # and the guard would go dead.
         if symbol in self._unqualified:
             raise ValueError(f"cannot qualify {symbol}")
         self.qualified_symbols.append(symbol)
         # Record every (symbol, exchange) pair the prequalify path
-        # requests so the NASDAQ-routing regression can assert every
-        # contract went out with the ISLAND direct-route code.
+        # requests so the routing regression can assert every contract
+        # went out with ACTIVE_ROUTING (see live/nasdaq_routing.py).
         self.make_contract_calls.append((symbol, exchange))
         # Return a stub carrying the same shape the qualified
         # ``Stock`` contract exposes to callers: ``symbol``,
@@ -1703,18 +1713,22 @@ def test_rrr3_stale_non_terminal_get_order_status_flags_uncovered(
 
 
 # ---------------------------------------------------------------------------
-# NASDAQ-routing regression: every order path must direct-route to ISLAND
+# Routing regression: every order path must thread ACTIVE_ROUTING
 # ---------------------------------------------------------------------------
 
-def test_every_order_path_routes_to_nasdaq(monkeypatch, tmp_path):
-    """NASDAQ-only routing is a hard requirement of this strategy — the
-    model is calibrated to the NASDAQ closing auction, so an off-venue
-    fill is uncorrelated with the signal we sized. Every code path in
-    ``live/`` that reaches the broker MUST carry
-    ``exchange="ISLAND"`` (IB's NASDAQ INET direct-route code, exported
-    as ``NASDAQ_EXCHANGE`` from ``live/nasdaq_routing.py``). SMART
-    routing is unacceptable — it routinely picks BATS / EDGX / IEX /
-    NYSE / ARCA when they're momentarily inside the NBBO.
+def test_every_order_path_uses_active_routing(monkeypatch, tmp_path):
+    """Routing is strategy-critical (see ``live/nasdaq_routing.py``) and
+    must be set from ONE place — ``ACTIVE_ROUTING`` — so switching the
+    active route is a one-line change here, not a grep across the
+    codebase. Every code path in ``live/`` that reaches the broker MUST
+    carry ``exchange=ACTIVE_ROUTING`` on the request.
+
+    ``ACTIVE_ROUTING`` is currently ``"SMART"`` (best NBBO on the entry
+    MKT; the MOC still prints on the NASDAQ close cross for our
+    NASDAQ-primary universe). This test pins the value AND the fact
+    that every call site threads the constant — so a future flip back
+    to ISLAND stays a one-liner and any drift shows up here first.
+
     Enumerates the three paths and pins each:
     * pre-qualify (``broker._make_contract`` inside
       ``_prequalify_symbols``)
@@ -1723,10 +1737,11 @@ def test_every_order_path_routes_to_nasdaq(monkeypatch, tmp_path):
     * MOC exit batch (``broker.buy`` / ``broker.sell`` with
       ``order_type="MOC"``)
     A regression that ever drops the ``exchange`` kwarg on any of these
-    would let orders SMART-route away from NASDAQ. This test fails
-    LOUDLY the moment that happens.
+    would let orders fall through to the broker's implicit default and
+    silently drift out of the ``live/`` routing contract. This test
+    fails LOUDLY the moment that happens.
     """
-    from live.nasdaq_routing import NASDAQ_EXCHANGE
+    from live.nasdaq_routing import ACTIVE_ROUTING
 
     universe = config.load_active_universe()
     feed = _prepopulate_live_feed(universe)
@@ -1746,17 +1761,19 @@ def test_every_order_path_routes_to_nasdaq(monkeypatch, tmp_path):
     rc = daily_orchestrator.main(_base_argv())
     assert rc == 0
 
-    # (1) prequalify path — every _make_contract call must be ISLAND.
+    # (1) prequalify path — every _make_contract call must carry
+    # ACTIVE_ROUTING.
     assert fake_broker.make_contract_calls, "no prequalify calls recorded"
     for sym, exchange in fake_broker.make_contract_calls:
-        assert exchange == NASDAQ_EXCHANGE == "ISLAND", (
+        assert exchange == ACTIVE_ROUTING == "SMART", (
             f"_prequalify_symbols routed {sym} to exchange={exchange!r}, "
-            f"expected {NASDAQ_EXCHANGE!r}"
+            f"expected {ACTIVE_ROUTING!r}"
         )
 
     # (2) + (3) entry MKT and exit MOC — every buy/sell call must
-    # carry exchange="ISLAND" in its kwargs. This is the load-bearing
-    # assertion: it fails the moment any call site drops the kwarg.
+    # carry exchange=ACTIVE_ROUTING in its kwargs. This is the
+    # load-bearing assertion: it fails the moment any call site drops
+    # the kwarg.
     all_order_calls = fake_broker.buy_calls + fake_broker.sell_calls
     assert all_order_calls, "no orders reached the broker at all"
     mkt_orders = [c for c in all_order_calls if c[2] == "MKT"]
@@ -1765,19 +1782,25 @@ def test_every_order_path_routes_to_nasdaq(monkeypatch, tmp_path):
     assert moc_orders, "no MOC exits reached the broker"
     for sym, qty, order_type, kw in all_order_calls:
         got = kw.get("exchange")
-        assert got == NASDAQ_EXCHANGE == "ISLAND", (
+        assert got == ACTIVE_ROUTING == "SMART", (
             f"{order_type} order for {sym} routed to exchange={got!r} "
-            f"(expected {NASDAQ_EXCHANGE!r}) — NASDAQ-only routing "
-            f"contract violated. Full kwargs: {kw}"
+            f"(expected {ACTIVE_ROUTING!r}) — active-routing contract "
+            f"violated. Full kwargs: {kw}"
         )
 
 
-def test_no_smart_routing_leaks_through_live_paths(monkeypatch, tmp_path):
-    """Companion pin: assert POSITIVELY that ``"SMART"`` never shows up as
-    the requested exchange on any order or prequalify call. Catches a
-    regression where a call site is added but forgets to import /
-    thread ``NASDAQ_EXCHANGE`` (which would silently default the
-    broker's ``exchange="SMART"``).
+def test_no_implicit_default_routing_leaks_through_live_paths(monkeypatch, tmp_path):
+    """Companion pin: assert POSITIVELY that no order or prequalify call
+    ever leaves ``exchange`` unset — every call site must explicitly
+    thread ``ACTIVE_ROUTING`` from ``live/nasdaq_routing.py`` rather
+    than rely on the broker's implicit ``exchange="SMART"`` default.
+
+    Why this matters even now that ``ACTIVE_ROUTING == "SMART"``: the
+    whole point of centralising the routing choice is that flipping
+    ``ACTIVE_ROUTING`` back to ISLAND (or to any future venue) is a
+    one-line change. A call site that silently defaults to the
+    broker's SMART kwarg would silently stay on SMART after such a
+    flip — the exact drift this test blocks.
     """
     universe = config.load_active_universe()
     feed = _prepopulate_live_feed(universe)
@@ -1797,140 +1820,224 @@ def test_no_smart_routing_leaks_through_live_paths(monkeypatch, tmp_path):
     rc = daily_orchestrator.main(_base_argv())
     assert rc == 0
 
-    smart_qualify = [
+    implicit_qualify = [
         (sym, ex) for sym, ex in fake_broker.make_contract_calls
-        if ex == "SMART"
+        if ex is None
     ]
-    assert not smart_qualify, (
-        f"prequalify path leaked SMART routing on: {smart_qualify}"
+    assert not implicit_qualify, (
+        f"prequalify path relied on broker's implicit default on: "
+        f"{implicit_qualify}"
     )
-    smart_orders = [
+    implicit_orders = [
         (sym, qty, ot, kw) for sym, qty, ot, kw
         in fake_broker.buy_calls + fake_broker.sell_calls
-        if kw.get("exchange") == "SMART" or kw.get("exchange") is None
+        if kw.get("exchange") is None
     ]
-    assert not smart_orders, (
-        f"order path leaked SMART or default routing on: {smart_orders}"
+    assert not implicit_orders, (
+        f"order path relied on broker's implicit default on: "
+        f"{implicit_orders}"
     )
 
 
-# --- DISABLED 2026-07-20 -----------------------------------------------------
-# This test pins the NASDAQ-primary drop path in
-# ``_prequalify_symbols`` (live/daily_orchestrator.py). That drop was
-# commented out on 2026-07-20 after the broker-side route-survival
-# assertion (which ran BEFORE this filter) rejected 46 of 46 requested
-# symbols (100% failure, 0 passed) during a paper replay of
-# 2026-01-05, meaning the primaryExchange filter never got a chance
-# to fire end-to-end. On both current tiered universes the filter is
-# also a no-op: 49/49 in top_49_universe.txt, and 99 of the 100 in
-# top_100_universe.txt qualify with all 99 NASDAQ-primary (ITCI fails
-# IB qualification outright and never reaches the filter); its real
-# value is future universe-drift protection. The routing itself
-# (``exchange="ISLAND"`` threaded through every broker call) is
-# unchanged; only the two rejection checks are rolled back. See the
-# commented-out block in ``_prequalify_symbols`` and the matching
-# block in ``ibkr_broker/src/ibkr_broker/broker.py::_make_contract``.
-# Restore this test together with the code it covers.
-#
-# def test_prequalify_drops_non_nasdaq_primary(monkeypatch, tmp_path):
-#     """Finding #3: ``_prequalify_symbols`` must drop any name whose
-#     qualified contract's ``primaryExchange`` is not ``"NASDAQ"``.
-#
-#     Reason: an ``ISLAND`` direct-routed MOC only prints on the NASDAQ
-#     close-cross when the name's primary listing is NASDAQ. IB will
-#     still qualify NYSE / ARCA-primary names on ``ISLAND`` for
-#     continuous UTP trading — but the closing MOC on that name will
-#     mis-print (or be rejected) at the primary listing's close-cross,
-#     silently breaking the strategy. Refusing to trade the name is
-#     the correct behaviour for a NASDAQ-only book.
-#
-#     Seeds the fake broker with a batch of universe names all marked
-#     NYSE-primary (rather than a single hand-picked one, since the
-#     optimizer's target set is model-dependent and we cannot predict
-#     which specific name will be traded) and asserts:
-#     * at least one drop is logged with ``primary_exchange="NYSE"``,
-#     * no buy/sell order for ANY seeded symbol ever reaches the broker,
-#     * unseeded (NASDAQ-primary) names still trade normally.
-#     """
-#     import logging as _logging
-#
-#     universe = config.load_active_universe()
-#     feed = _prepopulate_live_feed(universe)
-#     monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
-#     monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
-#     monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
-#     _patch_artifacts(monkeypatch, universe)
-#
-#     # The optimizer's target set is model-dependent and (with this
-#     # test's synthetic Ridge) skews toward alphabetically-early
-#     # mid-caps rather than the file-order top-of-universe mega-caps.
-#     # So we seed a wide alphabetical slice of the universe as
-#     # NYSE-primary — enough overlap with the target book that the
-#     # drop path is guaranteed to fire at least once. We intentionally
-#     # leave the last few names unseeded (still NASDAQ-primary in the
-#     # fake) so a NASDAQ-primary contingent survives to trade — the
-#     # "the drop is symbol-specific, not a wholesale abort" invariant.
-#     universe_sorted = sorted(universe)
-#     seeded_nyse: dict[str, str] = {
-#         sym: "NYSE" for sym in universe_sorted[: max(1, len(universe_sorted) // 2)]
-#     }
-#     fake_broker = _FakeBroker(non_nasdaq_primary=seeded_nyse)
-#
-#     def _fake_connect(_args):
-#         fake_broker.connect(mode="paper")
-#         return fake_broker
-#
-#     monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
-#
-#     handler, records = _capture_orchestrator_logs(_logging.WARNING)
-#     try:
-#         rc = daily_orchestrator.main(_base_argv())
-#     finally:
-#         daily_orchestrator.logger.removeHandler(handler)
-#
-#     assert rc == 0
-#
-#     # (1) No NYSE-primary name may ever hit any buy/sell call. This
-#     # is the load-bearing invariant — the strategy MUST NOT trade a
-#     # name whose MOC would mis-print on a non-NASDAQ close-cross.
-#     touched = (
-#         {c[0] for c in fake_broker.buy_calls}
-#         | {c[0] for c in fake_broker.sell_calls}
-#     )
-#     leaked = touched & set(seeded_nyse)
-#     assert not leaked, (
-#         f"non-NASDAQ-primary names traded despite the drop filter: "
-#         f"{sorted(leaked)}"
-#     )
-#
-#     # (2) At least one drop must have been logged with the informative
-#     # extras — ``symbol`` (which name) and ``primary_exchange`` (why).
-#     # We assert on the informative extras rather than a substring match
-#     # on the message so a benign wording change to the warning does
-#     # not silently break the regression.
-#     dropped_syms = {
-#         getattr(r, "symbol", None)
-#         for r in records
-#         if getattr(r, "primary_exchange", None) == "NYSE"
-#         and getattr(r, "expected_primary_exchange", None) == "NASDAQ"
-#     }
-#     dropped_syms.discard(None)
-#     assert dropped_syms, (
-#         "no 'dropping non-NASDAQ-listed' warning was captured. "
-#         f"seeded={sorted(seeded_nyse)}, "
-#         f"captured_records={[r.getMessage() for r in records]}"
-#     )
-#     # And every dropped symbol must be one we seeded — never a
-#     # spurious drop of a NASDAQ-primary name.
-#     assert dropped_syms.issubset(set(seeded_nyse)), (
-#         f"drop path fired for names we did NOT seed as NYSE-primary: "
-#         f"{sorted(dropped_syms - set(seeded_nyse))}"
-#     )
-#
-#     # (3) NASDAQ-primary names still trade — the drop is symbol-
-#     # specific, not a wholesale abort.
-#     assert touched, (
-#         "no orders reached the broker at all — the drop path should "
-#         "have removed only the seeded names, not the whole universe"
-#     )
-# --- end DISABLED 2026-07-20 -------------------------------------------------
+def test_prequalify_drops_non_nasdaq_primary(monkeypatch, tmp_path):
+    """``_prequalify_symbols`` must drop any name whose qualified
+    contract's ``primaryExchange`` is not ``"NASDAQ"``.
+
+    Reason: the strategy is calibrated to the NASDAQ closing auction,
+    so the MOC exit leg must print at the NASDAQ close cross. Under
+    the current SMART routing the router would send an MOC for a
+    non-NASDAQ-primary name to the home exchange's close cross — the
+    wrong auction — silently breaking the strategy. Under the ISLAND
+    direct-route alternative IB will still qualify a NYSE / ARCA-
+    primary name for continuous UTP trading, but the closing MOC
+    mis-prints (or is rejected) at the primary listing's close-cross
+    for the same reason. Under either routing choice, refusing to
+    trade the name upstream is the correct behaviour.
+
+    Re-enabled 2026-07-21 alongside the SMART routing switch; had
+    been rolled back 2026-07-20 with the broker's route-survival
+    assertion. See ``daily_orchestrator._prequalify_symbols``'
+    "NASDAQ-primary eligibility filter (ACTIVE)" docstring section
+    and ``live/nasdaq_routing.py``.
+
+    Seeds the fake broker with a batch of universe names all marked
+    NYSE-primary (rather than a single hand-picked one, since the
+    optimizer's target set is model-dependent and we cannot predict
+    which specific name will be traded) and asserts:
+    * at least one drop is logged with ``primary_exchange="NYSE"``,
+    * no buy/sell order for ANY seeded symbol ever reaches the broker,
+    * unseeded (NASDAQ-primary) names still trade normally.
+    """
+    import logging as _logging
+
+    universe = config.load_active_universe()
+    feed = _prepopulate_live_feed(universe)
+    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
+    monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+
+    # The optimizer's target set is model-dependent and (with this
+    # test's synthetic model) skews toward alphabetically-early
+    # mid-caps rather than the file-order top-of-universe mega-caps.
+    # So we seed a wide alphabetical slice of the universe as
+    # NYSE-primary — enough overlap with the target book that the
+    # drop path is guaranteed to fire at least once. We intentionally
+    # leave the last few names unseeded (still NASDAQ-primary in the
+    # fake) so a NASDAQ-primary contingent survives to trade — the
+    # "the drop is symbol-specific, not a wholesale abort" invariant.
+    universe_sorted = sorted(universe)
+    seeded_nyse: dict[str, str] = {
+        sym: "NYSE" for sym in universe_sorted[: max(1, len(universe_sorted) // 2)]
+    }
+    fake_broker = _FakeBroker(non_nasdaq_primary=seeded_nyse)
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    handler, records = _capture_orchestrator_logs(_logging.WARNING)
+    try:
+        rc = daily_orchestrator.main(_base_argv())
+    finally:
+        daily_orchestrator.logger.removeHandler(handler)
+
+    assert rc == 0
+
+    # (1) No NYSE-primary name may ever hit any buy/sell call. This
+    # is the load-bearing invariant — the strategy MUST NOT trade a
+    # name whose MOC would print on a non-NASDAQ close-cross.
+    touched = (
+        {c[0] for c in fake_broker.buy_calls}
+        | {c[0] for c in fake_broker.sell_calls}
+    )
+    leaked = touched & set(seeded_nyse)
+    assert not leaked, (
+        f"non-NASDAQ-primary names traded despite the drop filter: "
+        f"{sorted(leaked)}"
+    )
+
+    # (2) At least one drop must have been logged with the informative
+    # extras — ``symbol`` (which name) and ``primary_exchange`` (why).
+    # We assert on the informative extras rather than a substring match
+    # on the message so a benign wording change to the warning does
+    # not silently break the regression.
+    dropped_syms = {
+        getattr(r, "symbol", None)
+        for r in records
+        if getattr(r, "primary_exchange", None) == "NYSE"
+        and getattr(r, "expected_primary_exchange", None) == "NASDAQ"
+    }
+    dropped_syms.discard(None)
+    assert dropped_syms, (
+        "no 'dropping non-NASDAQ-listed' warning was captured. "
+        f"seeded={sorted(seeded_nyse)}, "
+        f"captured_records={[r.getMessage() for r in records]}"
+    )
+    # And every dropped symbol must be one we seeded — never a
+    # spurious drop of a NASDAQ-primary name.
+    assert dropped_syms.issubset(set(seeded_nyse)), (
+        f"drop path fired for names we did NOT seed as NYSE-primary: "
+        f"{sorted(dropped_syms - set(seeded_nyse))}"
+    )
+
+    # (3) NASDAQ-primary names still trade — the drop is symbol-
+    # specific, not a wholesale abort.
+    assert touched, (
+        "no orders reached the broker at all — the drop path should "
+        "have removed only the seeded names, not the whole universe"
+    )
+
+
+def test_prequalify_drop_still_flattens_existing_position(monkeypatch, tmp_path):
+    """Load-bearing asymmetry: a name the NASDAQ-primary filter drops
+    must still get its MOC flatten if we're already holding it. The
+    filter suppresses the ENTRY (we don't want a new position in a
+    name whose MOC would print on the wrong auction), but a position
+    we already carry has to be flattened either way — leaving it live
+    at 16:00 strands it overnight, which is exactly the failure mode
+    the filter is trying to prevent upstream.
+
+    The invariant relies on ``_submit_moc_flatten`` and the surrounding
+    exposure checks being passed ``managed_universe=universe_set`` — the
+    intersection of the active universe with ``get_positions`` — NOT
+    the prequalify-filtered ``qualified_symbols``. A future refactor
+    that "tidied" those call sites to pass ``qualified_symbols`` would
+    silently strand held positions in dropped names. This test fails
+    under exactly that mutation; see the mutation check recorded in
+    the review that added it.
+
+    Seeds one active-universe name as NYSE-primary AND as a 500-share
+    long, then asserts:
+    * no MKT entry for that name reached the broker (filter dropped
+      it from the entry batch), and
+    * a 500-share SELL MOC did reach the broker (flatten preserved).
+    """
+    universe = config.load_active_universe()
+    assert len(universe) >= 1, "test needs a non-empty active universe"
+    # Pick a name from the middle of the universe so it's neither the
+    # first (which some tests special-case) nor a boundary name.
+    held_sym = sorted(universe)[len(universe) // 2]
+
+    feed = _prepopulate_live_feed(universe)
+    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
+    monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+
+    held_qty = 500
+    fake_broker = _FakeBroker(
+        non_nasdaq_primary={held_sym: "NYSE"},
+        initial_positions=[_FakePosition(held_sym, held_qty)],
+    )
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    rc = daily_orchestrator.main(_base_argv())
+    assert rc == 0
+
+    # (1) ENTRY suppressed — no MKT for the dropped name.
+    mkt_calls_for_held = [
+        (sym, qty, ot, kw)
+        for sym, qty, ot, kw in fake_broker.buy_calls + fake_broker.sell_calls
+        if sym == held_sym and ot == "MKT"
+    ]
+    assert not mkt_calls_for_held, (
+        f"filter-dropped name {held_sym} reached an MKT entry despite "
+        f"the prequalify drop: {mkt_calls_for_held}"
+    )
+
+    # (2) EXIT preserved — a MOC of exactly the held quantity, on the
+    # opposite side of the long, must reach the broker. The +500 long
+    # flattens with a 500-share SELL MOC (``_submit_moc_flatten`` sizes
+    # off ``abs(current_qty)`` and signs the side to close). If this
+    # asserts False the position stranded overnight.
+    moc_sells_for_held = [
+        (sym, qty, ot, kw)
+        for sym, qty, ot, kw in fake_broker.sell_calls
+        if sym == held_sym and ot == "MOC"
+    ]
+    moc_buys_for_held = [
+        (sym, qty, ot, kw)
+        for sym, qty, ot, kw in fake_broker.buy_calls
+        if sym == held_sym and ot == "MOC"
+    ]
+    assert not moc_buys_for_held, (
+        f"held long in {held_sym} flattened with a BUY MOC (wrong side): "
+        f"{moc_buys_for_held}"
+    )
+    assert len(moc_sells_for_held) == 1, (
+        f"expected exactly one MOC flatten for held long in {held_sym}; "
+        f"got sells={moc_sells_for_held}"
+    )
+    sym, qty, ot, kw = moc_sells_for_held[0]
+    assert qty == held_qty, (
+        f"MOC flatten for {held_sym} sized to {qty}, expected "
+        f"{held_qty} (the held quantity)"
+    )

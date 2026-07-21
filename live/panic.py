@@ -55,7 +55,7 @@ from datetime import time as _time
 from typing import Optional
 
 from live import config
-from live.nasdaq_routing import NASDAQ_EXCHANGE
+from live.nasdaq_routing import ACTIVE_ROUTING
 
 
 # Distinct default client-id from daily_orchestrator (1). If the daily is
@@ -343,16 +343,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                 if pos.quantity == 0:
                     continue
                 try:
-                    # NASDAQ-only routing (see live/nasdaq_routing.py):
-                    # the strategy is calibrated to the NASDAQ close
-                    # auction, so even the kill-switch flatten routes
-                    # to the NASDAQ INET book — an off-venue fill on
-                    # a panic exit would leak the same off-strategy
-                    # cost as an off-venue entry. Same rule everywhere.
+                    # Routing pulled from
+                    # live/nasdaq_routing.py::ACTIVE_ROUTING — same
+                    # rule everywhere in live/, so the kill switch
+                    # uses whichever route the daily orchestrator is
+                    # currently using (currently SMART; see the
+                    # module docstring for the rationale).
                     oid = broker.close_position(
                         pos.symbol,
                         order_type=args.flatten_with,
-                        exchange=NASDAQ_EXCHANGE,
+                        exchange=ACTIVE_ROUTING,
                     )
                     if oid:
                         placed_ids.append(oid)

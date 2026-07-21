@@ -1,0 +1,897 @@
+{
+  "cancelled_entry_oids": [
+    "202",
+    "218"
+  ],
+  "dry_run": false,
+  "empty_snapshot_after_fills": false,
+  "entries": [
+    {
+      "filled_qty": 41,
+      "order_id": "198",
+      "requested_qty": 41,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "AAPL"
+    },
+    {
+      "filled_qty": 186,
+      "order_id": "200",
+      "requested_qty": 186,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "ABNB"
+    },
+    {
+      "filled_qty": 0,
+      "order_id": "202",
+      "requested_qty": 67,
+      "side": "BUY",
+      "status": "ApiCancelled",
+      "symbol": "ADBE"
+    },
+    {
+      "filled_qty": 38,
+      "order_id": "204",
+      "requested_qty": 38,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "ADI"
+    },
+    {
+      "filled_qty": 30,
+      "order_id": "206",
+      "requested_qty": 30,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "AMAT"
+    },
+    {
+      "filled_qty": 6,
+      "order_id": "208",
+      "requested_qty": 6,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "AMD"
+    },
+    {
+      "filled_qty": 87,
+      "order_id": "210",
+      "requested_qty": 87,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "AMGN"
+    },
+    {
+      "filled_qty": 89,
+      "order_id": "212",
+      "requested_qty": 89,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "AMZN"
+    },
+    {
+      "filled_qty": 12,
+      "order_id": "214",
+      "requested_qty": 12,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "APP"
+    },
+    {
+      "filled_qty": 18,
+      "order_id": "216",
+      "requested_qty": 18,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "AVGO"
+    },
+    {
+      "filled_qty": 0,
+      "order_id": "218",
+      "requested_qty": 278,
+      "side": "BUY",
+      "status": "ApiCancelled",
+      "symbol": "BKNG"
+    },
+    {
+      "filled_qty": 7,
+      "order_id": "220",
+      "requested_qty": 7,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "CEG"
+    },
+    {
+      "filled_qty": 251,
+      "order_id": "222",
+      "requested_qty": 251,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "CMCSA"
+    },
+    {
+      "filled_qty": 61,
+      "order_id": "224",
+      "requested_qty": 61,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "COIN"
+    },
+    {
+      "filled_qty": 112,
+      "order_id": "226",
+      "requested_qty": 112,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "COST"
+    },
+    {
+      "filled_qty": 6,
+      "order_id": "228",
+      "requested_qty": 6,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "CRWD"
+    },
+    {
+      "filled_qty": 369,
+      "order_id": "230",
+      "requested_qty": 369,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "CSCO"
+    },
+    {
+      "filled_qty": 6,
+      "order_id": "232",
+      "requested_qty": 6,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "DASH"
+    },
+    {
+      "filled_qty": 337,
+      "order_id": "234",
+      "requested_qty": 337,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "GILD"
+    },
+    {
+      "filled_qty": 170,
+      "order_id": "236",
+      "requested_qty": 170,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "GOOG"
+    },
+    {
+      "filled_qty": 90,
+      "order_id": "238",
+      "requested_qty": 90,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "GOOGL"
+    },
+    {
+      "filled_qty": 217,
+      "order_id": "240",
+      "requested_qty": 217,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "HON"
+    },
+    {
+      "filled_qty": 120,
+      "order_id": "242",
+      "requested_qty": 120,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "HOOD"
+    },
+    {
+      "filled_qty": 42,
+      "order_id": "244",
+      "requested_qty": 42,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "INTC"
+    },
+    {
+      "filled_qty": 172,
+      "order_id": "246",
+      "requested_qty": 172,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "INTU"
+    },
+    {
+      "filled_qty": 93,
+      "order_id": "248",
+      "requested_qty": 93,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "ISRG"
+    },
+    {
+      "filled_qty": 22,
+      "order_id": "250",
+      "requested_qty": 22,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "KLAC"
+    },
+    {
+      "filled_qty": 29,
+      "order_id": "252",
+      "requested_qty": 29,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "LRCX"
+    },
+    {
+      "filled_qty": 18,
+      "order_id": "254",
+      "requested_qty": 18,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "MELI"
+    },
+    {
+      "filled_qty": 78,
+      "order_id": "256",
+      "requested_qty": 78,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "META"
+    },
+    {
+      "filled_qty": 15,
+      "order_id": "258",
+      "requested_qty": 15,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "MRVL"
+    },
+    {
+      "filled_qty": 276,
+      "order_id": "260",
+      "requested_qty": 276,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "MSFT"
+    },
+    {
+      "filled_qty": 69,
+      "order_id": "262",
+      "requested_qty": 69,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "MSTR"
+    },
+    {
+      "filled_qty": 23,
+      "order_id": "264",
+      "requested_qty": 23,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "MU"
+    },
+    {
+      "filled_qty": 222,
+      "order_id": "266",
+      "requested_qty": 222,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "NFLX"
+    },
+    {
+      "filled_qty": 68,
+      "order_id": "268",
+      "requested_qty": 68,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "NVDA"
+    },
+    {
+      "filled_qty": 12,
+      "order_id": "270",
+      "requested_qty": 12,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "NXPI"
+    },
+    {
+      "filled_qty": 132,
+      "order_id": "272",
+      "requested_qty": 132,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "PANW"
+    },
+    {
+      "filled_qty": 398,
+      "order_id": "274",
+      "requested_qty": 398,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "PEP"
+    },
+    {
+      "filled_qty": 42,
+      "order_id": "276",
+      "requested_qty": 42,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "PLTR"
+    },
+    {
+      "filled_qty": 45,
+      "order_id": "278",
+      "requested_qty": 45,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "PYPL"
+    },
+    {
+      "filled_qty": 105,
+      "order_id": "280",
+      "requested_qty": 105,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "QCOM"
+    },
+    {
+      "filled_qty": 37,
+      "order_id": "282",
+      "requested_qty": 37,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "REGN"
+    },
+    {
+      "filled_qty": 100,
+      "order_id": "284",
+      "requested_qty": 100,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "SBUX"
+    },
+    {
+      "filled_qty": 8,
+      "order_id": "286",
+      "requested_qty": 8,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "SMCI"
+    },
+    {
+      "filled_qty": 49,
+      "order_id": "288",
+      "requested_qty": 49,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "TMUS"
+    },
+    {
+      "filled_qty": 58,
+      "order_id": "290",
+      "requested_qty": 58,
+      "side": "SELL",
+      "status": "Filled",
+      "symbol": "TXN"
+    },
+    {
+      "filled_qty": 15,
+      "order_id": "292",
+      "requested_qty": 15,
+      "side": "BUY",
+      "status": "Filled",
+      "symbol": "VRTX"
+    }
+  ],
+  "generated_at_ny": "2026-07-21T15:50:49.435825-04:00",
+  "generated_at_utc": "2026-07-21T19:50:49.435825+00:00",
+  "gmv_dollar": 1136728.8060807649,
+  "lambda": 5e-05,
+  "moc_batch": [
+    {
+      "oid": "294",
+      "qty": 41,
+      "side": "SELL",
+      "signed_qty": -41,
+      "symbol": "AAPL"
+    },
+    {
+      "oid": "296",
+      "qty": 186,
+      "side": "BUY",
+      "signed_qty": 186,
+      "symbol": "ABNB"
+    },
+    {
+      "oid": "298",
+      "qty": 67,
+      "side": "SELL",
+      "signed_qty": -67,
+      "symbol": "ADBE"
+    },
+    {
+      "oid": "300",
+      "qty": 38,
+      "side": "BUY",
+      "signed_qty": 38,
+      "symbol": "ADI"
+    },
+    {
+      "oid": "302",
+      "qty": 30,
+      "side": "BUY",
+      "signed_qty": 30,
+      "symbol": "AMAT"
+    },
+    {
+      "oid": "304",
+      "qty": 6,
+      "side": "BUY",
+      "signed_qty": 6,
+      "symbol": "AMD"
+    },
+    {
+      "oid": "306",
+      "qty": 87,
+      "side": "BUY",
+      "signed_qty": 87,
+      "symbol": "AMGN"
+    },
+    {
+      "oid": "308",
+      "qty": 89,
+      "side": "SELL",
+      "signed_qty": -89,
+      "symbol": "AMZN"
+    },
+    {
+      "oid": "310",
+      "qty": 12,
+      "side": "SELL",
+      "signed_qty": -12,
+      "symbol": "APP"
+    },
+    {
+      "oid": "312",
+      "qty": 18,
+      "side": "BUY",
+      "signed_qty": 18,
+      "symbol": "AVGO"
+    },
+    {
+      "oid": "314",
+      "qty": 236,
+      "side": "SELL",
+      "signed_qty": -236,
+      "symbol": "BKNG"
+    },
+    {
+      "oid": "316",
+      "qty": 7,
+      "side": "BUY",
+      "signed_qty": 7,
+      "symbol": "CEG"
+    },
+    {
+      "oid": "318",
+      "qty": 251,
+      "side": "SELL",
+      "signed_qty": -251,
+      "symbol": "CMCSA"
+    },
+    {
+      "oid": "320",
+      "qty": 61,
+      "side": "BUY",
+      "signed_qty": 61,
+      "symbol": "COIN"
+    },
+    {
+      "oid": "322",
+      "qty": 112,
+      "side": "BUY",
+      "signed_qty": 112,
+      "symbol": "COST"
+    },
+    {
+      "oid": "324",
+      "qty": 6,
+      "side": "BUY",
+      "signed_qty": 6,
+      "symbol": "CRWD"
+    },
+    {
+      "oid": "326",
+      "qty": 369,
+      "side": "BUY",
+      "signed_qty": 369,
+      "symbol": "CSCO"
+    },
+    {
+      "oid": "328",
+      "qty": 6,
+      "side": "BUY",
+      "signed_qty": 6,
+      "symbol": "DASH"
+    },
+    {
+      "oid": "330",
+      "qty": 337,
+      "side": "SELL",
+      "signed_qty": -337,
+      "symbol": "GILD"
+    },
+    {
+      "oid": "332",
+      "qty": 170,
+      "side": "BUY",
+      "signed_qty": 170,
+      "symbol": "GOOG"
+    },
+    {
+      "oid": "334",
+      "qty": 90,
+      "side": "SELL",
+      "signed_qty": -90,
+      "symbol": "GOOGL"
+    },
+    {
+      "oid": "336",
+      "qty": 217,
+      "side": "BUY",
+      "signed_qty": 217,
+      "symbol": "HON"
+    },
+    {
+      "oid": "338",
+      "qty": 120,
+      "side": "BUY",
+      "signed_qty": 120,
+      "symbol": "HOOD"
+    },
+    {
+      "oid": "340",
+      "qty": 42,
+      "side": "BUY",
+      "signed_qty": 42,
+      "symbol": "INTC"
+    },
+    {
+      "oid": "342",
+      "qty": 172,
+      "side": "SELL",
+      "signed_qty": -172,
+      "symbol": "INTU"
+    },
+    {
+      "oid": "344",
+      "qty": 93,
+      "side": "BUY",
+      "signed_qty": 93,
+      "symbol": "ISRG"
+    },
+    {
+      "oid": "346",
+      "qty": 22,
+      "side": "SELL",
+      "signed_qty": -22,
+      "symbol": "KLAC"
+    },
+    {
+      "oid": "348",
+      "qty": 29,
+      "side": "BUY",
+      "signed_qty": 29,
+      "symbol": "LRCX"
+    },
+    {
+      "oid": "350",
+      "qty": 18,
+      "side": "SELL",
+      "signed_qty": -18,
+      "symbol": "MELI"
+    },
+    {
+      "oid": "352",
+      "qty": 78,
+      "side": "SELL",
+      "signed_qty": -78,
+      "symbol": "META"
+    },
+    {
+      "oid": "354",
+      "qty": 15,
+      "side": "BUY",
+      "signed_qty": 15,
+      "symbol": "MRVL"
+    },
+    {
+      "oid": "356",
+      "qty": 276,
+      "side": "BUY",
+      "signed_qty": 276,
+      "symbol": "MSFT"
+    },
+    {
+      "oid": "358",
+      "qty": 69,
+      "side": "SELL",
+      "signed_qty": -69,
+      "symbol": "MSTR"
+    },
+    {
+      "oid": "360",
+      "qty": 23,
+      "side": "SELL",
+      "signed_qty": -23,
+      "symbol": "MU"
+    },
+    {
+      "oid": "362",
+      "qty": 222,
+      "side": "BUY",
+      "signed_qty": 222,
+      "symbol": "NFLX"
+    },
+    {
+      "oid": "364",
+      "qty": 68,
+      "side": "SELL",
+      "signed_qty": -68,
+      "symbol": "NVDA"
+    },
+    {
+      "oid": "366",
+      "qty": 12,
+      "side": "SELL",
+      "signed_qty": -12,
+      "symbol": "NXPI"
+    },
+    {
+      "oid": "368",
+      "qty": 132,
+      "side": "SELL",
+      "signed_qty": -132,
+      "symbol": "PANW"
+    },
+    {
+      "oid": "370",
+      "qty": 398,
+      "side": "SELL",
+      "signed_qty": -398,
+      "symbol": "PEP"
+    },
+    {
+      "oid": "372",
+      "qty": 42,
+      "side": "BUY",
+      "signed_qty": 42,
+      "symbol": "PLTR"
+    },
+    {
+      "oid": "374",
+      "qty": 45,
+      "side": "BUY",
+      "signed_qty": 45,
+      "symbol": "PYPL"
+    },
+    {
+      "oid": "376",
+      "qty": 105,
+      "side": "SELL",
+      "signed_qty": -105,
+      "symbol": "QCOM"
+    },
+    {
+      "oid": "378",
+      "qty": 37,
+      "side": "BUY",
+      "signed_qty": 37,
+      "symbol": "REGN"
+    },
+    {
+      "oid": "380",
+      "qty": 100,
+      "side": "SELL",
+      "signed_qty": -100,
+      "symbol": "SBUX"
+    },
+    {
+      "oid": "382",
+      "qty": 8,
+      "side": "SELL",
+      "signed_qty": -8,
+      "symbol": "SMCI"
+    },
+    {
+      "oid": "384",
+      "qty": 49,
+      "side": "SELL",
+      "signed_qty": -49,
+      "symbol": "TMUS"
+    },
+    {
+      "oid": "386",
+      "qty": 58,
+      "side": "BUY",
+      "signed_qty": 58,
+      "symbol": "TXN"
+    },
+    {
+      "oid": "388",
+      "qty": 15,
+      "side": "SELL",
+      "signed_qty": -15,
+      "symbol": "VRTX"
+    }
+  ],
+  "moc_order_ids": [
+    "294",
+    "296",
+    "298",
+    "300",
+    "302",
+    "304",
+    "306",
+    "308",
+    "310",
+    "312",
+    "314",
+    "316",
+    "318",
+    "320",
+    "322",
+    "324",
+    "326",
+    "328",
+    "330",
+    "332",
+    "334",
+    "336",
+    "338",
+    "340",
+    "342",
+    "344",
+    "346",
+    "348",
+    "350",
+    "352",
+    "354",
+    "356",
+    "358",
+    "360",
+    "362",
+    "364",
+    "366",
+    "368",
+    "370",
+    "372",
+    "374",
+    "376",
+    "378",
+    "380",
+    "382",
+    "384",
+    "386",
+    "388"
+  ],
+  "moc_positions_unknown": false,
+  "moc_signed_by_sym": {
+    "AAPL": -41,
+    "ABNB": 186,
+    "ADBE": -67,
+    "ADI": 38,
+    "AMAT": 30,
+    "AMD": 6,
+    "AMGN": 87,
+    "AMZN": -89,
+    "APP": -12,
+    "AVGO": 18,
+    "BKNG": -236,
+    "CEG": 7,
+    "CMCSA": -251,
+    "COIN": 61,
+    "COST": 112,
+    "CRWD": 6,
+    "CSCO": 369,
+    "DASH": 6,
+    "GILD": -337,
+    "GOOG": 170,
+    "GOOGL": -90,
+    "HON": 217,
+    "HOOD": 120,
+    "INTC": 42,
+    "INTU": -172,
+    "ISRG": 93,
+    "KLAC": -22,
+    "LRCX": 29,
+    "MELI": -18,
+    "META": -78,
+    "MRVL": 15,
+    "MSFT": 276,
+    "MSTR": -69,
+    "MU": -23,
+    "NFLX": 222,
+    "NVDA": -68,
+    "NXPI": -12,
+    "PANW": -132,
+    "PEP": -398,
+    "PLTR": 42,
+    "PYPL": 45,
+    "QCOM": -105,
+    "REGN": 37,
+    "SBUX": -100,
+    "SMCI": -8,
+    "TMUS": -49,
+    "TXN": 58,
+    "VRTX": -15
+  },
+  "moc_skipped_past_cutoff": [],
+  "mode": "replay",
+  "nmv_dollar": -76536.51742129319,
+  "replay_date": "2026-06-10",
+  "scale": 20000.0,
+  "targets": {
+    "AAPL": 41,
+    "ABNB": -186,
+    "ADBE": 67,
+    "ADI": -38,
+    "AMAT": -30,
+    "AMD": -6,
+    "AMGN": -87,
+    "AMZN": 89,
+    "APP": 12,
+    "AVGO": -18,
+    "BKNG": 278,
+    "CEG": -7,
+    "CMCSA": 251,
+    "COIN": -61,
+    "COST": -112,
+    "CRWD": -6,
+    "CSCO": -369,
+    "DASH": -6,
+    "GILD": 337,
+    "GOOG": -170,
+    "GOOGL": 90,
+    "HON": -217,
+    "HOOD": -120,
+    "INTC": -42,
+    "INTU": 172,
+    "ISRG": -93,
+    "KLAC": 22,
+    "LRCX": -29,
+    "MELI": 18,
+    "META": 78,
+    "MRVL": -15,
+    "MSFT": -276,
+    "MSTR": 69,
+    "MU": 23,
+    "NFLX": -222,
+    "NVDA": 68,
+    "NXPI": 12,
+    "PANW": 132,
+    "PEP": 398,
+    "PLTR": -42,
+    "PYPL": -45,
+    "QCOM": 105,
+    "REGN": -37,
+    "SBUX": 100,
+    "SMCI": 8,
+    "TMUS": 49,
+    "TXN": -58,
+    "VRTX": 15
+  },
+  "uncovered_symbols": [],
+  "unfilled_moc_symbols": [],
+  "universe_file": "top_49_universe.txt",
+  "universe_hash": "315feaa7b2f8",
+  "vol_cap": 5000.0
+}

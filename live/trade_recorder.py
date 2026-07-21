@@ -213,7 +213,14 @@ def _build_trade_record_schema() -> pa.Schema:
         ("side", pa.string()),           # "BUY" | "SELL"
         ("order_type", pa.string()),
         ("tif", pa.string()),
-        ("exchange", pa.string()),       # "ISLAND" for NASDAQ-only routing
+        # ``exchange``: the routing code we REQUESTED at submission time
+        # (whatever ``live.nasdaq_routing.ACTIVE_ROUTING`` is set to when
+        # the order is placed — "SMART" today, "ISLAND" when this book
+        # ran direct-routed). This is the intent, not the outcome; the
+        # actual venue the fill printed on lives in ``venue`` (below),
+        # populated from ``execution.exchange`` and worth splitting on
+        # for any post-trade venue analysis.
+        ("exchange", pa.string()),
         ("account", pa.string()),
         ("order_id", pa.string()),
         ("perm_id", pa.int64()),

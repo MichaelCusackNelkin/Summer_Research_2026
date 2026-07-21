@@ -150,7 +150,7 @@ def test_schema_columns_present_and_typed(tmp_path):
         leg="entry", symbol="AAA", side="BUY", requested_qty=50,
         order_type="MKT", order_id="oid-1",
         sent_ts_utc=_decision_ts() + timedelta(seconds=1),
-        exchange="ISLAND", tif="DAY",
+        exchange="SMART", tif="DAY",
     )
     rec.record_fill(
         leg="entry", symbol="AAA", order_id="oid-1",
@@ -832,6 +832,15 @@ def test_extract_broker_extras_handles_missing_trade():
 
 
 def test_extract_broker_extras_pulls_commission_and_exec_id():
+    """The extractor pulls contract.exchange as ``exchange`` (the
+    REQUESTED route — preserved by IB's qualifier for SMART) and the
+    fill's ``execution.exchange`` as ``venue`` (the REALIZED venue the
+    fill printed on). Under the current SMART routing the two diverge:
+    we ask for SMART, and each fill lands on whichever specific venue
+    the router picked (ISLAND, BATS, ARCA, ...). This test pins that
+    the two columns are populated independently so post-trade venue
+    analysis can split requested-route vs. realized-venue.
+    """
     exec_ = SimpleNamespace(
         execId="EX-42", exchange="ISLAND",
         lastLiquidity="R", time=datetime(2026, 5, 13, 15, 50, 12, tzinfo=_UTC),
@@ -842,7 +851,10 @@ def test_extract_broker_extras_pulls_commission_and_exec_id():
         order=SimpleNamespace(
             permId=123456789, clientId=1, tif="DAY", account="DU12345",
         ),
-        contract=SimpleNamespace(exchange="ISLAND"),
+        # Qualified contract exchange: IB preserves "SMART" on input
+        # (see the qualifier special-case in ib_async), so a SMART-
+        # routed order's qualified contract carries "SMART" here.
+        contract=SimpleNamespace(exchange="SMART"),
         orderStatus=SimpleNamespace(remaining=0),
         fills=[fill],
     )
@@ -852,10 +864,14 @@ def test_extract_broker_extras_pulls_commission_and_exec_id():
     assert extras["client_id"] == 1
     assert extras["tif"] == "DAY"
     assert extras["account"] == "DU12345"
-    assert extras["exchange"] == "ISLAND"
+    # ``exchange`` reflects the REQUESTED route (SMART).
+    assert extras["exchange"] == "SMART"
     assert extras["commission"] == pytest.approx(0.35)
     assert extras["commission_currency"] == "USD"
     assert extras["exec_id"] == "EX-42"
+    # ``venue`` reflects the REALIZED venue the fill printed on — SMART
+    # picked ISLAND for this fill; another fill in the same batch could
+    # have printed on BATS / ARCA / etc.
     assert extras["venue"] == "ISLAND"
     assert extras["liquidity"] == "R"
     assert extras["remaining_qty"] == 0.0

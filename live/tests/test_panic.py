@@ -73,7 +73,8 @@ class _FakeBroker:
         self.events: list[str] = []
         self.cancel_all_calls = 0
         # (symbol, order_type, exchange) — exchange added so the
-        # NASDAQ-routing regression can assert every leg is ISLAND.
+        # routing regression can assert every leg carries ACTIVE_ROUTING
+        # (see live/nasdaq_routing.py).
         self.close_position_calls: list[tuple[str, str, str]] = []
 
     def connect(self, mode="paper", **kwargs):
@@ -99,10 +100,20 @@ class _FakeBroker:
         self._orders = list(self._residual_orders)
 
     def close_position(self, symbol, order_type="MKT", tif="DAY",
-                       exchange="SMART"):
+                       exchange=None):
+        # ``exchange`` defaults to ``None`` (not the real broker's
+        # ``"SMART"``) so a call site that omits the kwarg is
+        # OBSERVABLE in ``close_position_calls`` — a
+        # ``(sym, order_type, None)`` tuple tells the routing
+        # regression the caller relied on the implicit default.
+        # Under the real broker's ``exchange="SMART"`` default and
+        # the current ``ACTIVE_ROUTING == "SMART"``, an omission
+        # would otherwise be indistinguishable from a correctly-
+        # threaded constant and the guard would go dead.
         self.events.append(f"close:{symbol}:{order_type}")
-        # Record the exchange too so the NASDAQ-routing regression can
-        # assert every panic-side flatten leg is direct-routed to ISLAND.
+        # Record the exchange too so the routing regression can assert
+        # every panic-side flatten leg carries the ACTIVE_ROUTING code
+        # (see live/nasdaq_routing.py).
         self.close_position_calls.append((symbol, order_type, exchange))
         if self._close_side_effect is not None:
             return self._close_side_effect(symbol, order_type)
@@ -231,11 +242,11 @@ def test_per_leg_flatten_survives_partial_failure(monkeypatch, capsys):
     # Non-zero rc because BADSYM position remains.
     assert rc == 1, f"expected rc=1 (partial failure), got {rc}"
     # Both legs were attempted (the good one wasn't skipped).
-    # Panic threads NASDAQ_EXCHANGE ("ISLAND") through close_position, so
+    # Panic threads ACTIVE_ROUTING ("SMART") through close_position, so
     # the recorded tuples include the exchange code.
     assert broker.close_position_calls == [
-        ("BADSYM", "MKT", "ISLAND"),
-        ("GOOD", "MKT", "ISLAND"),
+        ("BADSYM", "MKT", "SMART"),
+        ("GOOD", "MKT", "SMART"),
     ]
 
 
@@ -391,7 +402,7 @@ def test_live_prompt_accepts_panic(monkeypatch):
     rc = panic.main(["--live", "--live-confirm", panic._LIVE_CONFIRM_MSG])
     assert rc == 0
     assert broker.cancel_all_calls == 1
-    assert broker.close_position_calls == [("MSFT", "MKT", "ISLAND")]
+    assert broker.close_position_calls == [("MSFT", "MKT", "SMART")]
 
 
 def test_moc_startup_warning_after_cutoff(monkeypatch, capsys):
@@ -565,15 +576,16 @@ def test_flatten_loop_get_positions_dropout_continues_to_after(
     assert rc == 1, f"expected rc=1 (positions remain after failed flatten), got {rc}"
 
 
-def test_panic_flatten_routes_every_leg_to_nasdaq(monkeypatch):
-    """NASDAQ-only routing regression: every close_position call panic
-    issues during a flatten MUST carry ``exchange="ISLAND"`` — the
-    NASDAQ INET direct-route code. The kill switch is subject to the
-    same NASDAQ-only rule as the daily orchestrator (see
-    ``live/nasdaq_routing.py``); a SMART-routed panic exit would
-    lose the same off-strategy cost an off-venue entry would.
+def test_panic_flatten_routes_every_leg_via_active_routing(monkeypatch):
+    """Routing regression: every close_position call panic issues during
+    a flatten MUST carry ``exchange=ACTIVE_ROUTING`` — the same routing
+    code the daily orchestrator uses (see ``live/nasdaq_routing.py``).
+    Currently ``ACTIVE_ROUTING == "SMART"``. The kill switch is subject
+    to the same routing contract as the daily; if a future flip changes
+    ``ACTIVE_ROUTING`` (back to ISLAND, or forward to something else),
+    the panic path must move with it.
     """
-    from live.nasdaq_routing import NASDAQ_EXCHANGE
+    from live.nasdaq_routing import ACTIVE_ROUTING
 
     broker = _FakeBroker(
         initial_positions=[
@@ -585,22 +597,23 @@ def test_panic_flatten_routes_every_leg_to_nasdaq(monkeypatch):
     _install_broker(monkeypatch, broker)
     rc = panic.main(["--paper", "--yes"])
     assert rc == 0
-    # Every recorded flatten leg pinned to the NASDAQ direct route.
+    # Every recorded flatten leg pinned to the currently-active route.
     assert broker.close_position_calls, "no flatten legs were attempted"
     for sym, order_type, exchange in broker.close_position_calls:
-        assert exchange == NASDAQ_EXCHANGE == "ISLAND", (
+        assert exchange == ACTIVE_ROUTING == "SMART", (
             f"panic flatten leg for {sym} ({order_type}) routed to "
-            f"exchange={exchange!r}, expected {NASDAQ_EXCHANGE!r}"
+            f"exchange={exchange!r}, expected {ACTIVE_ROUTING!r}"
         )
 
 
-def test_panic_flatten_moc_also_routes_to_nasdaq(monkeypatch):
-    """NASDAQ-only routing regression, MOC branch: even the ``--flatten-with
-    MOC`` end-of-day flatten must direct-route to NASDAQ so the closing
-    print lands on the same auction the strategy targets.
+def test_panic_flatten_moc_also_uses_active_routing(monkeypatch):
+    """Routing regression, MOC branch: even the ``--flatten-with MOC``
+    end-of-day flatten must carry ``exchange=ACTIVE_ROUTING`` so the
+    kill switch stays consistent with the daily orchestrator's routing
+    contract (see ``live/nasdaq_routing.py``).
     """
     from datetime import datetime as _dt
-    from live.nasdaq_routing import NASDAQ_EXCHANGE
+    from live.nasdaq_routing import ACTIVE_ROUTING
 
     early = _dt(2026, 6, 15, 14, 30, tzinfo=config.NY_TZ)
     monkeypatch.setattr(config, "now_ny", lambda: early)
@@ -613,10 +626,42 @@ def test_panic_flatten_moc_also_routes_to_nasdaq(monkeypatch):
     assert broker.close_position_calls
     for sym, order_type, exchange in broker.close_position_calls:
         assert order_type == "MOC"
-        assert exchange == NASDAQ_EXCHANGE == "ISLAND", (
+        assert exchange == ACTIVE_ROUTING == "SMART", (
             f"panic MOC leg for {sym} routed to exchange={exchange!r}, "
-            f"expected {NASDAQ_EXCHANGE!r}"
+            f"expected {ACTIVE_ROUTING!r}"
         )
+
+
+def test_panic_flatten_never_relies_on_broker_implicit_default(monkeypatch):
+    """Companion pin for the panic path: no ``close_position`` call may
+    omit the ``exchange`` kwarg and rely on ``Broker.close_position``'s
+    ``exchange="SMART"`` default. The fake broker defaults ``exchange``
+    to ``None`` (unlike the real broker), so an omission surfaces as a
+    ``None`` in the recorded tuple. If a future edit drops the
+    ``exchange=ACTIVE_ROUTING`` kwarg from ``panic.py::main``, this
+    fires — same purpose as
+    ``test_no_implicit_default_routing_leaks_through_live_paths`` for
+    the orchestrator.
+    """
+    broker = _FakeBroker(
+        initial_positions=[
+            _FakePosition("AAPL", 100),
+            _FakePosition("MSFT", -50),
+            _FakePosition("NVDA", 25),
+        ],
+    )
+    _install_broker(monkeypatch, broker)
+    rc = panic.main(["--paper", "--yes"])
+    assert rc == 0
+    assert broker.close_position_calls, "no flatten legs were attempted"
+    implicit = [
+        (sym, order_type) for sym, order_type, exchange
+        in broker.close_position_calls if exchange is None
+    ]
+    assert not implicit, (
+        f"panic path relied on the broker's implicit exchange default "
+        f"on: {implicit}"
+    )
 
 
 def test_confirm_msg_stays_in_sync_with_broker():
