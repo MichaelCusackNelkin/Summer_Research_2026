@@ -293,8 +293,10 @@ def test_existing_moc_past_cutoff_warning_regardless_of_flatten_flag(
     monkeypatch, capsys,
 ):
     """H3: warning is driven by the BEFORE snapshot + clock, NOT --flatten-with.
-    Even with the default MKT flatten, an existing MOC past the cutoff must
-    surface a loud warning naming the count.
+    Even with the default MKT flatten, an existing MOC past NASDAQ's
+    15:50 CANCEL/MODIFY cutoff (round-2 fix — this is the relevant
+    cutoff here, not the 15:55 entry cutoff) must surface a loud
+    warning naming the count.
     """
     late = datetime(2026, 6, 15, 15, 55, tzinfo=config.NY_TZ)
     monkeypatch.setattr(config, "now_ny", lambda: late)
@@ -313,13 +315,18 @@ def test_existing_moc_past_cutoff_warning_regardless_of_flatten_flag(
     panic.main(["--paper", "--dry-run"])  # dry-run so we just inspect
     out = capsys.readouterr().out
     assert "2 MOC order(s) present in the BEFORE snapshot" in out
-    assert "past the ~15:50 ET entry cutoff" in out
+    assert "15:50" in out and "CANCEL" in out.upper(), (
+        f"expected 15:50 CANCEL/MODIFY cutoff mention in output; got:\n{out}"
+    )
     assert "cannot" in out.lower()
 
 
 def test_moc_flatten_past_cutoff_returns_nonzero(monkeypatch, capsys):
-    """M4: --flatten-with MOC past 15:50 must NOT claim success."""
-    late = datetime(2026, 6, 15, 15, 55, tzinfo=config.NY_TZ)
+    """M4: --flatten-with MOC past NASDAQ's 15:55 ENTRY cutoff (SEC
+    34-84454, 2018 rule) must NOT claim success. Round-2 fix: the
+    previous test used 15:55 which is exactly AT the cutoff (>= in
+    _past_moc_entry_cutoff), so pick 15:56 to be unambiguously past."""
+    late = datetime(2026, 6, 15, 15, 56, tzinfo=config.NY_TZ)
     monkeypatch.setattr(config, "now_ny", lambda: late)
     broker = _FakeBroker(
         initial_positions=[_FakePosition("MSFT", 50)],
@@ -406,15 +413,19 @@ def test_live_prompt_accepts_panic(monkeypatch):
 
 
 def test_moc_startup_warning_after_cutoff(monkeypatch, capsys):
-    """Pre-connect warning that new MOC submissions past the cutoff will
-    likely be rejected."""
-    late = datetime(2026, 6, 15, 15, 55, tzinfo=config.NY_TZ)
+    """Pre-connect warning that new MOC submissions past NASDAQ's
+    15:55 entry cutoff (SEC 34-84454, 2018 rule) will likely be
+    rejected. Round-2 fix: the panic script used to encode 15:50 as
+    the entry cutoff, which is FALSE for NASDAQ — 15:50 is the
+    cancel/modify cutoff. The startup warning is now at 15:55."""
+    # 15:56 is past NASDAQ's 15:55 entry cutoff.
+    late = datetime(2026, 6, 15, 15, 56, tzinfo=config.NY_TZ)
     monkeypatch.setattr(config, "now_ny", lambda: late)
     broker = _FakeBroker()
     _install_broker(monkeypatch, broker)
     panic.main(["--paper", "--flatten-with", "MOC", "--dry-run"])
     out = capsys.readouterr().out
-    assert "after ~15:50 ET" in out
+    assert "after NASDAQ's 15:55 ET entry cutoff" in out
 
 
 def test_mkt_startup_warning_outside_hours(monkeypatch, capsys):

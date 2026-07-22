@@ -21,11 +21,14 @@ per trading day: it streams Databento imbalance + tbbo from market open,
 snapshots at 15:50 America/New_York, engineers the same features the
 forecast pipeline was trained on, predicts alpha, solves the MVO,
 converts dollar targets to signed share counts, and executes them as
-a **two-leg batch — MKT entries at 15:50 sized to `target -
-current`, then MOC counter-flatten sized to the ACTUAL post-entry
-position** — so the book is flat overnight and the run captures the
-forecasted 15:50→16:00 close-auction move. `live/retrain.py` runs on
-a slower cadence (weekly or monthly), refreshes the historical
+a **two-leg batch — MKT entries at 15:50 sized to `target - current`,
+then a per-symbol FILL-GATED MOC counter-flatten (each symbol's MOC
+fires the moment its entry becomes terminal Filled) plus a DEADLINE
+SWEEP before 15:55 that MOC-flattens every residual managed-universe
+position** — so the book is flat overnight. A post-close position
+poll (16:00-16:05) then AUTHORITATIVELY verifies flat before returning
+rc=0; a nonzero managed position after 16:05 is rc=11. `live/retrain.py`
+runs on a slower cadence (weekly or monthly), refreshes the historical
 Databento cache on a rolling window, and rebuilds the three artifact
 sets on disk. `live/panic.py` is the account-wide kill switch (see
 section 10). The daily reads whatever the retrain last wrote; there
@@ -62,7 +65,7 @@ The daily orchestrator fails fast if any of these are missing:
 | `covariance/idiosyncratic_diag_return.npy`        | same                                        | `FileNotFoundError`                                                                 |
 | `covariance/factor_cov_matrix.npy`                | same                                        | `FileNotFoundError`                                                                 |
 | `covariance/cov_matrix_return.npy`                | same                                        | `FileNotFoundError`                                                                 |
-| `top_100_universe.txt`                            | `universe_selection.py`                     | `FileNotFoundError`                                                                 |
+| `top_49_universe.txt` (current active universe)   | `universe_selection.py`                     | `FileNotFoundError`                                                                 |
 | `impact/impact_gamma_vec.npy`                     | impact notebook or `retrain.py --refit impact`       | falls back to scalar `--impact-gamma` (0.5), logs a warning     |
 | `impact/reference_stats.parquet`                  | `retrain.py --refit impact`                          | falls back to null ADV/vol, live coverage assertion aborts the run (rc=2) |
 
@@ -253,6 +256,15 @@ Replay (dress-rehearsal):
   `--replay-date`; ignored on the live path (no historical cache in
   the loop). Single gate — replay is a one-day historical pull, so no
   `--yes` co-gate.
+- `--replay-ignore-cutoff` — in replay mode, IGNORE the wall-clock
+  `--submit-by` cutoff. Off by default — replay now HONOURS the
+  cutoff so a late-in-the-day rehearsal correctly surfaces the same
+  rc=4 / rc=11 codes a real run would. Pass this flag to preserve
+  the earlier afternoon-rehearsal ergonomics where you deliberately
+  want to exercise the order path even though `now` is past 15:55.
+  Only meaningful with `--replay-date`. The SNAPSHOT wall-clock wait
+  is unconditionally skipped in replay (the parquet is already on
+  disk); this flag only relaxes the submit-by check.
 
 The replay guard matrix, stated plainly:
 
@@ -335,14 +347,19 @@ Timing (all America/New_York):
   to wait before snapshotting the buffers. Default 10. The imbalance
   print publishes at 15:50:00+, so a 0s wait races it.
 - `--submit-by SUBMIT_BY` — hard cutoff (HH:MM ET) for MOC EXIT
-  submission. Default 15:55. Note: the NYSE/Nasdaq MOC entry cutoff
-  is 15:50 ET, so any leg placed after 15:50 may face exchange
-  rejection. This flag ONLY bounds the MOC exit batch; the MKT entry
-  batch fires unconditionally so the operator is never left with a
-  filled entry and no queued exit. If the cutoff was already past at
-  orchestrator entry (no orders placed), the run exits rc=4 (safe
-  skip). If it trips mid-flow AFTER entries filled, the run exits
-  rc=11 (OVERNIGHT EXPOSURE — page).
+  submission. Default 15:55 — this is **NASDAQ's** MOC ENTRY cutoff
+  of 15:55:00 ET (SEC release 34-84454, 2018 rule change that
+  extended it from the old 15:50). MOC orders may not be
+  CANCELED OR MODIFIED after 15:50 ET on NASDAQ; the entry cutoff
+  is later. (NYSE keeps a 15:50 MOC entry cutoff — different venue,
+  different rule. This strategy targets the NASDAQ close cross
+  exclusively — see `live/nasdaq_routing.py`.) This flag ONLY bounds
+  the MOC exit batch; the MKT entry batch fires unconditionally so
+  the operator is never left with a filled entry and no queued
+  exit. If the cutoff was already past at orchestrator entry (no
+  orders placed), the run exits rc=4 (safe skip). If it trips
+  mid-flow AFTER entries filled, the run exits rc=11 (OVERNIGHT
+  EXPOSURE — page).
 
 Execution (two-leg — see the "Execution model" section below):
 
@@ -376,7 +393,10 @@ Safety and data quality:
 Configuration:
 
 - `--universe-file UNIVERSE_FILE` — active-universe filename at the
-  repo root. Default `top_100_universe.txt`.
+  repo root. Default `top_49_universe.txt` — chosen for paper trading
+  to avoid known universe issues; the plan is to scale toward 500
+  later. The on-disk covariance/forecast/impact artifacts must be
+  regenerated for whichever universe you select (see § 6).
 - `--reference-stats-path REFERENCE_STATS_PATH` — override for the
   reference-stats parquet. Default `impact/reference_stats.parquet`.
 - `--no-live-feed` — skip the Databento live feed entirely. Only useful
@@ -502,32 +522,76 @@ than the one before it. Do not skip:
    |
    |  15:50+ LEG 1: MKT entries sized to (target - current) via
    |          broker.buy / broker.sell (default tif=DAY).
-   |          Bounded fill-wait; belt-and-braces cancel any entry
-   |          still in a non-terminal state before the MOC snapshot.
    |
-   |  15:50+ LEG 2: broker.get_positions() -> per-symbol MOC exit
-   |          sized to |current_qty| (NEVER to target - current)
-   |          in the OPPOSITE direction. Book is scheduled to be
-   |          flat at 16:00.
+   |  15:50+ LEG 2 (fill-gated dispatcher): a single-threaded fast-
+   |          polling loop monitors every entry's status concurrently.
+   |          As each entry becomes terminal Filled, its opposite-side
+   |          MOC is submitted IMMEDIATELY, sized off a fresh
+   |          broker.get_positions() for that symbol. Zero-fill entries
+   |          get NO MOC. Dispatcher runs until either every entry is
+   |          terminal or the sweep deadline lands. A staleness check
+   |          (baseline+signed_fill == snapshot) DEFERS the MOC to the
+   |          sweep whenever the position book lags the fill event
+   |          (round-4 fix: IB emits execution reports before the
+   |          position update — the naive dispatcher would have sized
+   |          an MOC off a stale PRE-fill snapshot).
+   |
+   |  ~15:51  FIRST SWEEP (immediately after the dispatcher): cancels
+   |          any entry still non-terminal, verifies each dispatcher
+   |          MOC is still live (drops coverage credit for any that
+   |          flipped terminal-Cancelled/Inactive with filled=0), takes
+   |          a fresh get_positions, and submits MOCs for every
+   |          managed-universe symbol whose signed residual
+   |          `held + Σ covered_MOC` is nonzero. Two-sided: TOPS UP an
+   |          under-cover AND TRIMS an over-cover.
+   |
+   |  <=15:55 SECOND SWEEP at the real sweep_deadline (= submit_by -
+   |          dynamic margin; margin scales with book size — see
+   |          _compute_sweep_deadline). The SLEEP from ~15:51 to the
+   |          deadline is PUMPED with a periodic broker.get_positions
+   |          call so the ib_async connection stays alive during the
+   |          wait (round-4 fix — otherwise the loop would starve and
+   |          risk wedging the post-close poll). On a normal day the
+   |          second sweep issues ZERO orders — its value is
+   |          confirmation under the ACTUAL "book state we hand to
+   |          16:00": a fresh snapshot several minutes later has
+   |          caught up on any IB position-propagation lag, verifies
+   |          every prior MOC (dispatcher + first sweep) is still
+   |          live at the exchange, and re-fires for any residual
+   |          (cancel-race fills, late exchange rejections). This is
+   |          the GUARANTEE — residual / baseline positions and late
+   |          cancel-race fills still get flattened here. Skipped
+   |          entirely in --replay-submit mode where the wall clock
+   |          is unrelated to the historical replay date; the first
+   |          sweep is authoritative in replay.
    |
    |  15:50+ Coverage cross-check: independent per-symbol re-poll
    |          via broker.get_order_status to verify every expected
    |          held position had an MOC counter-order. Uncovered =>
-   |          rc=11.
+   |          rc=11 (pre-close early warning).
    |
    |  15:50+ MOC acceptance audit (bounded --moc-ack-timeout, default 60s):
    |          per-oid wait_for_fill for a terminal state. Any MOC
    |          reaching Cancelled/ApiCancelled/Inactive with filled=0
-   |          => REJECTED at exchange => rc=11.
+   |          => REJECTED at exchange => rc=11 (pre-close early
+   |          warning; NASDAQ's 15:55 cutoff was likely blown).
    |
    |  15:55  --submit-by  hard cutoff for the MOC EXIT batch
-   |          entries always fire; MOC batch legs past the cutoff
-   |          are skipped and logged (=> rc=11 mid-flow).
+   |          (NASDAQ MOC ENTRY cutoff — SEC 34-84454). Entries always
+   |          fire; MOC batch legs past the cutoff are skipped and
+   |          logged (=> rc=11 mid-flow).
    |
-   |  16:00  official close auction; MOC prints
-   |          fill audit polls broker.wait_for_fill,
-   |          writes live/logs/fills/YYYY-MM-DD.jsonl (best-effort,
-   |          not rc-gating).
+   |  16:00  official NASDAQ close cross; MOC prints.
+   |
+   | 16:00-16:05  POST-CLOSE POSITION POLL — the AUTHORITATIVE
+   |          exposure verdict. broker.get_positions() polled with
+   |          exponential backoff; a nonzero managed-universe symbol
+   |          at 16:05 (OR every poll failing) => rc=11. Replaces
+   |          inference with a real position check.
+   |
+   |  16:05+ Fill audit polls broker.wait_for_fill, writes
+   |          live/logs/fills/YYYY-MM-DD.jsonl (best-effort, not
+   |          rc-gating).
 ```
 
 ### Safety guarantees
@@ -562,28 +626,106 @@ than the one before it. Do not skip:
   quantity is derived from `broker.get_positions()` AFTER the entry
   fills settle, NEVER from `target - current` or the entry's requested
   quantity. A partial MKT fill therefore cannot cause an over-flatten
-  into an opposite overnight exposure. Enforced by `_submit_moc_flatten`
-  not accepting any target-side argument in its signature.
-- **Ground-truth coverage cross-check.** After the MOC batch, an
+  into an opposite overnight exposure. Enforced by both
+  `_submit_single_moc` and `_sweep_moc_deadline` not accepting any
+  target-side argument in their signatures; a compile-time regression
+  test (`test_fill_gated_dispatch_never_regresses_leg_2_sized_from_target`)
+  pins these signatures.
+- **Fill-gated dispatcher fires each MOC as soon as its entry lands.**
+  Concurrent from the operator's perspective (single-threaded fast
+  poll loop; ib_async is not thread-safe so we do NOT launch a
+  ThreadPoolExecutor). Total MOC-send latency is bounded by fill
+  latency, not `n * per_symbol_timeout`. Zero-fill entries get NO
+  MOC.
+- **Fill-gated staleness check (round-4).** IB emits execution
+  reports BEFORE it updates the position book. A reducing entry
+  against a nonzero baseline that filled between the dispatcher's
+  status read and its position snapshot would otherwise be
+  MOC-sized off the STALE PRE-fill position. The dispatcher
+  computes the deterministic expected post-fill position
+  (`baseline + signed_fill`) and, whenever the tick snapshot
+  disagrees, DEFERS the MOC to the sweep — which takes a fresh
+  snapshot several minutes later, well past any plausible
+  position-propagation lag.
+- **Deadline sweep is the GUARANTEE — TWO sweeps.**  Round-4
+  runs the sweep at TWO points: once IMMEDIATELY after the
+  dispatcher (~15:51) and once at the real deadline
+  `submit_by - sweep_margin` (~15:54:42 for 49 names). The first
+  gives the operator EARLY exposure detection (pre-close signals
+  fire in time to run `panic` before 16:00); the second is
+  belt-and-braces after the ib_async position book has fully
+  caught up on any propagation lag and after any late exchange
+  rejections have flipped the affected MOCs to terminal
+  Cancelled. Both sweeps cancel any still-non-terminal entry,
+  verify each prior MOC (dispatcher + first sweep) is still live
+  at the exchange, take a fresh `get_positions`, and issue MOCs
+  for every managed-universe symbol whose signed residual is
+  nonzero (TWO-SIDED — TOPS UP an under-cover, TRIMS an
+  over-cover). Between the sweeps, `_sleep_until(sweep_deadline)`
+  is PUMPED with a periodic `broker.get_positions()` call so the
+  ib_async connection stays alive during the wait. Sweep margin
+  scales with book size — 15s floor at 49 names, ~121s at 500
+  names. On a normal day the second sweep issues zero orders. In
+  `--replay-submit` mode the second-sweep wall-clock sleep is
+  skipped (the wall clock is unrelated to the historical replay
+  date) but the second sweep itself still runs immediately so
+  the code path is exercised end-to-end.
+- **Ground-truth coverage cross-check.** After the MOC batches, an
   independent per-symbol check re-polls each entry's true fill via
   `broker.get_order_status`, computes `expected_held + moc_signed`,
-  and any symbol with non-zero remainder escalates to rc=11. Closes
-  partial `get_positions()` snapshots, budget-exhausted fill-waits
-  where the poll-derived `filled_qty=0` hides real fills, and
-  TWS event-stream brownouts where `get_order_status` returns stale
-  non-terminal reads (all treated as pessimistic full fill).
+  and any symbol with non-zero remainder escalates to rc=11 (early
+  warning). Closes partial `get_positions()` snapshots, stale
+  non-terminal reads, and slow-TWS budget exhaustion.
 - **MOC exchange-acceptance audit.** TWS's `placeOrder` returns the
   oid synchronously BEFORE any exchange ack. An MOC submitted past
-  the ~15:50 exchange cutoff is API-accepted then Cancelled at the
-  exchange. `_audit_moc_acceptance` waits up to `--moc-ack-timeout`
-  seconds per-oid for terminal state; any MOC reaching
-  `Cancelled` / `ApiCancelled` / `Inactive` with `filled=0`
-  escalates to rc=11.
+  NASDAQ's 15:55 exchange entry cutoff is API-accepted then
+  Cancelled at the exchange. `_audit_moc_acceptance` waits up to
+  `--moc-ack-timeout` seconds per-oid for terminal state; any MOC
+  reaching `Cancelled` / `ApiCancelled` / `Inactive` with `filled=0`
+  escalates to rc=11 (pre-close early warning).
+- **Post-close position poll (16:00-16:05) is the AUTHORITATIVE
+  exposure verdict.** After the auction has printed, poll
+  `broker.get_positions()` with exponential backoff until the
+  managed-universe subset is flat or 16:05 elapses. A nonzero
+  position at 16:05 → rc=11. Every poll failing → pessimistic
+  rc=11 (cannot verify flat = cannot claim flat). This replaces
+  inference as the definitive signal; the pre-close signals above
+  are EARLY warnings that short-circuit to rc=11 immediately so
+  the operator has time to run panic before 16:00.
+  Three round-2 safety bounds keep this from silently declaring
+  FLAT early: a **not-before** lower bound (default `16:00 +
+  DEFAULT_POST_CLOSE_POLL_SETTLE_SECS`; the poll refuses to return
+  FLAT before this), a **min-consecutive-flat-reads** counter
+  (default 2; a single transient empty response is not
+  authoritative), and a **max-window** clamp
+  (`POST_CLOSE_POLL_MAX_WINDOW_MINS = 15`; a misconfigured
+  `DEFAULT_POST_CLOSE_POLL_UNTIL_TIME` cannot make the poll spin
+  for hours). Also applies to `--replay-submit` runs — any run
+  that actually reached the broker gets the same post-auction
+  verification. Round-3 adds two more:
+  * If the process reaches the poll BEFORE `not_before` on a
+    live/paper run, it **sleeps until `not_before`** rather than
+    starting a poll that would fail-closed on stale reads. The
+    poll deadline is then clamped to leave room for
+    `min_consecutive_flat_reads` reads.
+  * If the process reaches the poll on a `--replay-submit`
+    rehearsal BEFORE `not_before`, the poll is **SKIPPED with a
+    WARNING** — a historical replay's fills are queued for
+    today's 16:00 close (not the replay date's), so the poll
+    cannot verify by definition. The operator must manually run
+    `python -m live.panic --paper` to flatten the paper account
+    before the next real session; rc=0 is preserved iff
+    pre-close signals were clean.
+  * The entire post-close block is wrapped in `try/except`.
+    Any raise there (a config parse error, an unexpected schema
+    issue) is treated as pessimistic EXPOSED (rc=11) — cannot
+    verify equals cannot claim flat.
 - The per-leg MOC submit re-checks the wall clock against
   `--submit-by` before each order — legs that would land past the
-  cutoff are skipped, not silently rejected by TWS. Replay mode
-  neutralises this cutoff (the wall clock is unrelated to the
-  historical date).
+  cutoff are skipped, not silently rejected by TWS. Replay HONOURS
+  this cutoff by default; pass `--replay-ignore-cutoff` to
+  neutralise it for an afternoon rehearsal (the wall clock is
+  unrelated to the historical date, but the paper orders are real).
 - Broker-connect failures (live-port guard tripping, TWS down, bad
   client_id) return rc=8 rather than a bare traceback. No orders were
   placed at that point.
@@ -612,8 +754,9 @@ or a clean shutdown. Wire the pager to page on `rc >= 11` and to log
   `--on-feed-failure` for a feed-*start* exception — strictly safer.
 - `3` — MVO solver returned a non-optimal status.
 - `4` — clock is past `--submit-by` at the moment the orchestrator was
-  about to submit; nothing was placed. Never fires in replay mode.
-  Distinct from rc=11 — rc=4 is a SAFE PRE-ORDER SKIP.
+  about to submit; nothing was placed. Also fires in replay mode with
+  `--replay-submit` unless `--replay-ignore-cutoff` is passed. Distinct
+  from rc=11 — rc=4 is a SAFE PRE-ORDER SKIP.
 - `5` — target book was empty and `--dry-run` was not set. The broker
   was not contacted.
 - `6` — `--replay-date` + `--live` was requested. Refused. No broker
@@ -625,16 +768,37 @@ or a clean shutdown. Wire the pager to page on `rc >= 11` and to log
   port, or a `--broker-client-id` collision.
 - `9` — `--lambda- <= 0` (invalid argument). No broker contact. Below
   the pager threshold — this is a validation failure, not an exposure.
-- `11` — **OVERNIGHT EXPOSURE POSSIBLE — page the operator.** Entries
-  filled but the MOC exit could not fully cover the book. Fires on any
-  of: MOC legs skipped past `--submit-by` mid-flow, `get_positions`
-  raised during the MOC snapshot, the snapshot came back stale-empty
-  after fills, the coverage cross-check found uncovered symbols
-  (partial snapshot / budget-exhausted-with-real-fill / TWS-brownout
-  stale non-terminal `get_order_status`), or the MOC acceptance audit
-  found exchange rejections (MOC placed after ~15:50 cutoff). The
-  ERROR log line includes the concrete panic command and the
-  uncovered / rejected symbols to name.
+- `11` — **OVERNIGHT EXPOSURE POSSIBLE — page the operator.** Fires
+  on any of two independent classes of signal:
+  * **Pre-close (EARLY warning, before 16:00)** — page immediately
+    so the operator has time to run `panic` before the auction.
+    Fires on: MOC legs skipped past `--submit-by` mid-flow (from
+    either the fill-gated dispatcher's per-tick cutoff refusal OR
+    the sweep's own past-cutoff refusal), `get_positions` raised
+    during the MOC batch, the snapshot came back stale-empty after
+    fills, the coverage cross-check found uncovered symbols
+    (partial snapshot / stale non-terminal `get_order_status`),
+    the MOC acceptance audit found exchange rejections (MOC placed
+    after NASDAQ's 15:55 cutoff), the sweep's belt-and-braces
+    cancel step failed for an entry (round-2 addition — an entry
+    we could not pull is by definition an uncontrolled position
+    source, may still fill mid-window into an unhedged overnight
+    position), OR the fill-gated dispatcher's per-symbol MOC
+    submission raised at the broker (round-4 addition — a
+    `broker.buy`/`sell` exception may leave the request in an
+    indeterminate state at TWS; a bare "assume nothing happened"
+    would defer to the sweep and risk a double-flatten. The list
+    lands in `fill_gated_submit_errors` and appears in the ERROR
+    log line as `Fill-gated submission errors: ...`). The ERROR
+    log line is tagged `OVERNIGHT EXPOSURE (pre-close)` and lists
+    cancel-failed entries in `cancel_failed_symbols`.
+  * **Post-close (AUTHORITATIVE, 16:00-16:05)** — polls
+    `broker.get_positions()` with backoff; a nonzero managed-
+    universe position at 16:05 OR every poll failing pessimistically
+    → rc=11. Tag: `OVERNIGHT EXPOSURE (post-close)`. This is the
+    definitive verdict — no inference; a real position check.
+  Either safeguard alone returns rc=11. Both are load-bearing;
+  either running silently on a real exposure would drop the page.
 
 ### Execution model — two-leg
 
@@ -648,13 +812,11 @@ Execution is two batches, in strict sequence, per name in the target book:
 **LEG 1 — MKT entries.** For each name where
 `diff = target_shares - current_shares != 0`, `broker.buy(sym, qty,
 order_type="MKT")` / `broker.sell(sym, qty, order_type="MKT")`
-submits a plain market order at the broker default `tif="DAY"`. The
-bounded per-order fill-wait (default 5s per order, capped by a global
-deadline tied to `--submit-by - 30s`) gathers terminal states. Any
-entry still non-terminal at the wait's end gets an explicit
-`broker.cancel(oid)` — this is the sole mechanism preventing a stuck
-entry from lingering past the MOC snapshot and causing a late naked
-fill.
+submits a plain market order at the broker default `tif="DAY"`.
+Fires unconditionally at 15:50-15:51 — MKT entries are the ONLY
+lateness the strategy is sensitive to (the signal decays through
+the 15:50-16:00 window), so any delay to the sweep or acceptance
+audit does NOT delay the entry batch.
 
 *Why plain MKT and not a slippage-capped LMT?* Earlier designs tried
 an IOC LMT capped at a `max-slippage-bps` from the entry mid, then a
@@ -666,67 +828,149 @@ price. Plain MKT gives the book the best chance of being filled and,
 therefore, of being hedged by the MOC leg. Slippage on the entry is
 priced into the impact and cost terms of the QP objective.
 
-**LEG 2 — MOC counter-flatten.** `broker.get_positions()` is called
-FRESH after the entry batch settles. For every managed-universe symbol
-with a non-zero net position, a per-symbol MOC is submitted in the
-OPPOSITE direction sized to `abs(current_qty)`. Out-of-universe
-positions are ignored (never touched).
+**LEG 2 — per-symbol FILL-GATED MOC + DEADLINE SWEEP.**
 
-**The core safety invariant.** The MOC exit quantity is drawn from the
-freshly snapshotted position book, NEVER from `target - current` or
+Two stages, both sized off `broker.get_positions()` (never target-side
+data). Together they guarantee every managed-universe symbol with a
+nonzero position at 15:55 has an MOC away, AND that no symbol whose
+entry never landed picks up a naked MOC.
+
+*Fill-gated dispatcher.* A single-threaded fast-polling loop iterates
+every entry once per tick (default 0.25s). Each tick READS ORDER
+STATUS FIRST (fast, local ib_async cache), then — if any entry is
+newly terminal-Filled — takes a FRESH `broker.get_positions()`
+snapshot (whose internal 0.5s sleep gives IB time to propagate the
+position update AFTER the fill event; round-3 fix for the
+snapshot-before-status race). Each newly-terminal entry's
+opposite-side MOC is submitted IMMEDIATELY, sized off the
+freshly-taken snapshot. If `filled == 0` (Cancelled / Inactive /
+Filled-zero), NO MOC is submitted from this path — this is the
+operator's stated goal: "prevent the accidental MOC exit without
+ever having entered." The loop is concurrent from the operator's
+perspective (each symbol's MOC fires as soon as its own entry
+lands, not after all N entries) without spawning threads
+(ib_async is not thread-safe).
+
+*Deadline sweep.* At `submit_by - sweep_margin` (margin scales with
+book size — see `_compute_sweep_deadline`; 15s floor at 49 names,
+~121s at 500 names), any entry still non-terminal is cancelled, a
+fresh `get_positions` is taken, and MOCs are submitted for every
+symbol whose net "held after entry fills + dispatcher MOC coverage"
+is nonzero. The sweep is TWO-SIDED (round-3 fix): it iterates the
+UNION of "symbols currently held" AND "symbols the dispatcher
+already MOC'd", so a symbol that is FLAT NOW but has a dispatcher
+MOC still queued (over-covered because the dispatcher's snapshot
+lagged the fill) gets a TRIM MOC in the opposite direction —
+restoring the invariant `held + Σ signed_MOC == 0`. Rejected
+dispatcher MOCs (terminal Cancelled with `filled=0`) have their
+coverage credit dropped so the sweep can resubmit while the 15:55
+window is still open.
+
+This is the GUARANTEE for the failure modes the dispatcher alone
+cannot cover:
+
+- A **residual/baseline position** carried in from a prior day (its
+  symbol may not have an entry today at all — the dispatcher's
+  fill-triggered path never fires for it).
+- A symbol whose entry submitted successfully but arrived
+  non-terminal at the sweep deadline (dispatcher gave up, sweep
+  cancels the entry then flattens whatever position landed).
+- A **reducing entry against a nonzero baseline** where IB's
+  position update lags the fill event. Dispatcher's stale snapshot
+  over-sizes the MOC → sweep sees the true post-fill position (0)
+  and covered_qty (-X), computes residual (-X), sends BUY MOC X as
+  the trim so the net MOC across both legs = 0. (Round-3 fix for
+  the SAFETY reviewer's critical finding.)
+- A **dispatcher MOC that got rejected at the exchange**
+  (short-sale restriction, margin, contract issue). The sweep
+  detects the terminal-not-Filled status, drops the coverage
+  credit, and resubmits a fresh MOC while the ~4 minutes to
+  15:55 remain. (Round-3 fix for the SAFETY reviewer's third
+  finding.)
+
+**The core safety invariant.** Both the dispatcher's per-symbol MOC
+send (`_submit_single_moc`) and the sweep's MOC batch
+(`_sweep_moc_deadline`) size their `qty` argument from a fresh
+`broker.get_positions()` snapshot, NEVER from `target - current` or
 from the entry's requested quantity. A partial MKT fill (say 50%)
-therefore produces a 50% MOC counter, and the book returns to zero.
+therefore produces a 50% MOC counter and the book returns to zero.
 A target-diff MOC would over-flatten a partial into an opposite
 overnight exposure — the exact bug this two-leg model exists to
-prevent. Structurally enforced: `_submit_moc_flatten`'s signature
-does not accept any target-side argument.
+prevent. Structurally enforced: neither `_submit_single_moc` nor
+`_sweep_moc_deadline` accepts any target-side argument in its
+signature; a regression test locks the signatures so a refactor
+that added one would fail at review.
 
 **Coverage cross-check.** After the MOC batch is submitted, an
 independent per-symbol check re-polls each entry's TRUE fill via
 `broker.get_order_status(oid)`, computes `expected_held =
 current_baseline + Σ signed_fills`, and any symbol with
 `expected_held + moc_signed_by_sym != 0` is flagged as uncovered →
-rc=11. This closes:
+rc=11. `moc_signed_by_sym` is built by AGGREGATING signed_qty
+across ALL MOC legs per symbol (round-3 fix — the dispatcher AND
+sweep can each emit a leg for the same symbol on the top-up
+path; a last-wins dict comprehension would drop the dispatcher
+leg and false-page the fix's own success case). MOC legs that
+are already visibly terminal-not-Filled at coverage-check time
+are EXCLUDED from the aggregation (round-3 fix — a rejected MOC
+covers nothing; counting it would under-count exposure).
+
+This closes:
 
 - **Partial `get_positions()` snapshots** — TWS reconnect returns
   3 of 10 held names; the missing 7 would ride unhedged.
-- **Wait-budget-exhausted** — `_wait_entry_fills` hits its global
-  deadline and marks `filled_qty=0` for the remainder, but the MKTs
-  may truly have filled at the exchange. The cross-check re-polls
-  ground-truth.
+- **Wait-budget-exhausted** — an entry status truncated by the
+  dispatcher's per-tick deadline marks `filled_qty=0` for the
+  remainder, but the MKTs may truly have filled at the exchange.
+  The cross-check re-polls ground-truth via `broker.get_order_status`.
 - **TWS event-stream brownout** — `get_order_status` returns
   successfully with a stale non-terminal status. The cross-check
   treats non-terminal-at-cross-check-time as a staleness signal and
   assumes pessimistic full fill (overcounting exposure > silently
   missing it).
+- **MOC rejections invisible to the acceptance audit** — the
+  round-3 exclusion of terminal-rejected MOCs from
+  `moc_signed_by_sym` means the coverage cross-check catches a
+  rejection even if the audit was misconfigured or the audit's
+  wait budget elapsed before the exchange got around to
+  Cancelling the MOC.
 
 **MOC exchange-acceptance audit.** `broker.buy`/`sell` returns the oid
 the moment TWS API-accepts `placeOrder` — BEFORE any exchange ack.
-An MOC submitted past the ~15:50 exchange entry cutoff (a not-uncommon
-outcome on a slow-TWS day where the MOC batch fires 15:50:20+) is
-API-accepted, an oid comes back, but the exchange REJECTS it and the
-order becomes terminal `Cancelled` with `filled=0` within seconds to
-a minute. `_audit_moc_acceptance` waits up to `--moc-ack-timeout`
-(default 60s) per-oid for a terminal state; any MOC reaching
-`Cancelled` / `ApiCancelled` / `Inactive` with `filled=0` is treated
-as REJECTED → rc=11. A `TimeoutError` (still `Submitted` at the
-deadline) is presumed accepted; MOCs sit `Submitted` until 16:00.
+An MOC submitted past NASDAQ's 15:55 MOC ENTRY cutoff (SEC release
+34-84454) is API-accepted, an oid comes back, but the exchange
+REJECTS it and the order becomes terminal `Cancelled` with `filled=0`
+within seconds to a minute. `_audit_moc_acceptance` waits up to
+`--moc-ack-timeout` (default 60s) per-oid for a terminal state; any
+MOC reaching `Cancelled` / `ApiCancelled` / `Inactive` with
+`filled=0` is treated as REJECTED → rc=11 (pre-close, early). A
+`TimeoutError` (still `Submitted` at the deadline) is presumed
+accepted; MOCs sit `Submitted` until 16:00.
 
-**Trade-off.** A stricter default would be to block on real fill
-confirmation until 16:00 (~8 minutes of wall-clock for a 15:52 run) —
-that catches an MOC that was accepted at ack then Cancelled minutes
-later. The 60s default trades that small residual for faster operator
-feedback. Late rejections beyond the window are caught next morning
-by `broker.reconcile_positions` at startup (the drift warning is
-loud). Widen `--moc-ack-timeout` on chronically slow venues.
+**Post-close position poll** (16:00-16:05) is the AUTHORITATIVE
+verdict — see the previous section. The audit above is an EARLY
+warning that fires before 16:00; the post-close poll is the
+definitive "did the book actually flatten" check that runs after
+the auction has printed.
+
+**Trade-off.** The pre-close audit + post-close poll combination is
+belt-and-braces. The audit catches most rejections in 10-60s so
+the operator can run `panic` before 16:00. The post-close poll
+catches anything the audit misses (a late rejection, a fill that
+did not zero the position, a symbol the audit didn't check).
+Widen `--moc-ack-timeout` on chronically slow venues; do NOT
+disable the post-close poll — it is the only signal that verifies
+the book is FLAT after the auction (rather than just verifying that
+MOCs were accepted).
 
 **Tail I/O is best-effort.** The rc=11 verdict is computed from all
 in-memory exposure signals (`moc_skipped`, `moc_positions_unknown`,
-`empty_snapshot_after_fills`, `uncovered_symbols`, `unfilled_moc_syms`)
-BEFORE any disk write. `_write_target_record` and the JSONL fill
-audit both run inside `try/except logger.exception(...)`. A disk-full
-raise on the amended target record does not propagate to `main()` and
-does not drop the exposure verdict from rc=11 to bare-exception rc=1.
+`empty_snapshot_after_fills`, `uncovered_symbols`, `unfilled_moc_syms`,
+`post_close_nonzero_symbols`, `post_close_poll_error`) BEFORE any
+disk write. `_write_target_record` and the JSONL fill audit both run
+inside `try/except logger.exception(...)`. A disk-full raise on the
+amended target record does not propagate to `main()` and does not
+drop the exposure verdict from rc=11 to bare-exception rc=1.
 
 ## 5. Timing gotchas
 
@@ -781,7 +1025,7 @@ A cron-style schedule that minimises live-imbalance airtime:
 - `--broad-universe-file BROAD_UNIVERSE_FILE` — broad-universe file
   used for the Databento historical scan. Default `universe.txt`.
 - `--active-universe-file ACTIVE_UNIVERSE_FILE` — active universe used
-  to align the saved vectors. Default `top_100_universe.txt`.
+  to align the saved vectors. Default `top_49_universe.txt`.
 - `--forecast-alpha FORECAST_ALPHA` — Lasso regularization strength for
   the forecast fit. Default 1e-4.
 - `--dry-run` — print the plan (windows, symbol counts, artifact paths)
@@ -1003,9 +1247,10 @@ and lists the uncovered / MOC-rejected symbols. Standard remediation:
 
 Common causes and where to look:
 
-- **MOC exchange rejection** — MOC batch fired 15:50:20+ or later,
-  past the exchange entry cutoff. Grep `MOC rejected at exchange` in
-  the log. Fix root cause by starting the run earlier (see section 5).
+- **MOC exchange rejection** — MOC batch fired past NASDAQ's 15:55:00
+  ET entry cutoff (SEC 34-84454, 2018 rule). Grep `MOC rejected at
+  exchange` in the log. Fix root cause by starting the run earlier
+  (see section 5).
 - **Uncovered symbols from a partial `get_positions()` snapshot** —
   TWS event stream had a brownout during the MOC snapshot. Grep
   `COVERAGE GAP` / `uncovered_symbols` — the log names each missing
@@ -1124,10 +1369,17 @@ naturally.
 
 Two gotchas the script prints up-front:
 
-1. `--flatten-with MOC` after the exchange's ~15:50 ET entry cutoff:
-   the exchange typically rejects new MOC submissions past this cutoff
-   and `cancel_all()` cannot pull already-accepted MOC orders. A late
-   MOC panic may be a no-op.
+1. NASDAQ has TWO distinct MOC deadlines the script encodes separately:
+   the CANCEL/MODIFY cutoff at **15:50:00 ET** (`_past_moc_cancel_cutoff`
+   — past this, `cancel_all()` CANNOT pull already-accepted MOC
+   orders) and the ENTRY cutoff at **15:55:00 ET**
+   (`_past_moc_entry_cutoff` — SEC release 34-84454, 2018 rule change
+   that extended it from the old 15:50 — past this, new MOC
+   submissions are typically rejected). `--flatten-with MOC` after
+   15:55 may be a no-op; a BEFORE-snapshot MOC after 15:50 is
+   unpullable. NYSE keeps a 15:50 entry cutoff (different venue,
+   different rule); this kill switch routes to NASDAQ via
+   `ACTIVE_ROUTING`.
 2. `--flatten-with MKT` outside regular trading hours (weekday
    09:30–16:00 ET, holidays not modelled): MKT orders queue until the
    next open — they do NOT flatten immediately.
@@ -1147,8 +1399,8 @@ Behaviour:
 
 - `--flatten-with {MKT,MOC}` — order type for the flatten. Default
   `MKT`. MKT fills immediately during regular hours; MOC fills at the
-  16:00 auction (clean end-of-day flatten) but is subject to the
-  ~15:50 cutoff (see gotcha #1).
+  16:00 auction (clean end-of-day flatten) but is subject to NASDAQ's
+  15:55 entry cutoff (and 15:50 cancel/modify cutoff — see gotcha #1).
 - `--cancel-only` — cancel open orders but do NOT flatten positions.
 - `--dry-run` — connect, print the BEFORE snapshot, place nothing.
 - `--yes` — skip the interactive `PANIC` confirmation prompt
@@ -1203,10 +1455,10 @@ prompt is skippable with `--yes` for scripted use):
 - `1` — NOT FLAT / partial failure. Some combination of: lingering
   non-panic orders after `cancel_all`, per-leg flatten failures,
   positions still non-flat in the AFTER snapshot, MOC flatten
-  submitted past the ~15:50 cutoff (likely rejected), OR the AFTER
-  snapshot itself couldn't be taken because TWS went unreachable
-  ("COULD NOT CONFIRM FLAT"). Investigate the printed BEFORE / AFTER
-  snapshots.
+  submitted past NASDAQ's 15:55 entry cutoff (likely rejected), OR
+  the AFTER snapshot itself couldn't be taken because TWS went
+  unreachable ("COULD NOT CONFIRM FLAT"). Investigate the printed
+  BEFORE / AFTER snapshots.
 - `2` — operator declined the live `PANIC` prompt.
 - `8` — broker connect failed. TWS not running, wrong port, or a
   `--broker-client-id` collision.
@@ -1481,8 +1733,8 @@ Panic script (`test_panic.py`):
   — the AFTER snapshot excludes panic's own newly-placed flatten
   legs when counting "lingering" orders (H2).
 - `test_moc_flatten_past_cutoff_returns_nonzero`
-  — an MOC panic past the ~15:50 cutoff returns rc=1, not a false
-  clean rc=0.
+  — an MOC panic past NASDAQ's 15:55 entry cutoff returns rc=1, not
+  a false clean rc=0.
 - `test_after_snapshot_tws_dropout_marks_could_not_confirm`
   — a TWS dropout during the AFTER snapshot exits rc=1 with an
   explicit "COULD NOT CONFIRM FLAT" line; never falsely reports flat.
@@ -1542,16 +1794,16 @@ or clean shutdown.
 
 | rc   | Meaning                                                                            |
 | ---- | ---------------------------------------------------------------------------------- |
-| `0`  | MVO solved; two-leg batch completed (or dry-run / broker-free replay summary). Cross-check clean, MOC acceptance audit clean. |
+| `0`  | MVO solved; two-leg batch completed AND post-close position poll confirmed managed universe FLAT (or dry-run / broker-free replay summary). Applies to `--replay-submit` too — any run that reached the broker also runs the authoritative post-close verification. |
 | `2`  | Live feed / feature build failed (coverage assertion, `LiveFeed.start()` / `ReplayFeed.start()` exception, cold-cache replay without `--allow-fetch`). |
 | `3`  | MVO solver returned a non-optimal status.                                          |
-| `4`  | Wall clock past `--submit-by` at submit time; NOTHING placed. Never fires in replay. Safe skip. |
+| `4`  | Wall clock past `--submit-by` at submit time; NOTHING placed. Replay honours this by default (round-2 change) — pass `--replay-ignore-cutoff` to exercise the order path on a late replay. Safe skip. |
 | `5`  | Target book was empty and `--dry-run` was not set. Broker not contacted.           |
 | `6`  | `--replay-date` + `--live` was requested. Refused. No broker contact.              |
 | `7`  | `--replay-submit` was requested without `--replay-date`. No broker contact.        |
 | `8`  | Broker refused the connection (live-port guard, TWS down, `--broker-client-id` collision). |
 | `9`  | `--lambda- <= 0` (invalid argument). No broker contact.                             |
-| `11` | **OVERNIGHT EXPOSURE — page.** Entries filled but MOC exit did not fully cover: MOC legs skipped past cutoff, `get_positions` failed, stale-empty snapshot, cross-check found uncovered symbols (partial snapshot / budget-exhausted / TWS-brownout stale non-terminal), or MOC acceptance audit found exchange rejections. ERROR log names the concrete panic command and the uncovered / rejected symbols. |
+| `11` | **OVERNIGHT EXPOSURE — page.** Either (a) a pre-close signal fired an EARLY warning so the operator can run panic before 16:00 (MOC skipped, `get_positions` failed, stale-empty snapshot, cross-check found uncovered symbols, or acceptance audit found exchange rejections; tag: `OVERNIGHT EXPOSURE (pre-close)`), OR (b) the AUTHORITATIVE post-close position poll (16:00-16:05) found a nonzero managed-universe symbol still on the book, or every poll failed pessimistically (tag: `OVERNIGHT EXPOSURE (post-close)`). ERROR log names the concrete panic command and the offending symbols. |
 
 ### `live.retrain`
 

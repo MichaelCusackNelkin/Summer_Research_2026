@@ -132,7 +132,8 @@ def test_replay_submit_writes_replay_parquet(monkeypatch, tmp_path):
     argv = [
         "--replay-date", "2026-05-13", "--paper",
         "--vol-cap", "5000", "--replay-submit",
-        "--submit-by", "00:01", "--on-feed-failure", "abort",
+        "--submit-by", "00:01", "--replay-ignore-cutoff",
+        "--on-feed-failure", "abort",
     ]
     rc = daily_orchestrator.main(argv)
     assert rc == 0
@@ -716,7 +717,8 @@ def test_print_wait_secs_over_60_still_creates_recorder(monkeypatch, tmp_path):
     argv = [
         "--replay-date", "2026-05-13", "--paper",
         "--vol-cap", "5000", "--replay-submit",
-        "--submit-by", "00:01", "--on-feed-failure", "abort",
+        "--submit-by", "00:01", "--replay-ignore-cutoff",
+        "--on-feed-failure", "abort",
         "--print-wait-secs", "90",  # would crash with second=90
     ]
     rc = daily_orchestrator.main(argv)

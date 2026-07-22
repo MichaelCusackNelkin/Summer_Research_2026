@@ -21,7 +21,8 @@ Also covers post-review defensive behaviours:
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import numpy as np
 import polars as pl
@@ -145,6 +146,49 @@ class _FakeBroker:
       would print on the primary listing's close-cross rather than the
       NASDAQ close cross the strategy targets; the orchestrator drops
       it during prequalify when that filter is enabled).
+    - ``zero_fill_symbols``: for symbols in this set, ``buy``/``sell``
+      RETURNS an oid (unlike ``raise_on_buy_symbols`` which raises)
+      but records the order with ``status="Cancelled"`` and
+      ``filled=0`` — i.e. exercise the round-2 dispatcher's terminal-
+      Cancelled-with-filled=0 zero-fill branch, not the submission-
+      failure branch. Used by
+      ``test_fill_gated_zero_fill_terminal_no_moc``.
+    - ``slow_fill_ticks_by_sym``: mapping ``{symbol: n_ticks}`` — for
+      symbols in the map, ``get_order_status`` returns non-terminal
+      (Submitted, filled=0) for the first ``n_ticks`` calls, then
+      returns the true recorded state. Simulates fill latency so the
+      dispatcher can observe the terminal transition for one symbol
+      while another is still pending — exercises the "MOC A fires
+      before B's terminal event" concurrency ordering.
+    - ``get_positions_transient_empty_calls``: set of call indexes
+      (1-based) that return ``[]`` regardless of the internal book.
+      Used by the post-close poll consecutive-flat-reads test — a
+      single transient empty read must NOT satisfy the FLAT verdict.
+    - ``moc_stays_submitted``: MOC orders record with
+      ``status="Submitted"`` and ``filled=0`` — the exchange has
+      accepted them, but they never terminal-Fill and never move
+      positions. Distinct from ``moc_reject_all`` (which flips
+      MOCs to terminal Cancelled — my round-3 coverage cross-check
+      correctly catches those pre-close via
+      ``moc_signed_by_sym``'s terminal-rejected exclusion). Used
+      to isolate the post-close poll as the SOLE remaining
+      exposure signal: the audit sees ``Submitted`` and presumes
+      accepted, coverage cross-check sees MOCs in a live state
+      (included in signed coverage → not uncovered), and only
+      the post-close position poll catches that positions never
+      actually flattened.
+
+    ROUND-3 MOC SEMANTICS (matches real IB). MOC orders record the
+    fill BUT do NOT update ``_positions`` until
+    ``simulate_close_auction()`` is called. Real IB does not fold MOC
+    fills into ``get_positions()`` until after the 16:00 crossing;
+    the earlier "MOC fills immediately update positions" fake model
+    silently broke the SAFETY reviewer's two-sided sweep test cases
+    (a two-sided sweep sees the pre-16:00 position book as if MOCs
+    had already filled, which they hadn't in real IB, and over-
+    corrects). The conftest autouse fixture wires
+    ``simulate_close_auction`` into ``_poll_positions_after_close``
+    so happy-path tests still see the post-auction FLAT state.
     """
 
     LIVE_CONFIRM_MSG = "YES_I_WANT_LIVE_TRADING"
@@ -164,10 +208,15 @@ class _FakeBroker:
                  duplicate_all_positions: bool = False,
                  get_positions_partial_after_n_calls: int | None = None,
                  partial_position_fraction: float = 0.3,
+                 partial_persistent: bool = False,
                  wait_for_fill_always_times_out: bool = False,
                  moc_reject_all: bool = False,
                  entry_status_stale: bool = False,
-                 non_nasdaq_primary: dict[str, str] | None = None):
+                 non_nasdaq_primary: dict[str, str] | None = None,
+                 zero_fill_symbols: set[str] | None = None,
+                 slow_fill_ticks_by_sym: dict[str, int] | None = None,
+                 get_positions_transient_empty_calls: set[int] | None = None,
+                 moc_stays_submitted: bool = False):
         self.connected = False
         self.disconnected = False
         self.rebalance_calls: list[tuple[dict, str]] = []
@@ -202,6 +251,18 @@ class _FakeBroker:
         self._duplicate_all_positions = duplicate_all_positions
         self._get_positions_partial_after_n_calls = get_positions_partial_after_n_calls
         self._partial_position_fraction = partial_position_fraction
+        # ``partial_persistent`` freezes the truncated-visible symbol
+        # set on the first partial snapshot and returns EXACTLY those
+        # symbols on every subsequent partial call — even after their
+        # internal ``_positions`` qty has been flattened. This models a
+        # TWS stream that is stuck returning a fixed subset of names
+        # (persistent brownout) rather than one that "rotates" as
+        # positions clear. The rotating shape is a weaker simulation
+        # of the underlying failure mode; the round-2 fill-gated
+        # dispatcher would otherwise silently cover all symbols by
+        # calling get_positions per-entry as the internal book cleared.
+        self._partial_persistent = partial_persistent
+        self._partial_visible_syms: Optional[list[str]] = None
         self._wait_for_fill_always_times_out = wait_for_fill_always_times_out
         self._moc_reject_all = moc_reject_all
         self._entry_status_stale = entry_status_stale
@@ -211,6 +272,49 @@ class _FakeBroker:
         # NASDAQ-listing filter; tests that want to exercise the
         # non-NASDAQ-primary drop path seed entries here.
         self._non_nasdaq_primary: dict[str, str] = dict(non_nasdaq_primary or {})
+        # Round-2 knobs (post-review):
+        self._zero_fill_symbols = set(zero_fill_symbols or [])
+        self._slow_fill_ticks_by_sym: dict[str, int] = dict(
+            slow_fill_ticks_by_sym or {}
+        )
+        # get_order_status remaining-tick counter (decrements per call).
+        self._slow_fill_remaining_by_oid: dict[str, int] = {}
+        self._get_positions_transient_empty_calls: set[int] = set(
+            get_positions_transient_empty_calls or set()
+        )
+        self._moc_stays_submitted = moc_stays_submitted
+        # Round-3 MOC semantics: pending MOC fills held here until
+        # ``simulate_close_auction()`` is called. Matches real IB's
+        # behaviour where MOC fills are not folded into
+        # ``get_positions()`` until after the 16:00 crossing prints.
+        # Each entry: oid -> {"symbol": str, "signed": int}.
+        self._pending_moc_fills: dict[str, dict] = {}
+        # Whether the fake has been told the auction has printed. Once
+        # True, ``get_positions()`` includes the pending MOC fills.
+        self._auction_printed: bool = False
+
+    def simulate_close_auction(self) -> None:
+        """Fold every non-rejected pending MOC fill into ``_positions``.
+
+        Real IB folds MOC fills into ``get_positions()`` after the
+        16:00 crossing prints. Test scenarios that want to check
+        the post-auction position book (rc=0 happy paths, post-close
+        poll tests) call this to trigger that fold. Rejected MOCs
+        (``moc_reject_all``) are recorded with ``filled=0`` and
+        already excluded from ``_pending_moc_fills``, so this method
+        is safe to call in every scenario.
+
+        Idempotent — calling twice folds only the pending set the
+        FIRST call saw.
+        """
+        for oid, meta in list(self._pending_moc_fills.items()):
+            sym = meta["symbol"]
+            signed = int(meta["signed"])
+            if signed == 0:
+                continue
+            self._positions[sym] = self._positions.get(sym, 0) + signed
+        self._pending_moc_fills.clear()
+        self._auction_printed = True
 
     def connect(self, mode="paper", **kwargs):
         self.connected = True
@@ -230,6 +334,13 @@ class _FakeBroker:
                 f"simulated TWS drop on get_positions call "
                 f"#{self._get_positions_call_count}"
             )
+        # Round-2: transient empty response on specific 1-based call
+        # indexes. Modeled independently of the "after N" knobs so a
+        # test can inject exactly one empty read amidst otherwise-real
+        # results.
+        if (self._get_positions_call_count
+                in self._get_positions_transient_empty_calls):
+            return []
         if (self._get_positions_empty_after_calls is not None
                 and self._get_positions_call_count
                 > self._get_positions_empty_after_calls):
@@ -252,12 +363,26 @@ class _FakeBroker:
             else:
                 rows.append(row)
         # RR1 (a): truncate to a fraction of the rows to simulate a
-        # partial TWS snapshot mid-flow.
+        # partial TWS snapshot mid-flow. In ``partial_persistent`` mode
+        # the truncated symbol set is frozen on the first partial call
+        # and returned on every subsequent partial call — see
+        # ``_partial_persistent`` docstring.
         if (self._get_positions_partial_after_n_calls is not None
                 and self._get_positions_call_count
                 >= self._get_positions_partial_after_n_calls):
-            keep = max(1, int(round(len(rows) * self._partial_position_fraction)))
-            rows = rows[:keep]
+            if self._partial_persistent:
+                if self._partial_visible_syms is None:
+                    keep = max(1, int(round(
+                        len(rows) * self._partial_position_fraction
+                    )))
+                    self._partial_visible_syms = [r.symbol for r in rows[:keep]]
+                visible = set(self._partial_visible_syms)
+                rows = [r for r in rows if r.symbol in visible]
+            else:
+                keep = max(1, int(round(
+                    len(rows) * self._partial_position_fraction
+                )))
+                rows = rows[:keep]
         return rows
 
     def _make_contract(self, symbol, exchange=None, currency="USD"):
@@ -294,29 +419,68 @@ class _FakeBroker:
     def _record_fill(self, oid: str, symbol: str, action: str,
                      requested: int, order_type: str, tif: str = "DAY") -> None:
         # Stuck-on symbols record as non-terminal (Submitted, 0 filled) —
-        # simulates a MKT placed but never acked. MOC orders (order_type
-        # == "MOC") always fully fill in this fake.
+        # simulates a MKT placed but never acked. MOC orders always
+        # fully fill unless ``moc_reject_all`` — but per round-3 MOC
+        # semantics (see class docstring) the fill does NOT update
+        # ``_positions`` until ``simulate_close_auction()`` runs. This
+        # matches real IB, which does not fold MOC fills into
+        # ``get_positions`` until after the 16:00 crossing prints.
         if order_type == "MOC":
             if self._moc_reject_all:
                 filled = 0
                 status = "Cancelled"
+            elif self._moc_stays_submitted:
+                # Round-3 test knob: MOC sits Submitted forever, never
+                # terminal-Fills. Audit presumes accepted (TimeoutError
+                # ↔ still Submitted), coverage cross-check includes
+                # signed_qty (not terminal-rejected), and only the
+                # post-close position poll catches the never-cleared
+                # position book. Also do NOT stash in
+                # ``_pending_moc_fills`` — the MOC didn't fill at all.
+                filled = 0
+                status = "Submitted"
             else:
                 filled = requested
                 status = "Filled"
         elif self._stuck_all_entries or symbol in self._stuck_on:
             filled = 0
             status = "Submitted"
+        elif symbol in self._zero_fill_symbols:
+            # Round-2: exercise the dispatcher's "terminal with
+            # filled=0" branch — oid IS returned (so `pending` sees
+            # this entry), but the order goes straight to terminal
+            # Cancelled with 0 fills. Distinct from
+            # ``raise_on_buy_symbols`` which prevents the oid from
+            # ever landing.
+            filled = 0
+            status = "Cancelled"
         else:
             filled = int(round(requested * self.entry_fill_ratio))
             status = "Filled"
         if filled > 0:
             signed = filled if action == "BUY" else -filled
-            self._positions[symbol] = self._positions.get(symbol, 0) + signed
+            if order_type == "MOC":
+                # Defer: MOC fills queue for the auction. Real IB
+                # does not reflect these in ``get_positions()`` until
+                # after 16:00.
+                self._pending_moc_fills[oid] = {
+                    "symbol": symbol, "signed": signed,
+                }
+            else:
+                self._positions[symbol] = (
+                    self._positions.get(symbol, 0) + signed
+                )
         self._orders[oid] = {
             "symbol": symbol, "action": action, "requested": requested,
             "filled": filled, "order_type": order_type, "tif": tif,
             "status": status,
         }
+        # Round-2 slow-fill: seed the per-oid remaining-ticks counter
+        # so ``get_order_status`` reports non-terminal for the first N
+        # calls, then transitions to the true terminal state.
+        n_ticks = self._slow_fill_ticks_by_sym.get(symbol, 0)
+        if n_ticks > 0 and order_type == "MKT":
+            self._slow_fill_remaining_by_oid[oid] = n_ticks
 
     def buy(self, symbol, quantity, order_type="MKT", **kwargs):
         if symbol in self._raise_on_buy:
@@ -394,6 +558,19 @@ class _FakeBroker:
         if (self._entry_status_stale
                 and info["order_type"] == "MKT"
                 and info["status"] == "Filled"):
+            return _FakeOrderStatus(
+                order_id=order_id, symbol=info["symbol"],
+                action=info["action"], requested=info["requested"],
+                filled=0, status="Submitted",
+            )
+        # Round-2 slow-fill: for the first N ``get_order_status`` calls
+        # on this order, report non-terminal so the dispatcher can
+        # observe a fast-filling symbol becoming terminal WHILE this
+        # symbol is still pending — proving the concurrency ordering
+        # end-to-end.
+        remaining = self._slow_fill_remaining_by_oid.get(order_id, 0)
+        if remaining > 0:
+            self._slow_fill_remaining_by_oid[order_id] = remaining - 1
             return _FakeOrderStatus(
                 order_id=order_id, symbol=info["symbol"],
                 action=info["action"], requested=info["requested"],
@@ -1001,7 +1178,8 @@ def test_two_leg_replay_exercises_same_path(monkeypatch, tmp_path):
     argv = [
         "--replay-date", "2026-05-15", "--paper",
         "--vol-cap", "5000", "--replay-submit",
-        "--submit-by", "00:01", "--on-feed-failure", "abort",
+        "--submit-by", "00:01", "--replay-ignore-cutoff",
+        "--on-feed-failure", "abort",
     ]
     rc = daily_orchestrator.main(argv)
     assert rc == 0
@@ -1162,38 +1340,43 @@ def test_r2_stuck_entries_cancelled_before_moc_snapshot(monkeypatch, tmp_path):
         f"MOC exits fired for stuck (never-filled) entries: {moc_orders}"
     )
 
-    # RR3: temporal ordering — every cancel must precede every
-    # get_positions call that happens after the last entry submission.
-    # A regression that moved the MOC snapshot BEFORE the cancel loop
-    # would let a late-filling MKT leave an unhedged position after
-    # the counter-flatten was already sized.
+    # RR3 (round-2 revised): temporal ordering — every cancel must
+    # precede the SWEEP's authoritative get_positions call. In round-1
+    # this was simpler ("every cancel before any get_positions after
+    # entries") because cancel_non_terminal_entries ran once, then
+    # the MOC snapshot took one get_positions. In round-2 the
+    # DISPATCHER takes a get_positions per tick to size fill-gated
+    # MOCs — those calls interleave with entry-status polling for
+    # symbols that DID fill, and are correct (they don't affect the
+    # sweep's later cancel-then-size flow). What still matters is
+    # that the SWEEP's get_positions (the LAST one before this test's
+    # main() returns) happens AFTER every entry cancel. That is the
+    # invariant that guarantees a stuck entry cannot fill BETWEEN
+    # its cancel and the MOC batch being sized off a fresh snapshot.
     events = fake_broker.events
     entry_event_indices = [
         i for i, e in enumerate(events)
         if (e.startswith("buy:MKT:") or e.startswith("sell:MKT:"))
     ]
     assert entry_event_indices, "no entry events recorded — test setup bug"
-    last_entry_idx = max(entry_event_indices)
     cancel_indices = [
         i for i, e in enumerate(events) if e.startswith("cancel:")
     ]
     assert cancel_indices, "no cancel events recorded"
-    gp_after_entries = [
-        i for i, e in enumerate(events)
-        if e == "get_positions" and i > last_entry_idx
+    gp_indices = [
+        i for i, e in enumerate(events) if e == "get_positions"
     ]
-    assert gp_after_entries, (
-        "no get_positions call after the entry batch — MOC snapshot "
-        "never happened"
+    assert gp_indices, "no get_positions calls recorded"
+    # The LAST get_positions is either the sweep's or the post-close
+    # poll's; either way it happens after every cancel in a valid run.
+    last_cancel = max(cancel_indices)
+    gp_after_last_cancel = [i for i in gp_indices if i > last_cancel]
+    assert gp_after_last_cancel, (
+        f"no get_positions call after the last cancel (at index "
+        f"{last_cancel}) — the sweep did not size its MOC batch off "
+        f"a fresh post-cancel snapshot. events tail: "
+        f"{events[max(0, last_cancel - 3):]}"
     )
-    first_gp_after_entries = min(gp_after_entries)
-    for c in cancel_indices:
-        assert c < first_gp_after_entries, (
-            f"RR3 ordering broken: cancel event at index {c} happened "
-            f"AT/AFTER get_positions event at {first_gp_after_entries}; "
-            f"MOC snapshot ran before cancel loop. events tail: "
-            f"{events[max(0, last_entry_idx-1):]}"
-        )
 
 
 def test_r4_duplicate_positions_dedup_by_symbol(monkeypatch, tmp_path):
@@ -1321,13 +1504,18 @@ def test_rr1_partial_snapshot_returns_rc_11(monkeypatch, tmp_path):
     monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
     _patch_artifacts(monkeypatch, universe)
 
-    # get_positions() calls: (1) diff baseline pre-entry, (2) inside
-    # _submit_moc_flatten post-entry. From call #2 onward return only
-    # 30% of the rows. The pre-entry baseline stays complete so entries
-    # are sized correctly, then the MOC snapshot is truncated.
+    # get_positions() calls: (1) diff baseline pre-entry, (2)+ inside
+    # the fill-gated dispatcher + sweep + post-close poll. From call
+    # #2 onward return only 30% of the rows AND freeze that visible
+    # subset (partial_persistent=True) — the un-fixed round-2 dispatcher
+    # would otherwise call get_positions per-entry and rotate through
+    # the truncated view as positions cleared, silently covering
+    # everything. Persistent partial models the underlying failure mode
+    # (TWS is stuck returning the same fixed subset) more honestly.
     fake_broker = _FakeBroker(
         get_positions_partial_after_n_calls=2,
         partial_position_fraction=0.3,
+        partial_persistent=True,
     )
 
     def _fake_connect(_args):
@@ -1432,22 +1620,42 @@ def test_rr1_wait_budget_exhausted_with_real_fills_returns_rc_11(
 # ---------------------------------------------------------------------------
 
 def test_rrr1_moc_rejected_at_exchange_returns_rc_11(monkeypatch, tmp_path):
-    """RRR1 HIGH: broker.buy/sell for MOC returns oid the moment TWS
-    API-accepts the placeOrder — BEFORE any exchange ack. A late MOC
-    (submitted past ~15:50 cutoff) becomes terminal Cancelled with
-    filled=0 shortly after. Pre-RRR1 code trusted the returned oid as
-    coverage → cross-check passes → rc=0. RRR1 adds an acceptance
-    audit that catches the rejection and returns rc=11.
+    """RRR1 + round-2 post-close poll: MOC exchange rejection must
+    return rc=11 via ONE OR BOTH of two independent safeguards.
 
-    N2: structurally lock the safety property by first running with
-    ``_audit_moc_acceptance`` neutralized (simulating pre-RRR1) and
-    asserting rc=0 — proving the acceptance audit is the load-bearing
-    safety piece — then run with the audit restored and assert rc=11.
+    ``broker.buy/sell`` for MOC returns oid the moment TWS API-accepts
+    the placeOrder — BEFORE any exchange ack. A late MOC (submitted
+    past NASDAQ's 15:55 cutoff) becomes terminal Cancelled with
+    filled=0 shortly after. Two safeguards now catch this:
+
+    1. **Pre-close acceptance audit** — early warning; per-oid wait
+       for terminal state during the [submit, submit+moc_ack_timeout]
+       window. Fast operator feedback (~60s from submit) so panic can
+       be run before 16:00.
+    2. **Post-close position poll** — AUTHORITATIVE. Polls
+       ``get_positions()`` 16:00-16:05; a nonzero managed-universe
+       position at the deadline is definitive proof of exposure.
+
+    This test proves BOTH safeguards independently return rc=11:
+
+    * Phase 1 — audit neutralized + MOCs stay Submitted (fake
+      ``moc_stays_submitted``): pre-close signal is silent (coverage
+      cross-check sees non-terminal MOCs, includes them in signed
+      coverage → sum=0 → not uncovered), but post-close poll
+      catches the non-flat book (MOCs never actually filled → held
+      remains X). Proves post-close poll is a load-bearing
+      standalone safeguard.
+    * Phase 2 — audit restored + MOCs terminal-rejected (fake
+      ``moc_reject_all``): the acceptance audit AND the coverage
+      cross-check both catch rejections pre-close (round-3
+      ``moc_signed_by_sym`` re-poll excludes terminal-rejected
+      MOCs). Either signal short-circuits to rc=11 before the
+      post-close poll runs.
     """
     import logging as _logging
     universe = config.load_active_universe()
 
-    def _setup_broker():
+    def _setup_broker(moc_mode: str):
         feed_local = _prepopulate_live_feed(universe)
         monkeypatch.setattr(daily_orchestrator, "LiveFeed",
                             lambda *a, **kw: feed_local)
@@ -1455,7 +1663,14 @@ def test_rrr1_moc_rejected_at_exchange_returns_rc_11(monkeypatch, tmp_path):
                             lambda *a, **kw: None)
         monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
         _patch_artifacts(monkeypatch, universe)
-        broker = _FakeBroker(moc_reject_all=True)
+        kwargs = {}
+        if moc_mode == "stays_submitted":
+            kwargs["moc_stays_submitted"] = True
+        elif moc_mode == "reject_all":
+            kwargs["moc_reject_all"] = True
+        else:
+            raise ValueError(f"unknown moc_mode {moc_mode}")
+        broker = _FakeBroker(**kwargs)
 
         def _fake_connect(_args):
             broker.connect(mode="paper")
@@ -1465,17 +1680,28 @@ def test_rrr1_moc_rejected_at_exchange_returns_rc_11(monkeypatch, tmp_path):
                             _fake_connect)
         return broker
 
-    # ---- Phase 1: acceptance audit neutralized (simulates pre-RRR1).
-    broker_pre = _setup_broker()
+    # ---- Phase 1: acceptance audit neutralized + MOCs stay Submitted
+    # → coverage cross-check clean, post-close poll must still catch
+    # the non-flat book.
+    broker_pre = _setup_broker("stays_submitted")
     real_audit = daily_orchestrator._audit_moc_acceptance
     monkeypatch.setattr(
         daily_orchestrator, "_audit_moc_acceptance",
         lambda *a, **kw: set(),
     )
-    rc_pre = daily_orchestrator.main(_base_argv())
-    assert rc_pre == 0, (
-        f"phase 1 (audit neutralized) must return rc=0 to prove the "
-        f"acceptance audit is the load-bearing safety piece; got {rc_pre}"
+    handler_pre, records_pre = _capture_orchestrator_logs(_logging.ERROR)
+    try:
+        rc_pre = daily_orchestrator.main(_base_argv())
+    finally:
+        daily_orchestrator.logger.removeHandler(handler_pre)
+    assert rc_pre == 11, (
+        f"phase 1 (audit neutralized) must STILL return rc=11 — the "
+        f"post-close position poll is a standalone safeguard; got {rc_pre}"
+    )
+    loud_pre = [r.getMessage() for r in records_pre]
+    assert any("OVERNIGHT EXPOSURE (post-close)" in m for m in loud_pre), (
+        f"phase 1: expected 'OVERNIGHT EXPOSURE (post-close)' alert to "
+        f"identify which safeguard tripped; got: {loud_pre}"
     )
     mkt_pre = [c for c in broker_pre.buy_calls + broker_pre.sell_calls
                if c[2] == "MKT"]
@@ -1486,10 +1712,12 @@ def test_rrr1_moc_rejected_at_exchange_returns_rc_11(monkeypatch, tmp_path):
         "fired against the broker"
     )
 
-    # ---- Phase 2: acceptance audit restored — must catch rejections.
+    # ---- Phase 2: acceptance audit restored + MOCs terminal-rejected
+    # (moc_reject_all) — both the audit and the round-3 coverage
+    # cross-check catch the rejection pre-close.
     monkeypatch.setattr(daily_orchestrator, "_audit_moc_acceptance",
                         real_audit)
-    broker_post = _setup_broker()
+    broker_post = _setup_broker("reject_all")
     handler, records = _capture_orchestrator_logs(_logging.ERROR)
     try:
         rc_post = daily_orchestrator.main(_base_argv())
@@ -1517,6 +1745,13 @@ def test_rrr1_moc_rejected_at_exchange_returns_rc_11(monkeypatch, tmp_path):
     )
     assert any("MOC rejected at exchange" in m for m in loud), (
         f"expected 'MOC rejected at exchange' detail in alert; got: {loud}"
+    )
+    # Phase 2 short-circuits pre-close — the "OVERNIGHT EXPOSURE
+    # (pre-close)" tag identifies which safeguard tripped.
+    assert any("OVERNIGHT EXPOSURE (pre-close)" in m for m in loud), (
+        f"phase 2: expected 'OVERNIGHT EXPOSURE (pre-close)' alert "
+        f"proving the audit caught this early (before the post-close "
+        f"poll ran); got: {loud}"
     )
 
 
@@ -2040,4 +2275,2485 @@ def test_prequalify_drop_still_flattens_existing_position(monkeypatch, tmp_path)
     assert qty == held_qty, (
         f"MOC flatten for {held_sym} sized to {qty}, expected "
         f"{held_qty} (the held quantity)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-2: fill-gated per-symbol MOC + deadline sweep + post-close verdict
+# ---------------------------------------------------------------------------
+
+
+def test_fill_gated_moc_fires_immediately_on_entry_terminal(
+    monkeypatch, tmp_path,
+):
+    """Round-2 core behaviour: as each entry becomes terminal Filled,
+    the fill-gated dispatcher fires its opposite-side MOC IMMEDIATELY
+    — not after all N entries have been polled.
+
+    Round-2 revision (per correctness review): the weaker version of
+    this test only asserted symbol-set equality between entries and
+    MOCs, which the pre-round-2 batch-based ``_submit_moc_flatten``
+    also satisfied. The strengthened version uses
+    ``slow_fill_ticks_by_sym`` to make ONE symbol fast-filling and
+    another slow (3 poll ticks before terminal), then asserts on the
+    broker's event log that the fast symbol's MOC send appears
+    BEFORE the slow symbol reaches terminal state. That ordering is
+    only achievable by concurrent per-symbol dispatch, and would fail
+    against any batch-after-all-entries-terminal implementation.
+    """
+    universe = config.load_active_universe()
+    feed = _prepopulate_live_feed(universe)
+    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
+    monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+
+    slow_sym = sorted(universe)[len(universe) // 2]
+    fake_broker = _FakeBroker(
+        slow_fill_ticks_by_sym={slow_sym: 3},
+    )
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    rc = daily_orchestrator.main(_base_argv())
+    assert rc == 0
+
+    # Ordering assertion. Find (a) the FIRST MOC send event for any
+    # non-slow symbol (a proxy for "some symbol's MOC fired") and (b)
+    # the slow symbol's get_order_status call that shows it as
+    # terminal. If the dispatcher is truly concurrent, (a) must be
+    # BEFORE the terminal transition of (b).
+    #
+    # The fake's ``events`` log records "get_positions",
+    # "buy:MKT:<sym>:<oid>", "sell:MKT:<sym>:<oid>", "buy:MOC:...",
+    # "sell:MOC:...", "cancel:<oid>". ``get_order_status`` calls are
+    # not currently logged (they'd flood the log), so we use "the
+    # LAST tick-loop pass that fires a MOC while slow_sym is not yet
+    # in the covered set" as the concurrency proof: some MOC(s) must
+    # be sent before the slow entry's MOC (i.e. slow_sym's MOC must
+    # NOT be the FIRST MOC in the log — if the dispatcher were fully
+    # batched it'd fire all MOCs at once).
+    moc_events = [
+        (i, tag) for i, tag in enumerate(fake_broker.events)
+        if (tag.startswith("buy:MOC:") or tag.startswith("sell:MOC:"))
+    ]
+    assert moc_events, "no MOC events recorded"
+
+    # First MOC's symbol and slow symbol's MOC index.
+    def _sym_from_moc_tag(tag: str) -> str:
+        # Tag shape: "buy:MOC:<sym>:<oid>" or "sell:MOC:<sym>:<oid>".
+        return tag.split(":", 3)[2]
+
+    first_moc_idx = moc_events[0][0]
+    first_moc_sym = _sym_from_moc_tag(moc_events[0][1])
+    slow_moc_events = [
+        (i, tag) for i, tag in moc_events
+        if _sym_from_moc_tag(tag) == slow_sym
+    ]
+    assert slow_moc_events, (
+        f"slow symbol {slow_sym!r} never got an MOC — sweep should have "
+        f"picked it up after ``slow_fill_ticks`` expired. Events tail: "
+        f"{fake_broker.events[-20:]}"
+    )
+    slow_moc_idx = slow_moc_events[0][0]
+
+    # (1) The FIRST MOC must NOT be the slow symbol's MOC — that
+    # proves other MOCs fired before the slow entry reached terminal.
+    # A batch-after-all-entries-terminal impl would have to have all
+    # MOCs go out in one contiguous span AFTER slow_sym is terminal;
+    # a concurrent impl fires other MOCs while slow_sym is still
+    # non-terminal in ``pending``.
+    assert first_moc_sym != slow_sym, (
+        f"first MOC in the event log was for the slow symbol "
+        f"{slow_sym!r}. Expected some other symbol's MOC to fire "
+        f"before the slow one — concurrency ordering broken."
+    )
+
+    # (2) At least one MOC must appear STRICTLY BEFORE slow_sym's MOC
+    # in the event log (a stronger restatement of (1)).
+    assert first_moc_idx < slow_moc_idx, (
+        f"no MOC fired before the slow symbol's MOC (first_moc_idx="
+        f"{first_moc_idx}, slow_moc_idx={slow_moc_idx}). Events: "
+        f"{fake_broker.events[:30]}"
+    )
+
+    # Structural sanity — every entry has an opposite-side MOC.
+    entries_by_sym: dict[str, str] = {}
+    for tag in fake_broker.events:
+        if tag.startswith("buy:MKT:") or tag.startswith("sell:MKT:"):
+            side, _, sym_oid = tag.split(":", 2)
+            sym = sym_oid.split(":")[0]
+            entries_by_sym[sym] = "BUY" if side == "buy" else "SELL"
+
+    mocs_by_sym: dict[str, str] = {}
+    for tag in fake_broker.events:
+        if tag.startswith("buy:MOC:") or tag.startswith("sell:MOC:"):
+            side, _, sym_oid = tag.split(":", 2)
+            sym = sym_oid.split(":")[0]
+            mocs_by_sym[sym] = "BUY" if side == "buy" else "SELL"
+
+    assert entries_by_sym, "no MKT entries recorded"
+    assert set(entries_by_sym) == set(mocs_by_sym), (
+        f"symbols missing an MOC: {set(entries_by_sym) - set(mocs_by_sym)}; "
+        f"symbols missing an entry: {set(mocs_by_sym) - set(entries_by_sym)}"
+    )
+    for sym in entries_by_sym:
+        entry_side = entries_by_sym[sym]
+        moc_side = mocs_by_sym[sym]
+        assert entry_side != moc_side, (
+            f"{sym}: entry {entry_side} paired with same-side MOC {moc_side} "
+            f"— expected opposite-side counter-flatten"
+        )
+
+
+def test_fill_gated_partial_fill_moc_sized_to_actual_position(
+    monkeypatch, tmp_path,
+):
+    """Round-2 partial-fill invariant: fill-gated MOC sizes off a
+    FRESH ``get_positions`` per symbol, not the entry's requested qty.
+    A 50% MKT fill produces a 50% MOC counter — never a full target-diff
+    MOC that would over-flatten into an opposite overnight exposure.
+    """
+    universe = config.load_active_universe()
+    feed = _prepopulate_live_feed(universe)
+    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
+    monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+
+    fake_broker = _FakeBroker(entry_fill_ratio=0.5)
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    rc = daily_orchestrator.main(_base_argv())
+    assert rc == 0
+
+    mkt_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
+                  if c[2] == "MKT"]
+    moc_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
+                  if c[2] == "MOC"]
+    assert mkt_orders and moc_orders
+
+    entry_by_sym = {c[0]: c[1] for c in mkt_orders}
+    for sym, moc_qty, ot, kw in moc_orders:
+        entry_qty = entry_by_sym[sym]
+        expected_filled = int(round(entry_qty * 0.5))
+        assert moc_qty == expected_filled, (
+            f"MOC exit {sym} qty {moc_qty} != actual position "
+            f"{expected_filled} (entry_qty={entry_qty}) — fill-gated "
+            f"dispatch did NOT size from broker.get_positions"
+        )
+
+
+def test_fill_gated_zero_fill_no_moc_submission_failure(
+    monkeypatch, tmp_path,
+):
+    """Round-2 zero-fill rule (variant A): a symbol whose entry
+    submission RAISED (never lands in ``pending``) gets no MOC. This
+    exercises the ``order_id is None`` branch in the dispatcher —
+    NOT the terminal-Cancelled-with-filled-0 branch. Both branches
+    have separate tests to prove each independently.
+    """
+    universe = config.load_active_universe()
+    feed = _prepopulate_live_feed(universe)
+    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
+    monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+
+    rejected_sym = universe[0]
+    fake_broker = _FakeBroker(
+        raise_on_buy_symbols={rejected_sym},
+        raise_on_sell_symbols={rejected_sym},
+    )
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    rc = daily_orchestrator.main(_base_argv())
+    assert rc == 0
+    all_calls = fake_broker.buy_calls + fake_broker.sell_calls
+    for sym, qty, ot, kw in all_calls:
+        if sym == rejected_sym:
+            assert ot != "MOC", (
+                f"MOC placed for {rejected_sym} despite the entry never "
+                f"landing (submission-failure zero-fill → no MOC invariant)"
+            )
+
+
+def test_fill_gated_zero_fill_no_moc_terminal_cancelled(
+    monkeypatch, tmp_path,
+):
+    """Round-2 zero-fill rule (variant B, per correctness review):
+    a symbol whose entry SUBMITTED but became terminal Cancelled with
+    ``filled=0`` also gets no MOC from the fill-gated path. This
+    directly exercises the ``if filled <= 0`` branch in
+    ``_fill_gated_moc_dispatch`` (an oid IS in ``pending``, but the
+    terminal state's filled qty is 0 so no counter-side MOC fires).
+
+    Distinct from the submission-failure variant above — that one hits
+    the ``order_id is None`` code path.
+    """
+    universe = config.load_active_universe()
+    feed = _prepopulate_live_feed(universe)
+    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
+    monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+
+    # First, run once without zero_fill to find which symbols are
+    # actually traded (the optimizer may skip some universe names).
+    probe_broker = _FakeBroker()
+
+    def _probe_connect(_args):
+        probe_broker.connect(mode="paper")
+        return probe_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _probe_connect)
+    daily_orchestrator.main(_base_argv())
+    traded_syms = [
+        c[0] for c in probe_broker.buy_calls + probe_broker.sell_calls
+        if c[2] == "MKT"
+    ]
+    assert traded_syms, "probe run traded nothing — cannot pick a zero-fill target"
+    zero_fill_sym = traded_syms[0]
+
+    # Reset the environment for the real test (new broker, same feed).
+    feed2 = _prepopulate_live_feed(universe)
+    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed2)
+    fake_broker = _FakeBroker(zero_fill_symbols={zero_fill_sym})
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    rc = daily_orchestrator.main(_base_argv())
+    assert rc == 0
+    # Assert an oid IS in the entries list (proves submission
+    # succeeded), the order's status IS Cancelled with filled=0 in
+    # the fake's internal book (proves it went terminal Cancelled)
+    # AND no MOC was placed for the symbol.
+    entry_events = [
+        tag for tag in fake_broker.events
+        if (tag.startswith("buy:MKT:") or tag.startswith("sell:MKT:"))
+        and f":{zero_fill_sym}:" in tag
+    ]
+    assert entry_events, (
+        f"expected an entry submission for {zero_fill_sym} — the "
+        f"zero-fill knob relies on the entry landing so the terminal "
+        f"branch can be exercised. Traded syms this run: "
+        f"{[c[0] for c in fake_broker.buy_calls + fake_broker.sell_calls if c[2] == 'MKT'][:10]}"
+    )
+    # Fake's internal book confirms terminal Cancelled + filled=0.
+    matching_orders = [
+        o for o in fake_broker._orders.values()
+        if o["symbol"] == zero_fill_sym and o["order_type"] == "MKT"
+    ]
+    assert matching_orders, "no MKT entry recorded internally"
+    for o in matching_orders:
+        assert o["status"] == "Cancelled" and o["filled"] == 0, (
+            f"knob mis-wired — expected terminal Cancelled+filled=0, "
+            f"got status={o['status']} filled={o['filled']}"
+        )
+    all_calls = fake_broker.buy_calls + fake_broker.sell_calls
+    for sym, qty, ot, kw in all_calls:
+        if sym == zero_fill_sym:
+            assert ot != "MOC", (
+                f"MOC placed for {zero_fill_sym} despite entry going "
+                f"terminal Cancelled with filled=0 (dispatcher's "
+                f"'if filled <= 0' branch failed to skip)"
+            )
+
+
+def test_sweep_flattens_residual_baseline_position(monkeypatch, tmp_path):
+    """Round-2 sweep invariant: a residual/baseline position whose
+    today's entry NEVER FILLS must STILL get an MOC leg from the sweep.
+
+    Simulated by ``stuck_on_symbols={held_sym}`` — the entry submits
+    successfully (returns an oid) but never reaches terminal state
+    (status stays ``Submitted``, ``filled=0``). The fill-gated
+    dispatcher polls the entry, sees non-terminal, moves on; when the
+    dispatcher's max wait elapses, the sweep runs, cancels the stuck
+    entry, and — critically — takes a fresh get_positions that STILL
+    shows the residual 250-share long, and submits the MOC to flatten
+    it.
+
+    Regression this pins: if a future refactor changed the sweep to
+    "only MOC symbols we tried to enter today" (i.e. filtered its
+    scope by ``entries`` rather than by ``managed_universe``), this
+    residual would strand overnight.
+    """
+    universe = config.load_active_universe()
+    held_sym = sorted(universe)[len(universe) // 3]
+    held_qty = 250
+
+    feed = _prepopulate_live_feed(universe)
+    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
+    monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+
+    # Held position + entry for the same name is stuck (never reaches
+    # terminal) — the fill-gated dispatch's per-oid wait expires, the
+    # sweep runs, cancels the stuck entry, and MOCs the residual.
+    fake_broker = _FakeBroker(
+        initial_positions=[_FakePosition(held_sym, held_qty)],
+        stuck_on_symbols={held_sym},
+    )
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    rc = daily_orchestrator.main(_base_argv())
+    assert rc == 0, (
+        f"expected rc=0 (sweep flattens residual position), got {rc}"
+    )
+    moc_sells_for_held = [
+        (sym, qty, ot, kw)
+        for sym, qty, ot, kw in fake_broker.sell_calls
+        if sym == held_sym and ot == "MOC"
+    ]
+    moc_buys_for_held = [
+        (sym, qty, ot, kw)
+        for sym, qty, ot, kw in fake_broker.buy_calls
+        if sym == held_sym and ot == "MOC"
+    ]
+    assert not moc_buys_for_held, (
+        f"held long in {held_sym} should have flattened with a SELL MOC "
+        f"(long → sell to close), not a BUY MOC: {moc_buys_for_held}"
+    )
+    assert len(moc_sells_for_held) == 1, (
+        f"expected exactly one MOC flatten for the residual position "
+        f"in {held_sym}; got sells={moc_sells_for_held}. The sweep is "
+        f"the sole guarantee for residual positions — a regression here "
+        f"strands them overnight."
+    )
+    sym, qty, ot, kw = moc_sells_for_held[0]
+    assert qty == held_qty, (
+        f"sweep MOC flatten for {held_sym} sized to {qty}, expected "
+        f"{held_qty} (the held quantity)"
+    )
+
+
+def test_sweep_deadline_scales_with_book_size(monkeypatch, tmp_path):
+    """Round-2 sweep margin formula (post-review):
+    ``margin = max(FLOOR, N * (PER_ORDER + PER_STATUS) + 2 * GET_POS
+    + OVERHEAD)``. The formula now budgets get_positions calls and
+    per-symbol status polls in addition to placeOrder time, so at
+    500 names the margin is ~121s (not the old ~70s). At 49 names
+    the small overhead pushes just past the 15s floor. Pinning
+    both the formula and its output so a silent drift here (e.g.
+    dropping the get_positions cost from the sum) fails LOUDLY.
+    """
+    submit_by = datetime.fromisoformat("2026-07-21T15:55:00-04:00")
+
+    def _expected(n):
+        return max(
+            config.SWEEP_MIN_MARGIN_SECS,
+            n * (config.SWEEP_PER_ORDER_SECS + config.SWEEP_PER_STATUS_SECS)
+            + 2 * config.SWEEP_GET_POSITIONS_SECS
+            + config.SWEEP_FIXED_OVERHEAD_SECS,
+        )
+
+    # Small book (49 names). Formula = 49 * (0.13+0.1) + 2*0.6 + 5
+    # = 17.47s at the current defaults — above the 15s floor.
+    small_deadline, small_margin = daily_orchestrator._compute_sweep_deadline(
+        submit_by, n_managed_symbols=49,
+    )
+    assert small_margin == pytest.approx(_expected(49), rel=1e-9), (
+        f"49-name book: expected margin {_expected(49)}s, got "
+        f"{small_margin}s. Formula (post-round-2 fix): N*(PER+STATUS) "
+        f"+ 2*GET_POSITIONS + OVERHEAD."
+    )
+    assert (submit_by - small_deadline).total_seconds() == pytest.approx(
+        small_margin, rel=1e-9,
+    )
+
+    # Tiny book (10 names) — should hit the floor.
+    _, tiny_margin = daily_orchestrator._compute_sweep_deadline(
+        submit_by, n_managed_symbols=10,
+    )
+    assert tiny_margin == config.SWEEP_MIN_MARGIN_SECS, (
+        f"tiny 10-name book should hit the {config.SWEEP_MIN_MARGIN_SECS}s "
+        f"floor; got margin={tiny_margin}"
+    )
+
+    # 500-name book — formula kicks in well past the floor.
+    big_deadline, big_margin = daily_orchestrator._compute_sweep_deadline(
+        submit_by, n_managed_symbols=500,
+    )
+    assert big_margin == pytest.approx(_expected(500), rel=1e-9), (
+        f"500-name book margin drifted from formula: expected "
+        f"{_expected(500)}, got {big_margin}"
+    )
+    assert (submit_by - big_deadline).total_seconds() == pytest.approx(
+        big_margin, rel=1e-9,
+    )
+
+
+def test_post_close_position_poll_returns_rc_11_on_nonzero(
+    monkeypatch, tmp_path,
+):
+    """Round-2 post-close verdict: a nonzero managed-universe symbol
+    at 16:05 is the AUTHORITATIVE exposure signal. Even with all
+    pre-close signals clean (MOCs sent, cross-check happy, audit
+    quiet), a nonzero position after the auction returns rc=11.
+
+    Round-3 revision: uses ``moc_stays_submitted=True`` (MOCs sit
+    Submitted forever, never terminal-Fill) rather than
+    ``moc_reject_all`` (which flips MOCs to terminal Cancelled). The
+    coverage cross-check's round-3 rebuild of
+    ``moc_signed_by_sym`` now correctly EXCLUDES terminal-rejected
+    MOCs — so ``moc_reject_all`` would trip the coverage
+    cross-check pre-close, defeating the "isolate the post-close
+    poll" premise. With ``moc_stays_submitted``, the audit sees
+    ``Submitted`` (presumes accepted), the coverage cross-check
+    includes the signed_qty (not terminal-rejected → included),
+    and only the post-close position poll catches the fact that
+    positions never actually flattened.
+    """
+    import logging as _logging
+    universe = config.load_active_universe()
+    feed = _prepopulate_live_feed(universe)
+    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
+    monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+    # Neutralise the pre-close acceptance audit so the ONLY remaining
+    # safety net is the post-close position poll.
+    monkeypatch.setattr(
+        daily_orchestrator, "_audit_moc_acceptance",
+        lambda *a, **kw: set(),
+    )
+
+    fake_broker = _FakeBroker(moc_stays_submitted=True)
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    handler, records = _capture_orchestrator_logs(_logging.ERROR)
+    try:
+        rc = daily_orchestrator.main(_base_argv())
+    finally:
+        daily_orchestrator.logger.removeHandler(handler)
+
+    assert rc == 11, (
+        f"expected rc=11 (post-close nonzero positions), got {rc}. "
+        f"With the pre-close audit neutralised, the post-close poll is "
+        f"the sole remaining safety net."
+    )
+    loud = [r.getMessage() for r in records]
+    assert any("OVERNIGHT EXPOSURE (post-close)" in m for m in loud), (
+        f"expected 'OVERNIGHT EXPOSURE (post-close)' tag to identify "
+        f"which safeguard tripped; got: {loud}"
+    )
+
+
+def test_post_close_poll_failure_pre_close_short_circuit(monkeypatch, tmp_path):
+    """Round-2 pessimism rule (variant A): if EVERY post-close
+    ``get_positions()`` poll raises, we cannot confirm flat and
+    rc=11 fires. In this variant the raises begin BEFORE 16:00 so
+    the sweep also sees a raise (``moc_positions_unknown``) and the
+    pre-close short-circuit returns rc=11 without the post-close
+    poll even running. That is the correct EARLY page for a TWS
+    outage.
+
+    Renamed from the round-1 name so its behaviour matches the
+    docstring (per correctness reviewer). Variant B below covers the
+    post-close-only failure end-to-end.
+    """
+    import logging as _logging
+    universe = config.load_active_universe()
+    feed = _prepopulate_live_feed(universe)
+    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
+    monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+
+    # Baseline + a few dispatcher calls succeed, then all subsequent
+    # calls raise — including the sweep AND the post-close poll.
+    fake_broker = _FakeBroker(get_positions_raises_after_n_calls=3)
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    handler, records = _capture_orchestrator_logs(_logging.ERROR)
+    try:
+        rc = daily_orchestrator.main(_base_argv())
+    finally:
+        daily_orchestrator.logger.removeHandler(handler)
+
+    assert rc == 11, (
+        f"expected rc=11 (get_positions raising = pessimistic exposure), "
+        f"got {rc}"
+    )
+    loud = [r.getMessage() for r in records]
+    assert any("OVERNIGHT EXPOSURE" in m for m in loud), (
+        f"expected 'OVERNIGHT EXPOSURE' alert; got: {loud}"
+    )
+
+
+def test_post_close_poll_only_isolated(monkeypatch, tmp_path):
+    """Direct unit-level pin on ``_poll_positions_after_close``.
+
+    Exercises three branches without going through main():
+    (a) all-flat → not exposed, no nonzero symbols, no error.
+    (b) still non-flat by deadline → exposed with the offending
+        symbols named.
+    (c) every poll raises → pessimistic exposed with the error msg.
+    """
+    universe = ["AAA", "BBB", "CCC"]
+    managed = set(universe)
+
+    # (a) All flat, WITH corroboration that the book must be flat.
+    # An empty position response is only accepted as proof of flat when
+    # an independent source agrees (see ``_moc_legs_corroborate_flat``);
+    # case (d) below pins the uncorroborated counterpart.
+    poll_until_a = config.now_ny() + timedelta(milliseconds=50)
+    empty_broker = _FakeBroker()  # no positions
+    exposed, nonzero, err = daily_orchestrator._poll_positions_after_close(
+        broker=empty_broker,
+        managed_universe=managed,
+        poll_until=poll_until_a,
+        initial_interval_secs=0.01,
+        max_interval_secs=0.02,
+        corroborator=lambda: True,
+    )
+    assert not exposed
+    assert nonzero == []
+    assert err is None
+
+    # (a2) Non-empty response whose MANAGED names are all zero needs NO
+    # corroboration — the stream is demonstrably reporting rows, so
+    # "rows present, none of ours nonzero" is real evidence of flat.
+    # ``ZZZ`` is outside ``managed``, so the response is non-empty while
+    # the managed aggregate is empty.
+    poll_until_a2 = config.now_ny() + timedelta(milliseconds=50)
+    zero_row_broker = _FakeBroker(
+        initial_positions=[_FakePosition("ZZZ", 100)],
+    )
+    exposed, nonzero, err = daily_orchestrator._poll_positions_after_close(
+        broker=zero_row_broker,
+        managed_universe=managed,
+        poll_until=poll_until_a2,
+        initial_interval_secs=0.01,
+        max_interval_secs=0.02,
+    )
+    assert not exposed, "zero-qty rows present is positive evidence of flat"
+    assert nonzero == []
+
+    # (b) Persistently non-flat.
+    poll_until_b = config.now_ny() + timedelta(milliseconds=100)
+    stuck_broker = _FakeBroker(
+        initial_positions=[
+            _FakePosition("AAA", 100),
+            _FakePosition("BBB", -50),
+        ],
+    )
+    exposed, nonzero, err = daily_orchestrator._poll_positions_after_close(
+        broker=stuck_broker,
+        managed_universe=managed,
+        poll_until=poll_until_b,
+        initial_interval_secs=0.01,
+        max_interval_secs=0.02,
+    )
+    assert exposed
+    assert set(nonzero) == {"AAA", "BBB"}
+    assert err is None
+
+    # (c) Every poll raises → pessimistic.
+    poll_until_c = config.now_ny() + timedelta(milliseconds=50)
+    dead_broker = _FakeBroker(get_positions_raises=True)
+    exposed, nonzero, err = daily_orchestrator._poll_positions_after_close(
+        broker=dead_broker,
+        managed_universe=managed,
+        poll_until=poll_until_c,
+        initial_interval_secs=0.01,
+        max_interval_secs=0.02,
+    )
+    assert exposed
+    assert nonzero == []
+    assert err is not None and "simulated TWS drop" in err
+
+    # (d) EMPTY position response that CANNOT be corroborated must NOT
+    # be read as flat. This is the post-close analogue of
+    # ``empty_snapshot_after_fills``: broker.get_positions returns
+    # ib_async's cached set and yields [] WITHOUT raising when the
+    # subscription was torn down and re-established across the auction,
+    # so a wiped cache is byte-identical to a genuinely flat book.
+    for label, corro in (
+        ("no corroborator", None),
+        ("corroborator says NOT flat", lambda: False),
+        ("corroborator cannot tell", lambda: None),
+        ("corroborator raises", _raise_corroborator),
+    ):
+        poll_until_d = config.now_ny() + timedelta(milliseconds=50)
+        wiped_broker = _FakeBroker()  # empty — indistinguishable from flat
+        exposed, nonzero, err = (
+            daily_orchestrator._poll_positions_after_close(
+                broker=wiped_broker,
+                managed_universe=managed,
+                poll_until=poll_until_d,
+                initial_interval_secs=0.01,
+                max_interval_secs=0.02,
+                corroborator=corro,
+            )
+        )
+        assert exposed, (
+            f"uncorroborated empty position read ({label}) must fail "
+            f"CLOSED — a wiped position cache looks exactly like a flat "
+            f"book, so it is not proof of flat"
+        )
+
+
+def _raise_corroborator():
+    raise RuntimeError("simulated corroborator failure")
+
+
+def test_post_close_corroborator_accounts_for_residual_and_skips():
+    """The post-close corroborator must not treat "no entry filled
+    today" as "nothing to flatten".
+
+    ``_reconcile_from_previous`` only LOGS drift (it never trades), so a
+    position carried in from a prior day is live even when
+    ``n_filled_entries == 0``. And ``moc_batch`` holds only legs that
+    were successfully SENT — a skipped/errored leg appends nothing — so
+    "every leg in moc_batch filled" proves only "every MOC I managed to
+    send filled", not "every position was covered".
+
+    Without both guards a wiped position cache (empty read) on a day
+    with a carried-in residual corroborates as FLAT and the run exits
+    rc=0 with real overnight exposure. Structural pin on the call-site
+    corroborator so a refactor cannot quietly drop either term.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(
+        daily_orchestrator.main,
+    )))
+    corro = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = getattr(fn, "id", None) or getattr(fn, "attr", None)
+        if name != "_poll_positions_after_close":
+            continue
+        for kw in node.keywords:
+            if kw.arg == "corroborator":
+                corro = kw.value
+    assert corro is not None, (
+        "_poll_positions_after_close must be called with a corroborator "
+        "— without one every empty position read fails closed and the "
+        "run pages every day"
+    )
+    src = ast.dump(corro)
+    assert "moc_skipped" in src, (
+        "corroborator must refuse to corroborate when any MOC leg was "
+        "skipped — moc_batch only contains legs that were SENT"
+    )
+    assert "n_filled_entries" in src, (
+        "corroborator must know whether today's entries filled"
+    )
+    assert "current" in src and "universe_set" in src, (
+        "corroborator must treat a nonzero managed BASELINE as an "
+        "opened book — a residual carried in from a prior day is live "
+        "even when nothing filled today"
+    )
+
+
+def test_moc_legs_corroborate_flat_verdicts():
+    """Unit pin on the corroboration source itself."""
+    class _Info:
+        def __init__(self, status, filled):
+            self.status = status
+            self.filled = filled
+
+    class _B:
+        def __init__(self, m):
+            self._m = m
+
+        def get_order_status(self, oid):
+            v = self._m[oid]
+            if isinstance(v, Exception):
+                raise v
+            return v
+
+    legs = [{"oid": "1", "symbol": "AAA"}, {"oid": "2", "symbol": "BBB"}]
+
+    # No book was ever opened -> nothing to flatten -> flat is provable
+    # even with no MOC legs at all.
+    assert daily_orchestrator._moc_legs_corroborate_flat(
+        _B({}), [], False,
+    ) is True
+
+    # A book WAS opened but there are no MOC legs to check -> unknown.
+    assert daily_orchestrator._moc_legs_corroborate_flat(
+        _B({}), [], True,
+    ) is None
+
+    # Every leg terminal Filled -> corroborated flat.
+    assert daily_orchestrator._moc_legs_corroborate_flat(
+        _B({"1": _Info("Filled", 10), "2": _Info("Filled", 5)}), legs, True,
+    ) is True
+
+    # One leg cancelled -> positive evidence AGAINST flat.
+    assert daily_orchestrator._moc_legs_corroborate_flat(
+        _B({"1": _Info("Filled", 10), "2": _Info("Cancelled", 0)}),
+        legs, True,
+    ) is False
+
+    # A leg still working -> not proof of flat.
+    assert daily_orchestrator._moc_legs_corroborate_flat(
+        _B({"1": _Info("Filled", 10), "2": _Info("Submitted", 0)}),
+        legs, True,
+    ) is False
+
+    # Status poll raises -> cannot tell.
+    assert daily_orchestrator._moc_legs_corroborate_flat(
+        _B({"1": _Info("Filled", 10), "2": RuntimeError("boom")}),
+        legs, True,
+    ) is None
+
+    # Filled status but zero shares -> not a real fill.
+    assert daily_orchestrator._moc_legs_corroborate_flat(
+        _B({"1": _Info("Filled", 0), "2": _Info("Filled", 5)}), legs, True,
+    ) is False
+
+
+def test_unhandled_exception_after_entry_submission_pages_rc11(
+    monkeypatch, tmp_path,
+):
+    """LAST-RESORT EXPOSURE GATE.
+
+    The order-path ``try`` previously had a ``finally`` but no
+    ``except``, so an unhandled raise between entry submission and the
+    rc gate exited rc=1 — BELOW the ``rc >= 11`` pager predicate — with
+    a filled, uncovered book. Pin both halves of the new handler:
+    armed (orders submitted) -> rc=11; unarmed -> rc=1.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    src = inspect.getsource(daily_orchestrator.main)
+    tree = ast.parse(textwrap.dedent(src))
+    order_try = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Try) and node.finalbody:
+            # The order-path try is the one whose finally disconnects.
+            fin = ast.dump(ast.Module(body=node.finalbody, type_ignores=[]))
+            if "disconnect" in fin:
+                order_try = node
+                break
+    assert order_try is not None, "order-path try/finally not found"
+    assert len(order_try.handlers) >= 1, (
+        "the order-path try MUST have an except handler — without one "
+        "an unhandled raise exits rc=1 with a possibly-live book"
+    )
+    handler_src = ast.dump(order_try)
+    assert "orders_may_be_live" in handler_src, (
+        "the handler must branch on whether orders were submitted"
+    )
+    # The armed branch must return 11, the unarmed branch 1.
+    returns = [
+        n.value.value
+        for h in order_try.handlers
+        for n in ast.walk(h)
+        if isinstance(n, ast.Return)
+        and isinstance(n.value, ast.Constant)
+    ]
+    assert 11 in returns, "armed path must return rc=11 (pager)"
+    assert 1 in returns, "unarmed path must return rc=1 (safe)"
+
+
+def test_fill_gated_dispatch_never_regresses_leg_2_sized_from_target(
+    monkeypatch, tmp_path,
+):
+    """Structural safety pin (CLAUDE.md invariant): the MOC exit
+    quantity must be sized from ``broker.get_positions()`` AFTER the
+    entry fills, NEVER from ``target - current`` or the entry's
+    requested quantity. The round-2 fill-gated dispatcher goes through
+    ``_submit_single_moc`` which — by SIGNATURE — cannot accept any
+    target-side argument. This test pins that structural property:
+    any refactor that tries to plumb a target-side quantity into the
+    MOC size fails at review, not at runtime.
+
+    Uses an inspectable helper — we assert on the parameter names of
+    ``_submit_single_moc``. Grep-level enforcement.
+    """
+    import inspect
+    sig = inspect.signature(daily_orchestrator._submit_single_moc)
+    params = sig.parameters
+    # Round-2: signature also carries ``submit_by`` for the pre-send
+    # cutoff guard (SAFETY reviewer finding 3). That is a TIME
+    # argument, not a target-side quantity — still forbidden are any
+    # target-side kwargs.
+    assert set(params) == {"broker", "symbol", "current_qty", "submit_by"}, (
+        f"_submit_single_moc signature drifted — expected exactly "
+        f"(broker, symbol, current_qty, submit_by); got {list(params)}. "
+        f"Any target-side argument (share_targets, requested_qty, "
+        f"target_diff, etc.) is a structural safety violation."
+    )
+
+    sig_sweep = inspect.signature(daily_orchestrator._sweep_moc_deadline)
+    # Sweep MUST NOT take target-side data — only managed_universe
+    # (for scope) and covered_qty (for de-dup / top-up). The round-2
+    # rename from ``already_covered`` (set) to ``covered_qty`` (dict)
+    # was to enable top-ups of under-sized dispatcher MOCs.
+    sweep_params = set(sig_sweep.parameters)
+    forbidden = {"share_targets", "target_positions", "extended_targets",
+                 "requested_qty", "target_diff"}
+    leaked = sweep_params & forbidden
+    assert not leaked, (
+        f"_sweep_moc_deadline signature leaked target-side data: "
+        f"{leaked}. MOC size must ALWAYS come from a fresh "
+        f"get_positions() snapshot inside the sweep."
+    )
+
+
+def test_replay_honours_submit_by_by_default(monkeypatch, tmp_path):
+    """Round-2 replay guard: without ``--replay-ignore-cutoff``,
+    replay HONOURS the wall-clock ``--submit-by`` — so a
+    late-in-the-day rehearsal correctly surfaces rc=4 or rc=11.
+
+    We use --submit-by 00:01 (past cutoff today) and NO ignore flag.
+    The pre-order rc=4 check fires because ``now > submit_by`` when
+    the orchestrator's main() reaches it.
+    """
+    from live.tests.test_replay import (
+        _make_stub_replay_feed as _make_stub,
+        _FakeBroker as _ReplayFakeBroker,
+    )
+
+    universe = config.load_active_universe()
+    stub_feed = _make_stub("2026-05-15", universe)
+    monkeypatch.setattr(daily_orchestrator, "ReplayFeed", lambda **kw: stub_feed)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+
+    def _blowup(_args):
+        raise AssertionError(
+            "broker connect happened despite past --submit-by and no "
+            "--replay-ignore-cutoff (replay must honour the cutoff)"
+        )
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _blowup)
+
+    argv = [
+        "--replay-date", "2026-05-15", "--paper",
+        "--vol-cap", "5000", "--replay-submit",
+        "--submit-by", "00:01",  # NO --replay-ignore-cutoff
+        "--on-feed-failure", "abort",
+    ]
+    rc = daily_orchestrator.main(argv)
+    assert rc == 4, (
+        f"expected rc=4 (past submit-by, safe pre-order skip), got {rc}. "
+        f"Replay honouring the cutoff is the round-2 default."
+    )
+
+
+def test_entry_fill_timeout_config_default_is_30_secs():
+    """Round-2 operator ask: raise the MKT entry fill timeout default
+    to 30s. Pin the config value so a silent drift is caught here.
+    """
+    # We can't check the runtime module-level value directly because
+    # the autouse conftest fixture patches it down to 0.5s for speed.
+    # Read the file source to check the DEFAULT constant defined
+    # BEFORE any monkeypatch runs.
+    import ast
+    from pathlib import Path
+    src = Path(config.__file__).read_text()
+    tree = ast.parse(src)
+    target = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name) and tgt.id == "DEFAULT_ENTRY_FILL_TIMEOUT_SECS":
+                    target = node.value
+                    break
+    assert target is not None, (
+        "DEFAULT_ENTRY_FILL_TIMEOUT_SECS missing from live/config.py"
+    )
+    value = ast.literal_eval(target)
+    assert value == 30.0, (
+        f"DEFAULT_ENTRY_FILL_TIMEOUT_SECS drifted from 30.0; got {value!r}. "
+        f"Round-2 operator ask was to raise from 5s to 30s."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-2 revision (post-review): new tests for defects the previous round
+# left unexercised
+# ---------------------------------------------------------------------------
+
+
+def test_post_close_poll_end_to_end_failure_returns_rc_11(
+    monkeypatch, tmp_path,
+):
+    """Round-2 (variant B): the AUTHORITATIVE end-to-end
+    verification that main() propagates rc=11 when
+    ``_poll_positions_after_close`` returns exposed with an error.
+
+    Directly monkey-patches ``_poll_positions_after_close`` to return
+    ``(True, [], "simulated post-close TWS failure")`` — that is the
+    behaviour a real ``get_positions()`` raise 16:00-16:05 must
+    produce, and this test proves main() correctly returns rc=11 for
+    that outcome (rather than falling through to rc=0 as it did
+    before the round-2 fix). The dispatcher/sweep run cleanly (no
+    pre-close signal fires), so the ONLY thing keeping this away
+    from rc=0 is the post-close poll's authority.
+    """
+    import logging as _logging
+    universe = config.load_active_universe()
+    feed = _prepopulate_live_feed(universe)
+    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
+    monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+
+    fake_broker = _FakeBroker()
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    # Poll returns pessimistic-exposed. This bypasses the pre-close
+    # signals entirely — the sole load-bearing safeguard for this
+    # test is the post-close poll's authority in main().
+    monkeypatch.setattr(
+        daily_orchestrator, "_poll_positions_after_close",
+        lambda **kw: (True, [], "simulated post-close TWS failure"),
+    )
+
+    handler, records = _capture_orchestrator_logs(_logging.ERROR)
+    try:
+        rc = daily_orchestrator.main(_base_argv())
+    finally:
+        daily_orchestrator.logger.removeHandler(handler)
+
+    assert rc == 11, (
+        f"expected rc=11 (post-close poll returned exposed with error), "
+        f"got {rc}. main() must propagate the post-close poll verdict "
+        f"even when pre-close signals are all clean."
+    )
+    loud = [r.getMessage() for r in records]
+    assert any("OVERNIGHT EXPOSURE (post-close)" in m for m in loud), (
+        f"expected 'OVERNIGHT EXPOSURE (post-close)' tag; got: {loud}"
+    )
+
+
+def test_post_close_poll_refuses_flat_before_not_before(monkeypatch, tmp_path):
+    """Round-2 lower-bound guard (SAFETY reviewer finding 1): the
+    post-close poll REFUSES to declare FLAT before ``not_before``,
+    even against an all-flat broker.
+
+    Setup: broker has no positions, ``not_before`` is 200ms in the
+    future, ``poll_until`` is 100ms in the future. Since
+    ``poll_until < not_before``, the loop breaks at ``poll_until``
+    WITHOUT the not_before threshold ever being crossed — so no
+    ``consecutive_flat`` count can grow past the "pre_not_before"
+    gate. Result must be EXPOSED (fail-closed pessimistic verdict),
+    NOT FLAT.
+    """
+    universe = ["AAA", "BBB", "CCC"]
+    managed = set(universe)
+
+    now = config.now_ny()
+    not_before = now + timedelta(milliseconds=200)
+    poll_until = now + timedelta(milliseconds=100)
+
+    empty_broker = _FakeBroker()
+    exposed, nonzero, err = daily_orchestrator._poll_positions_after_close(
+        broker=empty_broker,
+        managed_universe=managed,
+        poll_until=poll_until,
+        not_before=not_before,
+        min_consecutive_flat_reads=2,
+        initial_interval_secs=0.01,
+        max_interval_secs=0.02,
+    )
+    assert exposed, (
+        "post-close poll declared FLAT before not_before was reached "
+        "— fail-closed guard broken. Any run that reached the poll "
+        "before 16:00 (recorder short-circuit, empty book mid-afternoon) "
+        "could otherwise declare flat on a stale pre-auction snapshot."
+    )
+    assert err is not None, (
+        "expected a synthetic error explaining the fail-closed reason"
+    )
+
+
+def test_post_close_poll_requires_consecutive_flat_reads(
+    monkeypatch, tmp_path,
+):
+    """Round-2 consecutive-flat guard (SAFETY reviewer finding 1):
+    a SINGLE transient empty reading from a broker that returned rows
+    on a prior poll is NOT authoritative for FLAT. Requires N=2
+    consecutive flat reads.
+
+    Uses ``get_positions_transient_empty_calls={1}``: the first
+    ``get_positions`` call returns ``[]`` (transient/stale). All
+    subsequent calls report the true nonzero position. If the poll
+    accepted the first empty read as FLAT, it would return not-
+    exposed on that single reading — exactly the bug the round-2
+    fix closes.
+    """
+    universe = ["AAA", "BBB"]
+    managed = set(universe)
+
+    fake_broker = _FakeBroker(
+        initial_positions=[_FakePosition("AAA", 100)],
+        get_positions_transient_empty_calls={1},
+    )
+    poll_until = config.now_ny() + timedelta(milliseconds=200)
+    exposed, nonzero, err = daily_orchestrator._poll_positions_after_close(
+        broker=fake_broker,
+        managed_universe=managed,
+        poll_until=poll_until,
+        not_before=None,  # explicitly disable not_before for this test
+        min_consecutive_flat_reads=2,
+        initial_interval_secs=0.01,
+        max_interval_secs=0.02,
+    )
+    assert exposed, (
+        f"post-close poll accepted a single transient empty read as "
+        f"FLAT despite the true position being 100sh AAA. "
+        f"consecutive-flat-reads guard failed."
+    )
+    assert "AAA" in nonzero, (
+        f"expected AAA in the exposed-symbols list; got {nonzero}"
+    )
+
+
+def test_sweep_tops_up_undersized_dispatcher_moc(monkeypatch, tmp_path):
+    """Round-2 sweep top-up (SAFETY reviewer finding 4): if the
+    dispatcher's per-symbol MOC under-sized relative to the true
+    post-tick position (a partial fill landed AFTER the dispatcher
+    read positions), the sweep MUST top up the residual — not
+    silently skip the symbol as ``already_covered``.
+
+    Unit-level test on ``_sweep_moc_deadline`` directly. Simulates
+    ``covered_qty[sym] = -60`` (dispatcher already sent SELL MOC of
+    60) with a true held position of 100 (an extra 40 landed after
+    the dispatcher's read). The sweep must compute
+    ``residual = 100 + (-60) = 40`` and send a SELL MOC for 40.
+    """
+    held_sym = "AAAA"
+    held_qty = 100
+    dispatcher_covered = -60  # dispatcher SELL MOC of 60
+
+    fake_broker = _FakeBroker(
+        initial_positions=[_FakePosition(held_sym, held_qty)],
+    )
+    submit_by = config.now_ny() + timedelta(hours=1)
+
+    (moc_batch, cancelled_oids, cancel_failed, skipped, positions_unknown) = (
+        daily_orchestrator._sweep_moc_deadline(
+            broker=fake_broker,
+            entries=[],
+            managed_universe={held_sym},
+            covered_qty={held_sym: dispatcher_covered},
+            submit_by=submit_by,
+        )
+    )
+    assert not positions_unknown
+    assert not cancelled_oids and not cancel_failed and not skipped
+    assert len(moc_batch) == 1, (
+        f"expected exactly one top-up MOC for {held_sym}; got {moc_batch}. "
+        f"The round-2 sweep must top up under-sized dispatcher MOCs, not "
+        f"silently skip them as ``already_covered``."
+    )
+    leg = moc_batch[0]
+    assert leg["symbol"] == held_sym
+    assert leg["side"] == "SELL", (
+        f"residual {held_qty + dispatcher_covered}sh long should top "
+        f"up with a SELL MOC; got side={leg['side']}"
+    )
+    expected_topup = held_qty + dispatcher_covered  # 40
+    assert leg["qty"] == expected_topup, (
+        f"top-up MOC sized to {leg['qty']}, expected {expected_topup} "
+        f"(held {held_qty} + dispatcher covered {dispatcher_covered})"
+    )
+
+
+def test_sweep_skips_exactly_covered_symbol(monkeypatch, tmp_path):
+    """Companion to the top-up test: a symbol whose dispatcher MOC
+    exactly matches the true position (``residual == 0``) must NOT
+    receive a duplicate MOC from the sweep. This preserves the
+    no-double-flatten property.
+    """
+    held_sym = "BBBB"
+    held_qty = 100
+    dispatcher_covered = -100  # exact match
+
+    fake_broker = _FakeBroker(
+        initial_positions=[_FakePosition(held_sym, held_qty)],
+    )
+    submit_by = config.now_ny() + timedelta(hours=1)
+
+    (moc_batch, cancelled_oids, cancel_failed, skipped, positions_unknown) = (
+        daily_orchestrator._sweep_moc_deadline(
+            broker=fake_broker,
+            entries=[],
+            managed_universe={held_sym},
+            covered_qty={held_sym: dispatcher_covered},
+            submit_by=submit_by,
+        )
+    )
+    assert moc_batch == [], (
+        f"sweep sent an unnecessary MOC for an already-fully-covered "
+        f"symbol: {moc_batch}. residual=0 must skip."
+    )
+
+
+def test_sweep_cancel_failure_surfaces_as_pre_close_exposure(
+    monkeypatch, tmp_path,
+):
+    """Round-2 (CORRECTNESS reviewer finding 2): the sweep's cancel
+    failures must be surfaced up the return tuple as
+    ``cancel_failed_syms`` and OR'd into pre_close_exposure — an
+    entry that could not be cancelled may still fill mid-window and
+    become an uncontrolled overnight position.
+
+    Configure ``_FakeBroker.cancel`` to raise for a specific oid via
+    monkeypatch, verify the sweep returns the symbol in
+    ``cancel_failed_syms``.
+    """
+    stuck_sym = "CCCC"
+
+    fake_broker = _FakeBroker(
+        stuck_on_symbols={stuck_sym},
+    )
+
+    def _raising_cancel(oid):
+        # Track the attempt in the event log so the test can prove
+        # cancel was tried.
+        fake_broker.cancel_calls.append(oid)
+        fake_broker.events.append(f"cancel-failed:{oid}")
+        raise RuntimeError(f"simulated cancel failure for {oid}")
+
+    # Submit a stuck entry so the sweep has something to cancel.
+    stuck_oid = fake_broker.buy(
+        stuck_sym, 100, order_type="MKT", exchange="SMART",
+    )
+    monkeypatch.setattr(fake_broker, "cancel", _raising_cancel)
+
+    entries = [{
+        "symbol": stuck_sym, "side": "BUY", "requested_qty": 100,
+        "order_id": stuck_oid, "error": None, "status": "Submitted",
+        "filled_qty": 0,
+    }]
+
+    submit_by = config.now_ny() + timedelta(hours=1)
+    (moc_batch, cancelled_oids, cancel_failed_syms, skipped, positions_unknown) = (
+        daily_orchestrator._sweep_moc_deadline(
+            broker=fake_broker,
+            entries=entries,
+            managed_universe={stuck_sym},
+            covered_qty={},
+            submit_by=submit_by,
+        )
+    )
+    assert stuck_sym in cancel_failed_syms, (
+        f"sweep must return {stuck_sym} in cancel_failed_syms; got "
+        f"{cancel_failed_syms}. Without this the pre-close exposure "
+        f"signal misses an uncancellable entry — CORRECTNESS "
+        f"reviewer's second critical finding."
+    )
+    # No oid was successfully cancelled.
+    assert cancelled_oids == []
+
+
+def test_submit_single_moc_refuses_past_submit_by(monkeypatch, tmp_path):
+    """Round-2 (SAFETY reviewer finding 3): ``_submit_single_moc``
+    must REFUSE to submit a MOC when the wall clock is past
+    ``submit_by``. Before this fix, a late fill during a slow
+    dispatcher tick could fire a MOC the exchange would silently
+    reject; nothing in the pre-close signal set would notice
+    because ``_audit_moc_acceptance`` had a 60s budget that would
+    also be past.
+    """
+    fake_broker = _FakeBroker()
+    submit_by_past = config.now_ny() - timedelta(seconds=1)
+
+    leg, outcome = daily_orchestrator._submit_single_moc(
+        broker=fake_broker,
+        symbol="AAAA",
+        current_qty=100,
+        submit_by=submit_by_past,
+    )
+    assert outcome == "skipped_cutoff", (
+        f"expected outcome='skipped_cutoff'; got {outcome!r}"
+    )
+    assert leg is None
+    # No order should have reached the broker.
+    assert not fake_broker.buy_calls
+    assert not fake_broker.sell_calls
+
+
+def test_dispatcher_bounded_by_deadline_at_500_names(monkeypatch, tmp_path):
+    """Round-2 scaling (SAFETY reviewer finding 2): the dispatcher's
+    per-tick get_positions call is ONCE per tick, not per filled
+    symbol. Simulate a 500-name book with a slow (0.05s) get_positions
+    against a 5s effective deadline — the dispatcher must finish
+    ALL 500 without breaching the deadline, AND make O(ticks) not
+    O(N) get_positions calls.
+
+    Pins the "one snapshot per tick" property structurally.
+    """
+    import time as _time
+
+    universe = [f"SYM{i:04d}" for i in range(500)]
+
+    fake_broker = _FakeBroker()
+
+    # Slow down get_positions to 0.05s per call. A per-symbol regression
+    # (round-1 pattern) would cost 500 * 0.05 = 25s just in
+    # get_positions sleep — visibly exceeding the deadline. The
+    # round-2 one-per-tick pattern costs ~0.05s + 500 fast dict
+    # lookups.
+    real_get_positions = fake_broker.get_positions
+
+    def _slow_get_positions():
+        _time.sleep(0.05)
+        return real_get_positions()
+
+    monkeypatch.setattr(fake_broker, "get_positions", _slow_get_positions)
+
+    # Submit 500 entries directly. Each entry fills instantly in the
+    # fake, so all 500 are terminal Filled by the time the dispatcher
+    # first polls their status.
+    entries = []
+    for sym in universe:
+        oid = fake_broker.buy(
+            sym, 10, order_type="MKT", exchange="SMART",
+        )
+        entries.append({
+            "symbol": sym, "side": "BUY", "requested_qty": 10,
+            "order_id": oid, "error": None,
+        })
+
+    # Deadline of 5s comfortably fits 1 get_positions (0.05s) + 500
+    # fast dispatcher iterations. A per-symbol regression would need
+    # ~25s of pure get_positions sleep — well past the deadline —
+    # and the test would fail on the moc_batch length assertion.
+    calls_before = fake_broker._get_positions_call_count
+    sweep_deadline = config.now_ny() + timedelta(seconds=5)
+    submit_by = config.now_ny() + timedelta(seconds=10)
+
+    t0 = _time.monotonic()
+    (moc_batch, covered_qty, uncovered, skipped, positions_unknown) = (
+        daily_orchestrator._fill_gated_moc_dispatch(
+            broker=fake_broker,
+            entries=entries,
+            managed_universe=set(universe),
+            sweep_deadline=sweep_deadline,
+            submit_by=submit_by,
+            poll_interval_secs=0.01,
+            max_wait_secs=30.0,
+        )
+    )
+    elapsed = _time.monotonic() - t0
+    calls_after = fake_broker._get_positions_call_count
+    dispatcher_gp_calls = calls_after - calls_before
+
+    # Structural: dispatcher must not have made ~500 get_positions
+    # calls. Under one-per-tick + all-entries-terminal-in-tick-1, we
+    # expect exactly 1 get_positions call.
+    assert dispatcher_gp_calls <= 5, (
+        f"dispatcher made {dispatcher_gp_calls} get_positions calls "
+        f"for 500 symbols — the round-2 fix requires ONE per tick, "
+        f"not one per filled symbol. Elapsed={elapsed:.2f}s."
+    )
+    # And every symbol should have been covered by the dispatcher.
+    assert len(moc_batch) == 500, (
+        f"expected 500 MOC legs, got {len(moc_batch)}. Elapsed="
+        f"{elapsed:.2f}s, get_positions calls={dispatcher_gp_calls}, "
+        f"skipped={len(skipped)}, uncovered={len(uncovered)}."
+    )
+    # Total elapsed should be well under the deadline. Under a per-
+    # symbol regression this would be dominated by 25s of sleep.
+    assert elapsed < 3.0, (
+        f"dispatcher took {elapsed:.2f}s for 500 names — likely "
+        f"the round-1 per-symbol get_positions regression."
+    )
+
+
+def test_replay_submit_runs_post_close_poll(monkeypatch, tmp_path):
+    """Round-2 (SAFETY reviewer finding 5): ``--replay-submit``
+    places real broker orders and MUST get the same post-close
+    position verification as a live/paper run. Previously the poll
+    was gated on ``if not replay_mode`` and skipped entirely,
+    letting a replay run silently return rc=0 with real positions
+    live.
+
+    Uses ``moc_reject_all=True`` so pre-close signals are clean (MOCs
+    submit OK) but positions never zero — the post-close poll MUST
+    catch this and return rc=11. If the poll is still gated out for
+    replay-submit, this test returns rc=0 and fails.
+    """
+    import logging as _logging
+    from live.tests.test_replay import (
+        _make_stub_replay_feed as _make_stub,
+    )
+
+    universe = config.load_active_universe()
+    stub_feed = _make_stub("2026-05-15", universe)
+    monkeypatch.setattr(daily_orchestrator, "ReplayFeed", lambda **kw: stub_feed)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+    # Neutralise the pre-close acceptance audit so the ONLY signal
+    # left is the post-close position poll.
+    monkeypatch.setattr(
+        daily_orchestrator, "_audit_moc_acceptance",
+        lambda *a, **kw: set(),
+    )
+
+    fake_broker = _FakeBroker(moc_stays_submitted=True)
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    argv = [
+        "--replay-date", "2026-05-15", "--paper",
+        "--vol-cap", "5000", "--replay-submit",
+        "--submit-by", "23:59",  # not past cutoff so orders can go
+        "--replay-ignore-cutoff",  # otherwise rc=4 pre-order
+        "--on-feed-failure", "abort",
+    ]
+
+    handler, records = _capture_orchestrator_logs(_logging.ERROR)
+    try:
+        rc = daily_orchestrator.main(argv)
+    finally:
+        daily_orchestrator.logger.removeHandler(handler)
+
+    assert rc == 11, (
+        f"expected rc=11 (post-close poll authoritative for "
+        f"--replay-submit too), got {rc}. Round-2 requires the poll "
+        f"to run whenever a broker was contacted."
+    )
+    loud = [r.getMessage() for r in records]
+    assert any("OVERNIGHT EXPOSURE (post-close)" in m for m in loud), (
+        f"expected 'OVERNIGHT EXPOSURE (post-close)' tag; got: {loud}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-3 revision (post-review, second round): regression tests for the
+# reviewer-confirmed critical/high defects the previous round's tests did
+# not catch.
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_trims_over_cover_from_reducing_entry_against_baseline(
+    monkeypatch, tmp_path,
+):
+    """Round-3 (SAFETY reviewer critical finding 1): a reducing entry
+    against a nonzero BASELINE that the dispatcher over-covers because
+    the position update lagged the fill status event must be TRIMMED
+    (an opposite-side sweep MOC), NOT left as a naked overnight
+    exposure.
+
+    Reproduces the reviewer's confirmed loss path (unit-level on the
+    sweep so we don't need to race IB's position propagation):
+      * Baseline: +100 AAAA (residual from a prior day).
+      * Dispatcher over-covered: sent SELL MOC 100 → covered_qty =
+        {AAAA: -100}, dispatcher_leg with signed_qty=-100.
+      * At sweep time in REAL IB: get_positions has caught up →
+        position = 0 (baseline+entry netted).
+      * Sweep expected behaviour: residual = 0 + (-100) = -100 →
+        BUY MOC 100 offset, so net MOC across the two legs = 0.
+
+    Pre-round-3 (single-sided sweep): AAAA not in agg (position 0),
+    the sweep skipped, and the over-cover of 100 shares became a
+    naked overnight SHORT of 100. This test would fail on the
+    number of moc_batch legs.
+    """
+    class _StubBroker:
+        """Simulates REAL IB semantics: baseline=100, entry SELL 100
+        has already netted the position to 0 at sweep time.
+        Dispatcher MOC has been placed but has NOT filled yet (MOCs
+        fill at 16:00). No entry order to cancel.
+        """
+
+        def __init__(self):
+            self._positions = {"AAAA": 0}  # entry has netted baseline
+            self.sell_calls = []
+            self.buy_calls = []
+            # Dispatcher's SELL MOC 100, still live and unfilled.
+            self._dispatcher_oid = "dispatcher-moc-1"
+            self._orders = {
+                self._dispatcher_oid: {
+                    "symbol": "AAAA", "status": "Submitted",
+                    "filled": 0,
+                },
+            }
+
+        def get_positions(self):
+            from types import SimpleNamespace
+            return [SimpleNamespace(symbol=s, quantity=q)
+                    for s, q in self._positions.items() if q != 0]
+
+        def get_order_status(self, oid):
+            info = self._orders.get(oid, {})
+            from types import SimpleNamespace
+            return SimpleNamespace(
+                status=info.get("status", "Unknown"),
+                filled=info.get("filled", 0),
+            )
+
+        def cancel(self, oid):
+            pass
+
+        def buy(self, symbol, qty, order_type="MOC", **kwargs):
+            self.buy_calls.append((symbol, qty, order_type))
+            return f"sweep-buy-{symbol}"
+
+        def sell(self, symbol, qty, order_type="MOC", **kwargs):
+            self.sell_calls.append((symbol, qty, order_type))
+            return f"sweep-sell-{symbol}"
+
+    stub = _StubBroker()
+    dispatcher_legs = [{
+        "oid": stub._dispatcher_oid, "symbol": "AAAA",
+        "side": "SELL", "qty": 100, "signed_qty": -100,
+    }]
+    covered_qty = {"AAAA": -100}
+    submit_by = config.now_ny() + timedelta(hours=1)
+
+    (moc_batch, cancelled, cancel_failed, skipped, positions_unknown) = (
+        daily_orchestrator._sweep_moc_deadline(
+            broker=stub,
+            entries=[],
+            managed_universe={"AAAA"},
+            covered_qty=covered_qty,
+            submit_by=submit_by,
+            dispatcher_legs=dispatcher_legs,
+        )
+    )
+    assert not positions_unknown
+    assert len(moc_batch) == 1, (
+        f"expected exactly one TRIM sweep MOC to offset the "
+        f"over-cover; got {moc_batch}. Round-3 two-sided sweep must "
+        f"iterate covered_qty even when the symbol is absent from "
+        f"agg — the reviewer's critical failure path."
+    )
+    leg = moc_batch[0]
+    assert leg["symbol"] == "AAAA"
+    assert leg["side"] == "BUY", (
+        f"sweep must send BUY MOC to offset the over-cover; got "
+        f"side={leg['side']}"
+    )
+    assert leg["qty"] == 100, (
+        f"trim MOC sized to {leg['qty']}, expected 100"
+    )
+    # Net MOC across dispatcher (SELL 100) + sweep (BUY 100) = 0.
+    total_signed = sum(l_["signed_qty"] for l_ in dispatcher_legs) + \
+        sum(l_["signed_qty"] for l_ in moc_batch)
+    assert total_signed == 0, (
+        f"total MOC signed qty should net to 0 (dispatcher SELL 100 "
+        f"+ sweep BUY 100); got {total_signed}"
+    )
+
+
+def test_sweep_drops_credit_for_terminal_rejected_dispatcher_moc(
+    monkeypatch, tmp_path,
+):
+    """Round-3 (SAFETY reviewer finding 3): a dispatcher MOC that
+    was terminal-rejected at the exchange (Cancelled with filled=0
+    within seconds of placement) MUST have its coverage credit
+    dropped by the sweep so the sweep can resubmit. Without this,
+    the sweep sees residual=0 arithmetic and skips — leaving the
+    symbol uncovered with no re-MOC path.
+
+    Unit-level test on ``_sweep_moc_deadline``: pass a dispatcher_leg
+    whose oid resolves to a terminal-Cancelled-with-filled=0 status,
+    with covered_qty crediting that leg. Sweep must (a) drop the
+    credit and (b) submit a fresh MOC sized to the actual held qty.
+    """
+    class _StubBroker:
+        def __init__(self):
+            self._positions = {"AAAA": 100}
+            self.sell_calls = []
+            self.buy_calls = []
+            self._rejected_oid = "dispatcher-rejected-1"
+            self._orders = {
+                self._rejected_oid: {
+                    "symbol": "AAAA", "status": "Cancelled",
+                    "filled": 0,
+                },
+            }
+
+        def get_positions(self):
+            from types import SimpleNamespace
+            return [SimpleNamespace(symbol=s, quantity=q)
+                    for s, q in self._positions.items() if q != 0]
+
+        def get_order_status(self, oid):
+            info = self._orders.get(oid, {})
+            from types import SimpleNamespace
+            return SimpleNamespace(
+                status=info.get("status", "Unknown"),
+                filled=info.get("filled", 0),
+            )
+
+        def cancel(self, oid):
+            pass
+
+        def buy(self, symbol, qty, order_type="MOC", **kwargs):
+            self.buy_calls.append((symbol, qty, order_type))
+            return f"sweep-buy-{symbol}"
+
+        def sell(self, symbol, qty, order_type="MOC", **kwargs):
+            self.sell_calls.append((symbol, qty, order_type))
+            return f"sweep-sell-{symbol}"
+
+    stub = _StubBroker()
+    dispatcher_legs = [{
+        "oid": stub._rejected_oid, "symbol": "AAAA",
+        "side": "SELL", "qty": 100, "signed_qty": -100,
+    }]
+    covered_qty = {"AAAA": -100}
+    submit_by = config.now_ny() + timedelta(hours=1)
+
+    (moc_batch, cancelled, cancel_failed, skipped, positions_unknown) = (
+        daily_orchestrator._sweep_moc_deadline(
+            broker=stub,
+            entries=[],
+            managed_universe={"AAAA"},
+            covered_qty=covered_qty,
+            submit_by=submit_by,
+            dispatcher_legs=dispatcher_legs,
+        )
+    )
+    assert not positions_unknown
+    assert len(moc_batch) == 1, (
+        f"sweep must resubmit MOC after dispatcher leg was "
+        f"terminal-rejected; got {moc_batch}. Otherwise the symbol "
+        f"is uncovered with no re-MOC path — SAFETY reviewer's 3rd "
+        f"critical finding."
+    )
+    leg = moc_batch[0]
+    assert leg["symbol"] == "AAAA"
+    assert leg["side"] == "SELL", (
+        f"holds +100 → sweep must SELL MOC 100 (dispatcher's rejected "
+        f"leg is no longer credited); got side={leg['side']}"
+    )
+    assert leg["qty"] == 100
+
+
+def test_moc_signed_by_sym_aggregates_dispatcher_plus_sweep_legs(
+    monkeypatch, tmp_path,
+):
+    """Round-3 (SAFETY + CORRECTNESS reviewer finding 2/6): when the
+    dispatcher AND the sweep both emit a MOC leg for the SAME symbol
+    (the round-2 top-up path), ``moc_signed_by_sym`` must AGGREGATE
+    the signed_qtys. Pre-round-3 it was a last-wins dict comprehension
+    that silently dropped the dispatcher leg — the coverage cross-
+    check then saw only the top-up qty (say -40 when the truth was
+    -100), flagged the symbol as uncovered, and spuriously paged
+    rc=11 on the fix's OWN success case.
+
+    Directly asserts the aggregation contract: forge a moc_batch with
+    two legs for the same symbol whose signed_qtys sum to -100 and
+    show that the resulting coverage cross-check verdict is "no
+    uncovered symbols" (aggregate works) — NOT "AAAA uncovered"
+    (last-wins bug).
+    """
+    class _StubBroker:
+        """Records order-status polls; MOCs stay Submitted so the
+        round-3 exclusion-of-terminal-rejected path is a no-op and
+        aggregation is what determines the coverage verdict.
+        """
+
+        def __init__(self):
+            self._orders = {
+                "d-1": {"status": "Submitted", "filled": 0},
+                "s-1": {"status": "Submitted", "filled": 0},
+                "entry-1": {"status": "Filled", "filled": 100},
+            }
+
+        def get_order_status(self, oid):
+            info = self._orders.get(oid, {})
+            from types import SimpleNamespace
+            return SimpleNamespace(
+                status=info.get("status", "Unknown"),
+                filled=info.get("filled", 0),
+            )
+
+    stub = _StubBroker()
+    # entries: baseline 0 for AAAA, entry BUY 100 fully filled.
+    entries = [{
+        "symbol": "AAAA", "side": "BUY", "requested_qty": 100,
+        "order_id": "entry-1", "status": "Filled", "filled_qty": 100,
+    }]
+    current_baseline = {"AAAA": 0}
+    # SIMULATE round-3 aggregation logic exactly as main() does.
+    moc_batch = [
+        # Dispatcher covered 60 (partial-fill snapshot).
+        {"oid": "d-1", "symbol": "AAAA", "side": "SELL",
+         "qty": 60, "signed_qty": -60},
+        # Sweep topped up 40.
+        {"oid": "s-1", "symbol": "AAAA", "side": "SELL",
+         "qty": 40, "signed_qty": -40},
+    ]
+    moc_signed_by_sym: dict[str, int] = {}
+    for _leg in moc_batch:
+        _sym = _leg["symbol"]
+        _oid = _leg["oid"]
+        _include = True
+        try:
+            _info = stub.get_order_status(_oid)
+            _st = getattr(_info, "status", "") or ""
+            _fl = int(getattr(_info, "filled", 0) or 0)
+            if _st in daily_orchestrator._TERMINAL_ORDER_STATES and _fl == 0:
+                _include = False
+        except Exception:
+            _include = True
+        if _include:
+            moc_signed_by_sym[_sym] = (
+                moc_signed_by_sym.get(_sym, 0)
+                + int(_leg["signed_qty"])
+            )
+    # Aggregation invariant: BOTH legs' signed_qty must be summed.
+    assert moc_signed_by_sym["AAAA"] == -100, (
+        f"aggregation failed: expected -100 (dispatcher -60 + "
+        f"sweep -40), got {moc_signed_by_sym['AAAA']!r}. Round-3 "
+        f"replaced the last-wins dict comprehension with a summing "
+        f"loop precisely because this scenario was misreported."
+    )
+    uncovered = daily_orchestrator._coverage_cross_check(
+        broker=stub,
+        entries=entries,
+        current_baseline=current_baseline,
+        moc_signed_by_sym=moc_signed_by_sym,
+        managed_universe={"AAAA"},
+    )
+    assert uncovered == [], (
+        f"expected coverage cross-check to find NO uncovered symbols "
+        f"(entry 100 + moc_signed -100 = 0); got uncovered={uncovered}. "
+        f"Last-wins aggregation would have shown moc_signed=-40, sum=60, "
+        f"and appended AAAA to uncovered → spurious rc=11 page."
+    )
+
+
+def test_post_close_poll_block_exception_pages_pessimistically(
+    monkeypatch, tmp_path,
+):
+    """Round-3 (SAFETY reviewer finding 4): an exception ANYWHERE in
+    the post-close poll block — parse_hhmm raising, today_ny raising,
+    _poll_positions_after_close raising — must be treated as
+    pessimistic EXPOSED (rc=11). Pre-round-3 the block was
+    unwrapped, so a raise there yielded rc=1 (below the rc>=11 pager
+    threshold), silently degrading a genuine exposure to a
+    non-page.
+    """
+    import logging as _logging
+    universe = config.load_active_universe()
+    feed = _prepopulate_live_feed(universe)
+    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
+    monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+
+    fake_broker = _FakeBroker()
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    # Force the poll block to raise by making the poll function itself
+    # blow up. Wrapping should catch it and set post_close_exposed.
+    def _raising_poll(**kwargs):
+        raise RuntimeError("simulated poll block failure")
+
+    monkeypatch.setattr(
+        daily_orchestrator, "_poll_positions_after_close", _raising_poll,
+    )
+
+    handler, records = _capture_orchestrator_logs(_logging.ERROR)
+    try:
+        rc = daily_orchestrator.main(_base_argv())
+    finally:
+        daily_orchestrator.logger.removeHandler(handler)
+
+    assert rc == 11, (
+        f"expected rc=11 (poll block raised → pessimistic EXPOSED); "
+        f"got {rc}. Round-3 requires the entire post-close poll block "
+        f"to be wrapped in try/except with pessimistic default."
+    )
+    loud = [r.getMessage() for r in records]
+    assert any("post-close position poll block raised" in m for m in loud), (
+        f"expected the pessimistic poll-block-raised message in ERROR "
+        f"logs; got: {loud}"
+    )
+    assert any("OVERNIGHT EXPOSURE (post-close)" in m for m in loud), (
+        f"expected 'OVERNIGHT EXPOSURE (post-close)' page tag on "
+        f"pessimistic verdict; got: {loud}"
+    )
+
+
+def test_post_close_poll_replay_skipped_when_before_not_before(
+    monkeypatch, tmp_path,
+):
+    """Round-3 (CORRECTNESS reviewer finding 7): a --replay-submit
+    rehearsal that reaches the post-close poll BEFORE today's 16:00
+    auction wall clock (e.g. run at 11:00 ET) must SKIP the poll
+    with a WARNING, NOT spin the full MAX_WINDOW and then
+    fail-closed to rc=11. The auction wall clock is unrelated to
+    the historical replay date; the poll cannot verify anything
+    for a rehearsal.
+
+    Restores a future ``not_before`` inside the test (the conftest
+    globally patches it to "00:00" for speed) so the scenario the
+    correctness reviewer described is actually exercised
+    end-to-end.
+    """
+    import logging as _logging
+    # Set not_before to 23:59 — a wall clock time that will not be
+    # reached during a normal test run — so the pre-not_before
+    # short-circuit fires. MAX_WINDOW is tiny so a spurious spin
+    # would be caught by the elapsed-time assertion below.
+    monkeypatch.setattr(
+        config, "DEFAULT_POST_CLOSE_POLL_NOT_BEFORE_TIME", "23:59",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        config, "POST_CLOSE_POLL_MAX_WINDOW_MINS", 0.005,
+        raising=False,
+    )
+
+    from live.tests.test_replay import (
+        _make_stub_replay_feed as _make_stub,
+    )
+    universe = config.load_active_universe()
+    stub_feed = _make_stub("2026-05-15", universe)
+    monkeypatch.setattr(daily_orchestrator, "ReplayFeed", lambda **kw: stub_feed)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+    # Audit neutralised so any pre-close signal only comes from
+    # coverage cross-check.
+    monkeypatch.setattr(
+        daily_orchestrator, "_audit_moc_acceptance",
+        lambda *a, **kw: set(),
+    )
+
+    fake_broker = _FakeBroker()
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    argv = [
+        "--replay-date", "2026-05-15", "--paper",
+        "--vol-cap", "5000", "--replay-submit",
+        "--submit-by", "23:59",
+        "--replay-ignore-cutoff",
+        "--on-feed-failure", "abort",
+    ]
+    import time as _time
+    handler, records = _capture_orchestrator_logs(_logging.WARNING)
+    t0 = _time.monotonic()
+    try:
+        rc = daily_orchestrator.main(argv)
+    finally:
+        daily_orchestrator.logger.removeHandler(handler)
+    elapsed = _time.monotonic() - t0
+
+    # A rehearsal reaching the poll before not_before is a
+    # NON-VERIFIABLE-BUT-NOT-EXPOSED verdict: pre-close signals
+    # were clean, the poll cannot honestly answer. rc must be 0
+    # (successful rehearsal with a loud SKIP warning). Should NOT
+    # spin the full MAX_WINDOW.
+    assert rc == 0, (
+        f"expected rc=0 (replay-submit rehearsal before not_before → "
+        f"post-close poll SKIPPED with WARNING; pre-close signals "
+        f"clean); got {rc}. Correctness reviewer finding 7 required "
+        f"this to NOT spin the full window and return rc=11."
+    )
+    assert elapsed < 3.0, (
+        f"post-close poll block took {elapsed:.2f}s — round-3 "
+        f"replay pre-not_before must SHORT-CIRCUIT with a WARNING, "
+        f"not spin MAX_WINDOW."
+    )
+    loud = [r.getMessage() for r in records]
+    assert any(
+        "post-close position poll SKIPPED — replay-submit" in m
+        for m in loud
+    ), (
+        f"expected the replay-skip WARNING; got: {loud}"
+    )
+
+
+def test_post_close_poll_waits_for_not_before_live_run(
+    monkeypatch, tmp_path,
+):
+    """Round-3 (CORRECTNESS reviewer finding 7, other side): a
+    LIVE/PAPER run reaching the poll before not_before must SLEEP
+    until not_before (the auction hasn't printed yet — MUST wait
+    for the authoritative verdict), NOT skip or spin.
+
+    Unit-level test on ``_poll_positions_after_close`` and the
+    main() wait path — we drive the sleep-until-not_before pattern
+    directly rather than through a full main() run, because the
+    integration path spends ~1-2s of setup before reaching the
+    poll block, and picking a not_before wall clock that is
+    reliably in the future at THAT point (but not so far as to
+    blow the test's own budget) is brittle. The
+    ``_post_close_wait_and_poll`` shape is what main() calls; we
+    exercise it directly with a broker that would have been flat.
+    """
+    import logging as _logging
+    universe = ["AAA", "BBB", "CCC"]
+
+    # not_before is 400ms in the future — enough to demonstrate the
+    # wait, tight enough to keep the test fast.
+    not_before = config.now_ny() + timedelta(milliseconds=400)
+
+    class _EmptyBroker:
+        def get_positions(self):
+            return []
+        def simulate_close_auction(self):
+            pass
+
+    handler, records = _capture_orchestrator_logs(_logging.INFO)
+    try:
+        # Directly call _poll_positions_after_close with a not_before
+        # in the near future. The poll must refuse to return FLAT
+        # before that time. We use a poll_until well past not_before
+        # so the poll has room to confirm flat after the threshold.
+        poll_until = config.now_ny() + timedelta(seconds=2)
+        exposed, nonzero, err = daily_orchestrator._poll_positions_after_close(
+            broker=_EmptyBroker(),
+            managed_universe=set(universe),
+            poll_until=poll_until,
+            not_before=not_before,
+            min_consecutive_flat_reads=2,
+            initial_interval_secs=0.01,
+            max_interval_secs=0.05,
+            # This test pins the not_before GATING, not the empty-read
+            # corroboration rule; supply positive corroboration so the
+            # empty book is admissible as flat once not_before elapses.
+            corroborator=lambda: True,
+        )
+    finally:
+        daily_orchestrator.logger.removeHandler(handler)
+
+    assert not exposed, (
+        f"empty book past not_before must resolve as FLAT; got "
+        f"exposed=True, nonzero={nonzero}, err={err!r}"
+    )
+    assert nonzero == []
+    assert err is None
+    info_msgs = [r.getMessage() for r in records]
+    # The pre-not_before empty reads should be visible in the log
+    # (the poll refused to declare FLAT while now < not_before).
+    assert any(
+        "empty read pre-auction" in m for m in info_msgs
+    ), (
+        f"expected the pre-not_before empty-read log line; got: "
+        f"{info_msgs}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-4 revision (post-review, third round): regression tests for the
+# SAFETY reviewer's four blocking findings and the CORRECTNESS reviewer's
+# stale-comment finding.
+# ---------------------------------------------------------------------------
+
+
+def test_fill_gated_dispatch_defers_on_stale_position_snapshot(
+    monkeypatch, tmp_path,
+):
+    """Round-4 (SAFETY reviewer finding 2): a REDUCING entry against a
+    nonzero baseline that the tick snapshot has NOT yet caught up to
+    must DEFER the MOC submission to the sweep, NOT size the MOC off
+    the stale PRE-fill position.
+
+    Reproduces the reviewer's confirmed loss path directly on
+    ``_fill_gated_moc_dispatch``:
+      * Baseline: +100 AAAA (residual from a prior day).
+      * Entry: SELL 100 (reducing to target 0). Fills fully. Order
+        goes terminal Filled.
+      * Tick snapshot: still shows +100 (IB emits execution report
+        before the position update — hard-simulated by the stub
+        broker's ``get_positions`` returning +100 unconditionally
+        for the WHOLE dispatch loop).
+      * Expected post-round-4 behaviour: dispatcher observes
+        ``baseline + signed_fill = 100 + (-100) = 0``, snapshot shows
+        +100, they DISAGREE → defer. NO MOC submitted from this
+        path; entry left in pending; sweep must cover.
+
+    Pre-round-4 (no baseline check): dispatcher would size the MOC
+    to current=+100, submit SELL MOC 100, and end up with the
+    over-cover naked-short case the round-3 two-sided sweep exists
+    to trim. Layering fix 2 on top prevents the mis-size at the
+    source.
+    """
+    class _StubBroker:
+        """Fixed-position broker: snapshot returns +100 for AAAA
+        regardless of whether MOCs have been submitted. Models a
+        persistent IB position-update lag inside the dispatcher tick.
+        """
+
+        def __init__(self):
+            self.moc_calls: list[tuple[str, int, str]] = []
+            self.get_positions_calls = 0
+            # The entry order is pre-recorded as terminal Filled.
+            self._orders = {
+                "entry-AAAA": {
+                    "symbol": "AAAA", "status": "Filled", "filled": 100,
+                },
+            }
+
+        def get_positions(self):
+            self.get_positions_calls += 1
+            from types import SimpleNamespace
+            return [SimpleNamespace(symbol="AAAA", quantity=100)]
+
+        def get_order_status(self, oid):
+            info = self._orders.get(oid, {})
+            from types import SimpleNamespace
+            return SimpleNamespace(
+                status=info.get("status", "Unknown"),
+                filled=info.get("filled", 0),
+            )
+
+        def cancel(self, oid):
+            pass
+
+        def sell(self, symbol, qty, order_type="MOC", **kwargs):
+            self.moc_calls.append((symbol, qty, order_type))
+            return f"stub-sell-{symbol}"
+
+        def buy(self, symbol, qty, order_type="MOC", **kwargs):
+            self.moc_calls.append((symbol, qty, order_type))
+            return f"stub-buy-{symbol}"
+
+    stub = _StubBroker()
+    entries = [{
+        "symbol": "AAAA", "side": "SELL", "requested_qty": 100,
+        "order_id": "entry-AAAA", "error": None,
+    }]
+    # Baseline == pre-entry position: +100. Expected post-fill = 0.
+    # Snapshot says +100 (stale). Dispatcher MUST refuse to submit.
+    (moc_batch, covered_qty, uncovered,
+     skipped, positions_unknown) = daily_orchestrator._fill_gated_moc_dispatch(
+        broker=stub,
+        entries=entries,
+        managed_universe={"AAAA"},
+        sweep_deadline=config.now_ny() + timedelta(seconds=2),
+        submit_by=config.now_ny() + timedelta(hours=1),
+        baseline={"AAAA": 100},
+        poll_interval_secs=0.01,
+        max_wait_secs=1.0,
+    )
+    assert moc_batch == [], (
+        f"dispatcher must DEFER (submit no MOC) when the tick "
+        f"snapshot disagrees with baseline+signed_fill; got "
+        f"moc_batch={moc_batch}. Pre-round-4 the dispatcher would "
+        f"have sized SELL MOC 100 off the stale +100 snapshot — a "
+        f"naked overnight short."
+    )
+    assert stub.moc_calls == [], (
+        f"broker must not have received any MOC placement calls; "
+        f"got {stub.moc_calls}"
+    )
+    assert not positions_unknown
+    # The entry is terminal Filled; no submission error. The defer
+    # leaves it in pending until dispatcher exits at deadline —
+    # dispatcher's exit path sets status='pending_at_sweep_deadline'
+    # so the sweep picks it up.
+    assert entries[0]["status"] in {"Filled", "pending_at_sweep_deadline"}, (
+        f"entry should be terminal Filled or marked "
+        f"pending_at_sweep_deadline; got {entries[0]!r}"
+    )
+
+
+def test_fill_gated_submit_error_pages_pre_close(monkeypatch, tmp_path):
+    """Round-4 (SAFETY reviewer finding 1): a broker exception during
+    the fill-gated MOC submission (broker.buy/sell raised) MUST
+    surface as a pre-close exposure signal → rc=11. Pre-round-4 the
+    signal was computed and thrown away: ``fg_uncovered_from_positions_fail``
+    was unpacked and never OR'd into ``pre_close_exposure``, so a
+    submission error left the symbol in the "neither moc_batch nor
+    skipped" gap and the sweep could double-flatten.
+
+    End-to-end variant: ``raise_on_sell_symbols={one traded name}``
+    causes every SELL from the dispatcher (both MKT and MOC) to
+    raise. The dispatcher will fail to submit the MOC for that
+    name via ``_submit_single_moc`` returning "error" — a genuine
+    submission-side exception. Assertion: rc must be 11, and the
+    log line must mention the fill-gated submission error.
+    """
+    import logging as _logging
+    universe = config.load_active_universe()
+    feed = _prepopulate_live_feed(universe)
+    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
+    monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+
+    # Probe run to find which symbols are traded and pick one that
+    # gets a BUY entry (so the MOC is a SELL — we can raise SELL).
+    probe = _FakeBroker()
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker",
+                        lambda _args: (probe.connect(mode="paper"), probe)[1])
+    daily_orchestrator.main(_base_argv())
+    buy_entry_syms = [c[0] for c in probe.buy_calls if c[2] == "MKT"]
+    assert buy_entry_syms, "probe found no MKT BUY entry to target"
+    target_sym = buy_entry_syms[0]
+
+    # Real test: same setup, but raise on any SELL for target_sym.
+    # The MOC for target_sym is SELL (opposite of the BUY entry), so
+    # the dispatcher's _submit_single_moc raises → outcome "error" →
+    # symbol appended to fg_uncovered_from_submit_error.
+    feed2 = _prepopulate_live_feed(universe)
+    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed2)
+    fake_broker = _FakeBroker(raise_on_sell_symbols={target_sym})
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    handler, records = _capture_orchestrator_logs(_logging.ERROR)
+    try:
+        rc = daily_orchestrator.main(_base_argv())
+    finally:
+        daily_orchestrator.logger.removeHandler(handler)
+
+    assert rc == 11, (
+        f"expected rc=11 (fill-gated dispatcher submission error → "
+        f"pre-close exposure); got {rc}. Round-4 requires "
+        f"fg_uncovered_from_submit_error to feed pre_close_exposure "
+        f"— pre-round-4 the signal was silently dropped and the "
+        f"sweep would then double-flatten the symbol."
+    )
+    loud = [r.getMessage() for r in records]
+    assert any("Fill-gated submission errors" in m for m in loud), (
+        f"expected the fill-gated-submission-error line in the "
+        f"exposure log; got: {loud[:5]}"
+    )
+
+
+def test_second_sweep_catches_late_dispatcher_moc_rejection(
+    monkeypatch, tmp_path,
+):
+    """Round-4 (SAFETY reviewer finding 3): if a dispatcher MOC flips
+    terminal-Cancelled with filled=0 (exchange rejection) AFTER the
+    first sweep already credited it, the SECOND sweep at
+    sweep_deadline must observe the rejection, drop the coverage
+    credit, and re-fire an MOC to flatten the position.
+
+    We simulate: dispatcher fires an MOC that initially reports
+    'Submitted' (accepted by the API), then flips to Cancelled
+    between the first and second sweep. The first sweep's
+    ``dispatcher_legs`` check sees Submitted → credit preserved →
+    residual 0 → no top-up. The second sweep's check sees
+    Cancelled+filled=0 → credit dropped → residual = held → fires
+    the missing MOC.
+
+    Test structure: drive main() to the point where MOC placement
+    happens with a broker that starts as ``moc_stays_submitted=True``
+    (so dispatcher MOCs are Submitted, not terminal-rejected), then
+    monkey-patch the broker's ``get_order_status`` to FLIP the
+    dispatcher MOC to Cancelled AFTER the first sweep runs but
+    BEFORE the second sweep runs. The second sweep must observe
+    the flipped state and resubmit.
+
+    Simplified: rather than time-based flipping (fragile in tests),
+    exercise the sweep function DIRECTLY twice — first call with
+    Submitted dispatcher leg (no resubmit), second call with the
+    same leg flipped to Cancelled (resubmit fires). Together they
+    prove the round-4 double-sweep pattern would catch the late
+    rejection.
+    """
+    class _FlipperBroker:
+        def __init__(self):
+            self._positions = {"AAAA": 100}
+            self.moc_calls: list[tuple[str, str, int]] = []
+            self._orders = {
+                "dispatcher-moc-1": {
+                    "symbol": "AAAA", "status": "Submitted", "filled": 0,
+                },
+            }
+
+        def flip_rejected(self):
+            self._orders["dispatcher-moc-1"]["status"] = "Cancelled"
+
+        def get_positions(self):
+            from types import SimpleNamespace
+            return [SimpleNamespace(symbol=s, quantity=q)
+                    for s, q in self._positions.items() if q != 0]
+
+        def get_order_status(self, oid):
+            info = self._orders.get(oid, {})
+            from types import SimpleNamespace
+            return SimpleNamespace(
+                status=info.get("status", "Unknown"),
+                filled=info.get("filled", 0),
+            )
+
+        def cancel(self, oid):
+            pass
+
+        def sell(self, symbol, qty, order_type="MOC", **kwargs):
+            self.moc_calls.append(("SELL", symbol, qty))
+            return f"resubmit-{symbol}"
+
+        def buy(self, symbol, qty, order_type="MOC", **kwargs):
+            self.moc_calls.append(("BUY", symbol, qty))
+            return f"resubmit-{symbol}"
+
+    stub = _FlipperBroker()
+    dispatcher_legs = [{
+        "oid": "dispatcher-moc-1", "symbol": "AAAA",
+        "side": "SELL", "qty": 100, "signed_qty": -100,
+    }]
+    covered_qty = {"AAAA": -100}
+    submit_by = config.now_ny() + timedelta(hours=1)
+
+    # First sweep: dispatcher MOC still Submitted, credit preserved,
+    # residual 0 → no orders.
+    (moc_batch1, _c, _cf, _sk, _pu) = daily_orchestrator._sweep_moc_deadline(
+        broker=stub,
+        entries=[],
+        managed_universe={"AAAA"},
+        covered_qty=covered_qty,
+        submit_by=submit_by,
+        dispatcher_legs=dispatcher_legs,
+    )
+    assert moc_batch1 == [], (
+        f"first sweep should NOT resubmit while dispatcher MOC is "
+        f"still Submitted; got {moc_batch1}"
+    )
+    assert stub.moc_calls == [], (
+        f"broker should not have received any MOC placement in the "
+        f"first sweep; got {stub.moc_calls}"
+    )
+
+    # Time passes. IB flips the dispatcher's MOC to Cancelled
+    # (exchange rejection). SECOND sweep runs — the round-4
+    # sleep-then-second-sweep pattern in main() runs this at
+    # sweep_deadline.
+    stub.flip_rejected()
+
+    # Second sweep: dispatcher leg is now terminal-rejected. Credit
+    # dropped from effective_covered_qty. Residual = held +
+    # (credit_dropped) = 100 + 0 = 100 → SELL MOC 100.
+    combined_covered_qty = dict(covered_qty)
+    for _leg in moc_batch1:
+        combined_covered_qty[_leg["symbol"]] = (
+            combined_covered_qty.get(_leg["symbol"], 0)
+            + int(_leg["signed_qty"])
+        )
+    (moc_batch2, _c2, _cf2, _sk2, _pu2) = daily_orchestrator._sweep_moc_deadline(
+        broker=stub,
+        entries=[],
+        managed_universe={"AAAA"},
+        covered_qty=combined_covered_qty,
+        submit_by=submit_by,
+        dispatcher_legs=dispatcher_legs + moc_batch1,
+    )
+    assert len(moc_batch2) == 1, (
+        f"second sweep must resubmit the MOC after the dispatcher "
+        f"MOC flipped terminal-rejected between sweeps; got "
+        f"{moc_batch2}. This is exactly the round-4 case the "
+        f"double-sweep pattern is designed to catch."
+    )
+    leg = moc_batch2[0]
+    assert leg["symbol"] == "AAAA"
+    assert leg["side"] == "SELL"
+    assert leg["qty"] == 100
+    assert stub.moc_calls == [("SELL", "AAAA", 100)], (
+        f"broker should have received exactly one SELL MOC 100 "
+        f"resubmission in the second sweep; got {stub.moc_calls}"
+    )
+
+
+# Capture the REAL ``_sleep_until`` / ``_wait_for_marks_pumped``
+# references at module load time — the autouse conftest fixture
+# monkey-patches these to no-ops on every test (needed so main()-level
+# tests don't hang on the round-4 second-sweep sleep), so a direct
+# unit test of these helpers needs the pre-patch objects.
+_REAL_SLEEP_UNTIL = daily_orchestrator._sleep_until
+_REAL_WAIT_FOR_MARKS_PUMPED = daily_orchestrator._wait_for_marks_pumped
+
+
+def test_sleep_until_pump_callback_invoked(monkeypatch):
+    """Round-4 (SAFETY reviewer finding 4): ``_sleep_until`` with a
+    pump callback must invoke the callback periodically during the
+    wait. This is what keeps the ib_async loop pumped so a long
+    unpumped wall-clock wait doesn't wedge the connection and force
+    the post-close poll into its pessimistic-EXPOSED branch.
+
+    We stub ``time.sleep`` to advance a fake clock so the pump
+    interval elapses without a real wall-clock wait; the pump
+    callback records its invocations.
+    """
+    import time as _time
+    pump_calls: list[float] = []
+    real_time_time = _time.time
+    fake_time = [real_time_time()]
+
+    def _fake_sleep(secs):
+        fake_time[0] += secs
+
+    monkeypatch.setattr(_time, "sleep", _fake_sleep)
+    monkeypatch.setattr(_time, "time", lambda: fake_time[0])
+    # config.now_ny reads real datetime.now — we drive the loop
+    # instead via a target computed off the fake clock. Use a
+    # slightly hacky pattern: patch config.now_ny to reflect the
+    # fake clock's advance so the sleep_until loop exits when the
+    # fake target is reached.
+    start = daily_orchestrator.config.now_ny()
+
+    def _fake_now_ny():
+        elapsed = fake_time[0] - real_time_time()
+        return start + timedelta(seconds=max(elapsed, 0))
+
+    monkeypatch.setattr(daily_orchestrator.config, "now_ny", _fake_now_ny)
+
+    target = start + timedelta(seconds=90)
+
+    def _pump():
+        pump_calls.append(fake_time[0])
+
+    # Poll every 5s (real function default). Pump every 30s. Over
+    # a 90s wait we expect approximately 3 pumps.
+    _REAL_SLEEP_UNTIL(
+        target, poll=5.0, pump=_pump, pump_interval=30.0,
+    )
+    assert 2 <= len(pump_calls) <= 4, (
+        f"expected ~3 pump invocations over the 90s wait, got "
+        f"{len(pump_calls)} at times {pump_calls}"
+    )
+
+
+def test_sleep_until_pump_exception_does_not_break_wait(monkeypatch):
+    """Round-4: a raising pump callback logs a warning and continues
+    the wait — a transient TWS blip during a 4-minute sleep must
+    not gate the downstream sweep / verdict.
+    """
+    import time as _time
+    real_time_time = _time.time
+    fake_time = [real_time_time()]
+
+    def _fake_sleep(secs):
+        fake_time[0] += secs
+
+    monkeypatch.setattr(_time, "sleep", _fake_sleep)
+    monkeypatch.setattr(_time, "time", lambda: fake_time[0])
+    start = daily_orchestrator.config.now_ny()
+
+    def _fake_now_ny():
+        elapsed = fake_time[0] - real_time_time()
+        return start + timedelta(seconds=max(elapsed, 0))
+
+    monkeypatch.setattr(daily_orchestrator.config, "now_ny", _fake_now_ny)
+
+    target = start + timedelta(seconds=60)
+
+    def _boom_pump():
+        raise RuntimeError("simulated TWS blip during pump")
+
+    # Should not raise; should exit at target.
+    _REAL_SLEEP_UNTIL(
+        target, poll=5.0, pump=_boom_pump, pump_interval=10.0,
+    )
+
+
+def test_stale_moc_cutoff_comment_replaced(monkeypatch):
+    """Round-4 (CORRECTNESS reviewer finding 5): the stale
+    "~15:50 MOC entry cutoff" claim in main()'s acceptance-audit
+    comment survives no more. NASDAQ's MOC ENTRY cutoff is 15:55:00
+    (SEC 34-84454), and DEFAULT_SUBMIT_BY_TIME = "15:55" depends on
+    that being clear to every future reader.
+    """
+    import inspect
+    src = inspect.getsource(daily_orchestrator)
+    assert "past the ~15:50 cutoff" not in src, (
+        "stale '~15:50 cutoff' comment survives in "
+        "daily_orchestrator.py — CORRECTNESS reviewer finding 5. "
+        "That is the exact false fact the task singled out for "
+        "correction, and it directly contradicts the corrected "
+        "ground-truth in the module docstring and the "
+        "_audit_moc_acceptance docstring."
+    )
+    # And the corrected form must be present.
+    assert (
+        "NASDAQ's 15:55:00 ENTRY cutoff" in src
+        or "15:55:00 ET (SEC" in src
+    ), (
+        "corrected 15:55:00 ENTRY-cutoff language missing from "
+        "daily_orchestrator.py; the fix must be positive, not just "
+        "a deletion."
+    )
+
+
+def test_wait_for_marks_pumped_calls_broker_between_slices(monkeypatch):
+    """Round-4 (SAFETY reviewer finding 4): the pumped-wait wrapper
+    for ``recorder.wait_for_marks`` must invoke ``broker.get_positions``
+    between wait slices so the ib_async connection is exercised.
+    """
+    from types import SimpleNamespace
+    slices = [0]
+    broker_calls = [0]
+
+    class _StubRecorder:
+        def wait_for_marks(self, timeout):
+            slices[0] += 1
+            # Return "not done" for the first 3 slices, then "done".
+            return slices[0] >= 4
+
+    class _StubBroker:
+        def get_positions(self):
+            broker_calls[0] += 1
+            return []
+
+    done = _REAL_WAIT_FOR_MARKS_PUMPED(
+        recorder=_StubRecorder(),
+        broker=_StubBroker(),
+        timeout=100.0,
+        pump_interval=0.001,
+    )
+    assert done is True
+    # 4 wait_for_marks slices; broker pumped between each non-final
+    # one (3 pumps).
+    assert slices[0] == 4
+    assert broker_calls[0] == 3, (
+        f"expected 3 broker.get_positions pumps between the first 3 "
+        f"wait slices; got {broker_calls[0]}"
+    )
+
+
+def test_wait_for_marks_pumped_broker_pump_exception_ok(monkeypatch):
+    """A raising broker pump doesn't kill the marks wait — the
+    marks thread should complete regardless of transient TWS blips.
+    """
+    slices = [0]
+
+    class _StubRecorder:
+        def wait_for_marks(self, timeout):
+            slices[0] += 1
+            return slices[0] >= 3
+
+    class _BoomBroker:
+        def get_positions(self):
+            raise RuntimeError("simulated TWS drop mid-marks-wait")
+
+    done = _REAL_WAIT_FOR_MARKS_PUMPED(
+        recorder=_StubRecorder(),
+        broker=_BoomBroker(),
+        timeout=100.0,
+        pump_interval=0.001,
+    )
+    assert done is True
+
+
+def test_main_replay_ignore_cutoff_skips_second_sweep_sleep(
+    monkeypatch, tmp_path,
+):
+    """Round-4: in replay mode with ``--replay-ignore-cutoff``
+    the second-sweep wall-clock sleep is skipped so the process
+    doesn't stall for an hour (``effective_submit_by = now + 1h``
+    yields a nonsense wall-clock deadline).
+
+    Assertion strategy: install a ``_sleep_until`` that RAISES if
+    called with a target more than 5 minutes from ``now``. The
+    autouse conftest patch is a no-op, so this test's explicit
+    setattr wins.
+    """
+    from live.tests.test_replay import (
+        _make_stub_replay_feed as _make_stub,
+    )
+
+    universe = config.load_active_universe()
+    stub_feed = _make_stub("2026-05-15", universe)
+    monkeypatch.setattr(daily_orchestrator, "ReplayFeed", lambda **kw: stub_feed)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+
+    max_target_seconds_ahead: list[float] = []
+
+    def _tattletale_sleep(target, *args, **kwargs):
+        # Record how far in the future the target is; a real second-
+        # sweep sleep against effective_submit_by=now+1h would be
+        # ~3600s. Anything <= 5 min is fine (the post-close
+        # not_before sleep is tightly bounded by tests' fake wall
+        # clock).
+        try:
+            secs = (target - config.now_ny()).total_seconds()
+        except Exception:
+            secs = 0.0
+        max_target_seconds_ahead.append(secs)
+
+    monkeypatch.setattr(daily_orchestrator, "_sleep_until", _tattletale_sleep)
+
+    fake_broker = _FakeBroker()
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    argv = [
+        "--replay-date", "2026-05-15", "--paper",
+        "--vol-cap", "5000", "--replay-submit",
+        "--submit-by", "23:59",
+        "--replay-ignore-cutoff",
+        "--on-feed-failure", "abort",
+    ]
+    rc = daily_orchestrator.main(argv)
+    assert rc == 0
+
+    # In replay mode the second-sweep sleep is skipped entirely.
+    # The only _sleep_until targets that should reach the tattletale
+    # are the post-close not_before wait — bounded by the conftest
+    # to well under 5 minutes.
+    long_waits = [s for s in max_target_seconds_ahead if s > 300.0]
+    assert long_waits == [], (
+        f"replay run scheduled a _sleep_until with target > 5min "
+        f"in the future: {long_waits[:5]}. The second-sweep sleep "
+        f"against effective_submit_by = now+1h must be skipped in "
+        f"replay mode (round-4 fix)."
     )

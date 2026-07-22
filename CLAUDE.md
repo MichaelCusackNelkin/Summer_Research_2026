@@ -72,7 +72,8 @@ windows: 24 months for covariance, 12 months for forecast/impact, ending yesterd
   exposing a synchronous `Broker` class (`buy`/`sell`/`buy_moc`/`get_positions`/
   `reconcile_positions`/`flatten_all`, etc.). Port map: 7497 paper, 7496 live, 4002/4001
   Gateway; live connections require the confirm string `YES_I_WANT_LIVE_TRADING`.
-- `whitepaper/` — `wihtepaper.qmd` (filename typo is intentional/current), the Quarto writeup.
+- `whitepaper/` — `whitepaper.qmd`, the Quarto writeup. (An earlier note here claimed the
+  filename was misspelled `wihtepaper.qmd`; it is not, and never was on disk.)
 - `CAX/` — corporate-actions download + recovery (splits & dividends from **yfinance**),
   the input to the covariance adjustment. See the architecture note below. Outputs
   `corporate_actions.csv` and `missing_corporate_actions.txt` next to the scripts.
@@ -89,8 +90,12 @@ windows: 24 months for covariance, 12 months for forecast/impact, ending yesterd
   are brittle — treat as a helper, verify output.)
 - `top_49_universe.txt`, `top_50_universe.txt`, `top_100_universe.txt`, `top_250_universe.txt`,
   `top_500_universe.txt` — tiered ADV-ranked universes produced by `universe_selection.py`.
-  **`top_100_universe.txt` is the active universe** — all four pipeline notebooks read it and
-  it is the `live/` system's default `--universe-file` / `--active-universe-file`. `universe.txt`
+  **`top_49_universe.txt` is the active universe** as of 2026-07-21
+  (`config.DEFAULT_ACTIVE_UNIVERSE_FILE`) — chosen for paper trading to avoid known universe
+  issues while the strategy scales up; the plan is to grow toward 500 later. The on-disk
+  covariance / forecast / impact artifacts are all sized for the top-49 set, so changing this
+  without rebuilding all three produces shape mismatches at solve time.
+  `top_100_universe.txt` is the previous active universe, kept for reference. `universe.txt`
   remains the **broad** pool that `live/retrain.py` scans for the historical fit.
 - `universe.txt` — flat newline-delimited ticker list (~2000 names) used by `data.py`, `CAX/`,
   and as the broad pool. Uses Bloomberg/CRSP-style class delimiters (e.g. `BRK.B`).
@@ -321,17 +326,28 @@ surface. `live/README.md` is the authoritative operator's guide; the shape:
   `CoverageError`) that fingerprints on-disk parquets by schema/symbols/date-range and refuses a
   paid Batch API fetch on a miss unless explicitly authorized. This is the anti-surprise-bill
   guardrail; see the "universe drift trap" in `live/README.md`.
-- **`nasdaq_routing.py`** — the single source of `NASDAQ_EXCHANGE = "ISLAND"`. Every `live/`
-  order routes direct to the NASDAQ INET book (NOT SMART), because the model is calibrated to
-  the NASDAQ close cross — an off-venue fill is uncorrelated with the sized signal. Any new
-  broker call site in `live/` MUST thread this constant through; enforcement is code review
-  (the broker default stays `SMART` for non-`live/` callers). `_prequalify_symbols` previously
-  also dropped non-NASDAQ-primary names via a `primaryExchange == "NASDAQ"` check; that filter
-  is currently **disabled** (rolled back 2026-07-20 with the broker's route-survival
-  assertion). It's a no-op on both current tiered universes — 49/49 in `top_49_universe.txt`,
-  and 99 of the 100 in `top_100_universe.txt` qualify with all 99 NASDAQ-primary (ITCI fails IB
-  qualification outright and is dropped before the filter) — so nothing changes today; its real
-  value is future universe-drift protection.
+- **`nasdaq_routing.py`** — the single source of `ACTIVE_ROUTING = "SMART"`. Every
+  `live/` order routes via IB's SMART router; `NASDAQ_EXCHANGE = "ISLAND"` is
+  retained but currently **unused**. Any new broker call site in `live/` MUST import and thread
+  `ACTIVE_ROUTING` through rather than typing a literal or leaning on the broker default;
+  enforcement is code review. SMART is a **known risk** for the MOC exit leg on any
+  non-NASDAQ-primary name — a SMART MOC prints on the primary listing's close cross, not
+  NASDAQ's, which is the wrong auction for a model calibrated to the NASDAQ cross. The
+  compensating control is `_prequalify_symbols`, which drops any name whose
+  `primaryExchange != "NASDAQ"`. That filter is **ACTIVE** (re-enabled 2026-07-21, committed in
+  `ac2350d`, alongside the SMART switch). It is a no-op on both current tiered universes —
+  49/49 in `top_49_universe.txt`, and 99 of the 100 in `top_100_universe.txt` qualify with all
+  99 NASDAQ-primary (ITCI fails IB qualification outright and is dropped before the filter) —
+  so nothing changes today; its value is universe-drift protection AND making the SMART routing
+  premise load-bearing rather than assumed.
+- **Exchange deadlines the order path is built around** (verified 2026-07-21; earlier versions
+  of this file and several `live/` docstrings had these wrong). NASDAQ MOC **entry** cutoff is
+  **15:55:00 ET** — the 2018 rule change (SEC release 34-84454) lifted the old 15:50 rule.
+  NASDAQ MOC orders may not be **cancelled or modified** after **15:50:00 ET**. **NYSE** keeps a
+  15:50 MOC entry cutoff, but this strategy trades the NASDAQ close cross exclusively, so 15:55
+  is the load-bearing deadline. Hence `config.DEFAULT_SUBMIT_BY_TIME = "15:55"` is correct and
+  must not be "fixed" earlier; note that the book is committed once MOCs are away after 15:50,
+  since they can no longer be pulled or resized.
 - Non-obvious execution invariant worth knowing before touching the order path: **LEG 2 (the
   MOC counter-flatten) is sized from a fresh `broker.get_positions()` after the entry fills,
   NEVER from `target - current`.** This is what prevents a partial entry fill from

@@ -98,15 +98,35 @@ def test_dollar_to_shares_drops_bad_prices():
 
 @pytest.mark.filterwarnings("ignore::UserWarning")
 def test_optimizer_end_to_end_with_real_artifacts():
-    """Load real cov + impact artifacts, feed a synthetic alpha, solve."""
-    universe = config.load_active_universe()
-    N = len(universe)
+    """Load real cov + impact artifacts, feed a synthetic alpha, solve.
 
+    N is derived from the on-disk covariance loadings so the test tracks
+    whatever universe the artifacts were built for (top-49 today; the
+    plan is to scale toward 500 later). Hardcoding N was a regression
+    trap — a mismatch means the covariance was built against a different
+    universe file than the test expected, not that the optimizer is
+    broken.
+
+    Round-2 fix (correctness review): the earlier "if drift, pad" branch
+    made a real invariant undetectable — a future retrain writing
+    loadings at 500 names against a top_49 active universe would be
+    silently padded with 451 fake tickers and pass. Replaced with a
+    hard cross-check that the covariance artifact and the active
+    universe agree; a mismatch fails the test with a message pointing
+    at the fix (rerun ``live.retrain --refit covariance``).
+    """
     L = np.load(config.COV_DIR / config.COV_LOADINGS_NAME)
     Sigma_f = np.load(config.COV_DIR / config.COV_FACTOR_COV_NAME)
     Sigma_r = np.load(config.COV_DIR / config.COV_MATRIX_NAME)
     eps_diag = np.load(config.COV_DIR / config.COV_EPS_DIAG_NAME)
-    assert L.shape == (10, N)
+    n_factors, N = L.shape
+    universe = config.load_active_universe()
+    assert len(universe) == N, (
+        f"covariance artifact has N={N} names but active universe "
+        f"({config.DEFAULT_ACTIVE_UNIVERSE_FILE}) has {len(universe)} — "
+        f"rerun ``live.retrain --refit covariance`` to regenerate the "
+        f"loadings against the current active universe."
+    )
 
     day = _make_day_frame(universe)
     cost = CostModel(universe).get_cost(day, config.COMMISSION_PER_SHARE)
@@ -127,3 +147,5 @@ def test_optimizer_end_to_end_with_real_artifacts():
     # Two-factor neutrality
     factor_exposures = L[:2] @ dollar_positions
     assert np.allclose(factor_exposures, 0.0, atol=1e-3)
+    # Sanity: n_factors matches the covariance shape convention.
+    assert n_factors == 10

@@ -143,10 +143,13 @@ Search for these messages in this order. This is the actual emitted text:
 | 15 | `contracts pre-qualified` | checking each ticker is tradeable |
 | 16 | `MKT entry placed` (per stock) | **leg one — getting in** |
 | 17 | `MKT entry batch submitted` | |
-| 18 | `MOC exit placed` (per stock) | **leg two — the exit that flattens at 16:00** |
-| 19 | `MOC exit batch submitted` | |
-| 20 | `target book persisted` (2nd) | amended with what actually happened |
-| 21 | `fills audited` | final tally |
+| 18 | `MOC sweep deadline computed` | when the deadline sweep is scheduled |
+| 19 | `MOC exit placed` (per stock) | **leg two — fill-gated MOC as each entry fills** |
+| 20 | `MOC exit batch submitted` | |
+| 21 | `target book persisted` (2nd) | amended with what actually happened |
+| 22 | `post-close position poll: FLAT` | **AUTHORITATIVE — the book is verifiably flat after 16:00** |
+| 23 | `target book persisted` (3rd) | post-close status appended |
+| 24 | `fills audited` | final tally |
 
 Replay and dry-run terminate early but still return 0:
 `DRY RUN — printing target book, no broker connection` and
@@ -154,7 +157,9 @@ Replay and dry-run terminate early but still return 0:
 
 **A quiet ending is the good ending.** The coverage cross-check and the MOC
 acceptance audit only speak up when something is wrong. A clean run produces
-*no* line from either. Absence is the healthy signal.
+*no* line from either — the post-close poll ends with the single healthy
+`post-close position poll: FLAT` line and rc=0. Absence of every
+`OVERNIGHT EXPOSURE` tag is the healthy signal.
 
 ### What to search for when worried
 
@@ -163,13 +168,28 @@ strategy is never supposed to do**:
 
 ```
 OVERNIGHT EXPOSURE
+OVERNIGHT EXPOSURE (pre-close)
+OVERNIGHT EXPOSURE (post-close)
 POSITIONS MAY BE LIVE INTO THE CLOSE
 OPERATOR MUST MANUALLY FLATTEN
 MOC REJECTED at exchange
 MOC exit: get_positions FAILED
 MOC exit: entries filled but zero MOC legs sent
 MOC exit: legs skipped past submit cutoff
+sweep: MOC legs skipped past submit cutoff
+sweep: get_positions FAILED
+sweep: dispatcher MOC terminal-rejected
+Fill-gated submission errors:
+post-close position poll: managed-universe symbols still non-flat
+post-close position poll: every attempt FAILED
+post-close position poll: reached deadline without a confirmed FLAT
+post-close position poll block raised
 ```
+
+The two `(pre-close)` and `(post-close)` tags identify WHICH safeguard
+tripped. `(pre-close)` fires before 16:00 (leaving the operator time to
+run `panic`); `(post-close)` fires 16:00-16:05 (definitive verdict after
+the auction has printed). Either is rc=11.
 
 Cheapest triage: filter the day's file for `"level":"ERROR"`. On a healthy day
 there are almost none.
@@ -182,6 +202,78 @@ Investigate but not an emergency:
 - `position drift vs yesterday's target book` — reconcile mismatch
 - `raising broker MAX_ORDER_QTY for this session` — risk-limit override
 - `coverage cross-check: non-terminal status at cross-check time` — TWS brownout
+- `fill-gated dispatch: sweep deadline reached with entry still non-terminal`
+  — the fill-gated per-symbol dispatch gave up on this entry; the sweep
+  will pick it up. Only an emergency if it appears alongside one of the
+  OVERNIGHT EXPOSURE tags above.
+- `sweep: cancelled non-terminal entry` — belt-and-braces cancel before
+  the sweep's MOC batch; expected on stuck entries.
+- `sweep: cancel failed — entry may still be working` — the sweep
+  couldn't cancel a still-working entry. This IS a pre-close exposure
+  signal (the symbol lands in `cancel_failed_symbols` and rc=11
+  short-circuits). Only benign if it appears alongside `MOC exit
+  placed` for the same symbol (the sweep's fresh get_positions
+  captured the fill and covered it) — but the escalation happens
+  regardless because the entry's fate is not verifiable pre-close.
+- `sweep: dispatcher MOC terminal-rejected; dropping coverage
+  credit so sweep re-submits` — round-3 rejection-recovery. The
+  dispatcher's MOC for this symbol was API-accepted but then
+  Cancelled/Inactive at the exchange with filled=0; the sweep
+  drops the coverage credit and resubmits a fresh MOC sized to
+  the actual held qty. Benign iff followed by a `MOC exit placed`
+  log line for the same symbol. If the retry also gets rejected
+  (past 15:55 cutoff), `_audit_moc_acceptance` OR the coverage
+  cross-check catch it and escalate to rc=11.
+- `fill-gated dispatch: position snapshot lags fill event
+  (expected != current) — deferring MOC to the sweep to avoid
+  mis-sizing off a stale book` — round-4 staleness deferral.
+  IB emitted the execution report before it updated the
+  position book. The dispatcher refuses to size an MOC off the
+  stale snapshot; the entry stays in ``pending`` and the sweep
+  (which snapshots minutes later) covers it via the two-sided
+  residual arithmetic. Benign iff followed by a sweep `MOC exit
+  placed` for the same symbol. If it appears every tick for
+  many symbols in one run, IB propagation is genuinely stuck —
+  worth investigating post-hoc but not an emergency.
+- `sleep-to-sweep-deadline raised (non-fatal); proceeding with
+  second sweep` — round-4 pump loop hiccup. A raise inside
+  `_sleep_until` between the first and second sweep. Non-fatal
+  by design — the second sweep still runs, and the sweep's own
+  error paths are pessimistic. Only worth a look if it repeats
+  daily.
+- `pump callback raised during _sleep_until (non-fatal)` —
+  round-4. A transient TWS blip during a pumped wall-clock
+  wait. The wait continues; a wedged connection would
+  eventually be caught by the post-close poll's own
+  pessimistic-on-raise branch. Benign in isolation.
+- `broker heartbeat during marks wait failed (non-fatal)` —
+  round-4. Same idea but during the ~350s pumped
+  `wait_for_marks` slot on the rc=0 path. Benign in isolation.
+- `post-close position poll: still non-flat, retrying` — IB is settling
+  the auction print, poll is backing off. Only an emergency if the loop
+  hits the deadline (next line above).
+- `post-close position poll: empty read pre-auction; not counting
+  toward FLAT confirmation` — round-2 safety bound. The poll got an
+  empty response before 16:00:30 and is not treating that as
+  authoritative. Not an emergency; the poll keeps going.
+- `post-close position poll: flat read; awaiting confirmation` —
+  round-2 safety bound. First flat read landed, but the poll needs
+  N=2 consecutive to declare FLAT. Not an emergency; the poll keeps
+  going.
+- `post-close position poll: waiting for not_before wall clock` —
+  round-3 wait guard. A live/paper run reached the poll before
+  ``DEFAULT_POST_CLOSE_POLL_NOT_BEFORE_TIME`` (default 16:00 + settle).
+  The process sleeps until the auction wall clock so the poll can
+  give an authoritative post-auction verdict. Benign — expected on
+  fast happy-path runs where the audit finished by ~15:52.
+- `post-close position poll SKIPPED — replay-submit rehearsal
+  reached the poll before today's 16:00 auction wall clock` —
+  round-3 REPLAY-only. A ``--replay-submit`` rehearsal cannot
+  verify against today's 16:00 print (the fills are queued at the
+  paper account for today's close, not the historical date's).
+  rc=0 is preserved when pre-close signals were clean, but the
+  operator MUST run ``python -m live.panic --paper`` before the
+  next real session to flatten the paper positions.
 
 Benign by design: the loud `REPLAY SUBMIT:` banner, and anything suffixed
 `(non-fatal)` — tail I/O failures that **cannot** downgrade an rc=11 verdict.
@@ -255,7 +347,7 @@ broker cannot size them.
   equals exactly zero.
 - `moc_order_ids`, `moc_signed_by_sym` — convenience lookups of the same.
 
-Then **five fields that together are the post-mortem of a bad day.** If any is
+Then **eight fields that together are the post-mortem of a bad day.** If any is
 non-empty or true, that is what triggered the code-11 page:
 
 | Field | Meaning |
@@ -264,10 +356,22 @@ non-empty or true, that is what triggered the code-11 page:
 | `moc_positions_unknown` | couldn't read positions, so couldn't compute exits |
 | `empty_snapshot_after_fills` | orders filled, yet the broker reported an empty account. Contradiction; suspect stale data. |
 | `uncovered_symbols` | independent re-check found stock not covered by an exit order |
-| `unfilled_moc_symbols` | exits accepted by the broker but **rejected by the exchange**, usually from submitting past the ~15:50 cutoff |
+| `unfilled_moc_symbols` | exits accepted by the broker but **rejected by the exchange**, usually from submitting past NASDAQ's 15:55 cutoff |
+| `fill_gated_submit_errors` | round-4: dispatcher tried to place an MOC for these symbols and the broker `buy`/`sell` call raised (a read timeout AFTER TWS queued the order looks the same to the caller; ignoring this signal risks the sweep double-flattening) |
+| `post_close_nonzero_symbols` | AUTHORITATIVE 16:00-16:05 position poll found these managed-universe symbols still non-flat after the auction print |
+| `post_close_poll_error` | every post-close poll failed (TWS unreachable); pessimistic rc=11 |
 
 Plus `cancelled_entry_oids` — entries that hadn't resolved and got pulled
-before the exit was computed.
+by the sweep before the exit was computed.
+
+New round-2 fields also on the record:
+
+| Field | Meaning |
+|---|---|
+| `sweep_deadline_ny` | when the sweep was scheduled to fire (submit_by − sweep_margin) |
+| `sweep_margin_secs` | dynamic margin (scales with book size — 15s floor at 49 names, ~121s at 500; formula budgets for both get_positions and per-symbol status/order costs) |
+| `covered_by_fill_gated` | symbols whose MOC came from the fill-gated dispatcher rather than the deadline sweep |
+| `cancel_failed_symbols` | entries the sweep tried to cancel but the broker raised on — these entries may still fill mid-window and are a pre-close exposure signal in their own right |
 
 ### The `status` values on entries
 

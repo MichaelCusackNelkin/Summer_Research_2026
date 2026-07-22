@@ -80,6 +80,19 @@ class _FakeBroker:
         self._positions: dict[str, int] = {}
         self._orders: dict[str, dict] = {}
         self._order_counter = 0
+        # Round-3 MOC semantics — real IB defers MOC fills to the
+        # 16:00 auction. Match that so the two-sided sweep does not
+        # spuriously offset every dispatcher MOC.
+        self._pending_moc_fills: dict[str, dict] = {}
+
+    def simulate_close_auction(self) -> None:
+        for oid, meta in list(self._pending_moc_fills.items()):
+            sym = meta["symbol"]
+            signed = int(meta["signed"])
+            if signed == 0:
+                continue
+            self._positions[sym] = self._positions.get(sym, 0) + signed
+        self._pending_moc_fills.clear()
 
     def connect(self, mode="paper", **kwargs):
         self.connected = True
@@ -104,7 +117,11 @@ class _FakeBroker:
     def _record_fill(self, oid, symbol, action, requested, order_type):
         filled = int(requested)  # full-fill replay broker
         signed = filled if action == "BUY" else -filled
-        self._positions[symbol] = self._positions.get(symbol, 0) + signed
+        if order_type == "MOC":
+            # Real-IB semantics: MOC fill deferred to close auction.
+            self._pending_moc_fills[oid] = {"symbol": symbol, "signed": signed}
+        else:
+            self._positions[symbol] = self._positions.get(symbol, 0) + signed
         self._orders[oid] = {
             "symbol": symbol, "action": action, "requested": int(requested),
             "filled": filled, "order_type": order_type, "status": "Filled",
@@ -330,10 +347,11 @@ def test_replay_default_is_broker_free(monkeypatch, tmp_path):
 def test_replay_submit_places_moc_orders(monkeypatch, tmp_path):
     """F2: --replay-submit exercises the full per-leg MOC path.
 
-    F1 regression: the per-leg cutoff must be neutralised in replay, so this
-    test is deterministic regardless of wall-clock time of day. We
-    additionally pass ``--submit-by 00:01`` so the un-fixed code would
-    silently skip every leg.
+    Round-2 change: replay now HONOURS the wall-clock cutoff by default
+    so a late-in-the-day rehearsal correctly surfaces the same rc=4 /
+    rc=11 codes a real run would; ``--replay-ignore-cutoff`` opts out.
+    We combine ``--submit-by 00:01`` (past cutoff) with
+    ``--replay-ignore-cutoff`` to exercise the order path deterministically.
     """
     universe = config.load_active_universe()
     stub_feed = _make_stub_replay_feed("2026-05-15", universe)
@@ -350,7 +368,10 @@ def test_replay_submit_places_moc_orders(monkeypatch, tmp_path):
 
     monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
 
-    argv = _base_argv("2026-05-15") + ["--replay-submit", "--submit-by", "00:01"]
+    argv = _base_argv("2026-05-15") + [
+        "--replay-submit", "--submit-by", "00:01",
+        "--replay-ignore-cutoff",
+    ]
     rc = daily_orchestrator.main(argv)
     assert rc == 0, f"expected rc=0, got {rc}"
     assert fake_broker.connected
@@ -402,7 +423,12 @@ def test_replay_refuses_live(monkeypatch, tmp_path):
 
 def test_replay_skips_wall_clock_waits(monkeypatch, tmp_path):
     """Replay must NOT call _sleep_until AND must still submit real orders
-    with a past --submit-by. Guards against F1 (per-leg cutoff regression).
+    when the operator opts out of the cutoff via ``--replay-ignore-cutoff``.
+    The snapshot wall-clock wait is unconditionally skipped in replay (the
+    parquet is already on disk); the submit-by cutoff is HONOURED by
+    default now (round-2 change) so a late replay MOC is correctly
+    flagged. ``--replay-ignore-cutoff`` is the escape hatch for the
+    afternoon-rehearsal use case.
     """
     universe = config.load_active_universe()
     stub_feed = _make_stub_replay_feed("2026-05-15", universe)
@@ -427,10 +453,14 @@ def test_replay_skips_wall_clock_waits(monkeypatch, tmp_path):
 
     monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
 
-    # Past --submit-by (00:01 ET) is a stress test: live/paper would exit
-    # rc=4 pre-submit and skip every leg per-leg; replay must ignore both
-    # cutoffs, place real orders through the broker, and never sleep.
-    argv = _base_argv("2026-05-15") + ["--replay-submit", "--submit-by", "00:01"]
+    # Past --submit-by (00:01 ET) + --replay-ignore-cutoff: live/paper
+    # would exit rc=4 pre-submit and skip every leg per-leg; replay with
+    # the ignore-cutoff opt-in must still place real orders through the
+    # broker (and, per the SNAPSHOT wall-clock skip, must never sleep).
+    argv = _base_argv("2026-05-15") + [
+        "--replay-submit", "--submit-by", "00:01",
+        "--replay-ignore-cutoff",
+    ]
     rc = daily_orchestrator.main(argv)
     assert rc == 0, f"expected rc=0, got {rc}"
     assert sleep_calls == [], "replay should never call _sleep_until"

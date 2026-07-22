@@ -65,11 +65,12 @@ REF_STATS_NAME = "reference_stats.parquet"
 # ---------------------------------------------------------------------------
 
 # The saved covariance, forecast, and impact artifacts on disk are all sized
-# for the top-100 universe (see the artifact ``.npy`` shapes) so that is the
-# active set the live pipeline consumes. Changing this without simultaneously
-# rebuilding all three artifact sets will produce shape mismatches at solve
-# time.
-DEFAULT_ACTIVE_UNIVERSE_FILE = "top_100_universe.txt"
+# for the currently-active tiered universe. As of 2026-07-21 that is the
+# top-49 file — chosen for paper trading to avoid known universe issues
+# (see the notes in ``live/nasdaq_routing.py``); the plan is to scale
+# toward 500 later. Changing this without simultaneously rebuilding all
+# three artifact sets will produce shape mismatches at solve time.
+DEFAULT_ACTIVE_UNIVERSE_FILE = "top_49_universe.txt"
 
 # Broad symbol pool used for historical Databento pulls. The ``CACHE_DIR``
 # parquet files are keyed on the ticker list, so the retrain has to pass
@@ -82,10 +83,14 @@ DEFAULT_BROAD_UNIVERSE_FILE = "universe.txt"
 
 NY_TZ = ZoneInfo("America/New_York")
 
-# Default MOC submission window. NYSE's official MOC cutoff is 15:50 ET for
-# most names; brokers frequently want orders in a couple minutes earlier. We
-# solve at 15:50 (that is when the imbalance print is available) and hard-stop
-# submission at 15:55 to leave zero ambiguity about a late fill rejection.
+# Default MOC submission window. NASDAQ's MOC ENTRY cutoff is 15:55:00 ET
+# (SEC release 34-84454 lifted the old 15:50 rule in 2018); MOC orders may
+# not be CANCELED OR MODIFIED after 15:50:00 ET. NYSE keeps a 15:50 MOC
+# entry cutoff, but this strategy trades the NASDAQ close cross exclusively
+# (see ``live/nasdaq_routing.py``), so 15:55 is the load-bearing entry
+# deadline. We solve at 15:50 (that is when the imbalance print is
+# available) and hard-stop MOC submission at 15:55 — the LAST moment
+# NASDAQ still accepts an MOC.
 DEFAULT_REBALANCE_TIME = "15:50"
 DEFAULT_SUBMIT_BY_TIME = "15:55"
 DEFAULT_STREAM_START_TIME = "09:30"
@@ -102,23 +107,100 @@ DEFAULT_VOL_CAP = 5e3
 DEFAULT_IMPACT_GAMMA = 0.5
 
 # Two-leg execution: MKT entry at 15:50, MOC counter-flatten at the 16:00
-# auction (see daily_orchestrator._submit_mkt_entries / _submit_moc_flatten).
+# auction (see daily_orchestrator._submit_mkt_entries /
+# _fill_gated_moc_dispatch / _sweep_moc_deadline).
 # The strategy predicts the 15:50 -> 16:00 close-auction move; we take that
 # move with an MKT entry that lands intraday and an MOC exit that lifts at
-# the closing print. Fill-wait is bounded per-order so a stuck MKT can't
-# hang the process past the MOC cutoff.
-DEFAULT_ENTRY_FILL_TIMEOUT_SECS = 5.0
+# the closing print. Per-order fill-wait bounds the fill-gated MOC
+# dispatcher — as soon as any entry becomes terminal Filled, the fill-gated
+# path submits its opposite-side MOC IMMEDIATELY. Set to 30s to give slow
+# venues headroom; the dispatcher still respects the sweep deadline (see
+# ``_compute_sweep_deadline``) so a slow tape can never delay the sweep
+# past NASDAQ's 15:55:00 MOC entry cutoff.
+DEFAULT_ENTRY_FILL_TIMEOUT_SECS = 30.0
 
 # RRR1: bounded wall-clock wait for MOC acceptance verification. TWS's
 # placeOrder returns synchronously BEFORE any exchange ack; a rejected
-# MOC (submitted after the ~15:50 exchange cutoff) becomes terminal
-# Cancelled/Inactive within seconds to a minute. We wait up to this
-# many seconds for any MOC to reach terminal-not-Filled state; anything
-# still Submitted at the deadline is presumed accepted (will fill at
-# 16:00). Trade-off: waiting the full ~8 min until 16:00 would be
-# stricter but slows operator feedback with no rejection detected.
-# Cancelled-after-60s residual is small in practice.
+# MOC (submitted after the ~15:55 NASDAQ exchange entry cutoff) becomes
+# terminal Cancelled/Inactive within seconds to a minute. We wait up to
+# this many seconds for any MOC to reach terminal-not-Filled state;
+# anything still Submitted at the deadline is presumed accepted (will
+# fill at 16:00). Trade-off: waiting the full ~5-8 min until 16:00 would
+# be stricter but slows operator feedback with no rejection detected. In
+# practice the definitive verdict now comes from the post-close position
+# poll (see ``DEFAULT_POST_CLOSE_POLL_*``), so this audit is an EARLY
+# warning signal, not the authority.
 DEFAULT_MOC_ACK_TIMEOUT_SECS = 60.0
+
+# Fill-gated MOC dispatcher — sweep-deadline margin formula.
+#
+# We must NOT let a slow tape delay any managed-universe symbol's MOC
+# past NASDAQ's 15:55:00 entry cutoff. The dispatcher submits each
+# symbol's MOC as soon as its entry becomes terminal; a sweep at
+# ``submit_by - sweep_margin`` cancels remaining unfilled entries and
+# submits an MOC for every managed-universe symbol still holding a
+# nonzero position that has not already been covered.
+#
+# The margin must accommodate:
+#   * every ``broker.get_positions()`` call (each contains an ib_async
+#     ``self._ib.sleep(0.5)`` — hard-coded broker cost)
+#   * every ``broker.get_order_status`` call inside the sweep's
+#     belt-and-braces cancel loop
+#   * every MOC ``placeOrder`` call (~0.13s observed in paper mode).
+#
+# Formula (round-2 fix — earlier version budgeted only the placeOrder
+# cost and missed the get_positions/status costs, so at 500 names the
+# real work would exceed the budgeted margin):
+#
+#     margin = max(SWEEP_MIN_MARGIN_SECS,
+#                  n * (SWEEP_PER_ORDER_SECS + SWEEP_PER_STATUS_SECS)
+#                  + 2 * SWEEP_GET_POSITIONS_SECS
+#                  + SWEEP_FIXED_OVERHEAD_SECS)
+#
+# At 49 symbols → 15.0s (floor). At 500 symbols → 500*(0.13+0.1) + 2*0.6
+# + 5 ≈ 121s. The dispatcher additionally consolidates its
+# per-symbol get_positions calls into ONE per tick (see
+# ``_fill_gated_moc_dispatch``) so the pre-sweep window is bounded
+# independently of book size.
+SWEEP_MIN_MARGIN_SECS = 15.0
+SWEEP_PER_ORDER_SECS = 0.13
+SWEEP_PER_STATUS_SECS = 0.1
+SWEEP_GET_POSITIONS_SECS = 0.6
+SWEEP_FIXED_OVERHEAD_SECS = 5.0
+
+# Post-close position verification — poll ``broker.get_positions()``
+# after the 16:00 auction print, retry with exponential backoff up to
+# ``DEFAULT_POST_CLOSE_POLL_UNTIL_TIME`` ET so IB has time to reflect
+# the auction fill. ANY nonzero managed-universe position after the
+# deadline → rc=11 (real overnight exposure). A poll that fails
+# outright is pessimistic — treat as exposure. This replaces the
+# pre-16:00 inference-based verdict as the AUTHORITATIVE exposure
+# signal.
+#
+# Two extra guards on top of the raw poll:
+#
+# * ``DEFAULT_POST_CLOSE_POLL_NOT_BEFORE_TIME`` — the poll REFUSES to
+#   declare FLAT before this wall-clock time (default 16:00 ET plus
+#   ``DEFAULT_POST_CLOSE_POLL_SETTLE_SECS``). Without this a poll that
+#   reached the code path early (e.g. recorder short-circuit at 15:53)
+#   could declare FLAT on a stale/empty response — the exact bug the
+#   ``empty_snapshot_after_fills`` guard exists to defend against.
+# * ``DEFAULT_POST_CLOSE_MIN_CONSECUTIVE_FLAT_READS`` — require N
+#   consecutive successful all-flat reads before returning FLAT (default
+#   2). A transient empty/partial from a broker that returned rows on
+#   a prior poll is suspect, not authoritative.
+DEFAULT_POST_CLOSE_POLL_UNTIL_TIME = "16:05"
+DEFAULT_POST_CLOSE_POLL_INITIAL_INTERVAL_SECS = 5.0
+DEFAULT_POST_CLOSE_POLL_MAX_INTERVAL_SECS = 30.0
+DEFAULT_POST_CLOSE_POLL_NOT_BEFORE_TIME = "16:00"
+DEFAULT_POST_CLOSE_POLL_SETTLE_SECS = 30.0
+DEFAULT_POST_CLOSE_MIN_CONSECUTIVE_FLAT_READS = 2
+# Hard upper bound on wall-clock time spent in the post-close poll —
+# guards against the poll deadline being far in the future (a clock
+# skew, a run started late, or a config typo) and the loop spinning
+# for hours. Independent of NY_TZ — pure wall-clock minutes past
+# ``config.now_ny()`` at the moment the poll is entered.
+POST_CLOSE_POLL_MAX_WINDOW_MINS = 15.0
 
 # Rolling windows for retrain. Covariance uses a longer window because it
 # needs enough daily bars to estimate 10 factors; forecast/impact use a

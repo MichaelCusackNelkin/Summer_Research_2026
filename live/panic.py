@@ -27,9 +27,18 @@ No new broker logic. Reuses ``ibkr_broker.Broker`` primitives:
 
 Gotchas the script surfaces:
 
-- MOC orders CANNOT be cancelled after the exchange's ~15:50 ET entry
-  cutoff. If any BEFORE-snapshot order has order_type=MOC and it is past
-  15:50, we warn: those orders will still print at the close.
+- NASDAQ has TWO distinct MOC deadlines. (1) The CANCEL/MODIFY cutoff
+  at 15:50:00 ET — past this, ``cancel_all`` CANNOT pull an
+  already-accepted MOC (see ``_past_moc_cancel_cutoff``). (2) The
+  ENTRY cutoff at 15:55:00 ET (SEC release 34-84454, 2018 rule change)
+  — past this, NEW MOC submissions are typically rejected at the
+  exchange (see ``_past_moc_entry_cutoff``). NYSE keeps a 15:50 MOC
+  entry cutoff, but this kill switch is aligned with NASDAQ because
+  ``ACTIVE_ROUTING`` targets NASDAQ names (see
+  ``live/nasdaq_routing.py``). If a BEFORE-snapshot order is MOC and
+  we're past 15:50, we warn that cancel_all cannot pull it; if
+  ``--flatten-with MOC`` runs past 15:55, we warn the exchange will
+  likely reject.
 - ``close_position`` with MKT outside regular hours queues MKT orders
   until the next open — use ``--flatten-with MOC`` or wait.
 - The market-hours and MOC-cutoff checks are weekday+clock only. They
@@ -150,11 +159,37 @@ def _is_us_market_open_now() -> bool:
 
 
 def _past_moc_entry_cutoff() -> bool:
-    """The exchange stops accepting new MOC orders around 15:50 ET.
+    """Past NASDAQ's MOC ENTRY cutoff — new MOC submissions typically
+    rejected at the exchange.
 
-    After this, ``cancel_all`` cannot pull already-accepted MOC orders
-    and NEW MOC submissions get rejected. Weekday + clock only; a
-    weekday exchange holiday will look like a normal trading day here.
+    NASDAQ's MOC entry cutoff is 15:55:00 ET (SEC release 34-84454,
+    2018 rule change that extended it from the old 15:50). After
+    this, an MOC ``placeOrder`` is API-accepted at TWS but the
+    exchange rejects it — the order becomes terminal Cancelled with
+    filled=0 within seconds to a minute. (NYSE keeps a 15:50 entry
+    cutoff, but this kill switch targets NASDAQ via
+    ``ACTIVE_ROUTING``; see ``live/nasdaq_routing.py``.)
+
+    Weekday + clock only; a weekday exchange holiday will look like
+    a normal trading day here.
+    """
+    now = config.now_ny()
+    if now.weekday() >= 5:
+        return False
+    return now.time() >= _time(15, 55)
+
+
+def _past_moc_cancel_cutoff() -> bool:
+    """Past NASDAQ's MOC CANCEL/MODIFY cutoff — already-accepted MOCs
+    cannot be pulled by ``cancel_all``.
+
+    Distinct from the ENTRY cutoff (15:55): an MOC that made it to
+    the exchange before 15:55 is unpullable after 15:50. So a BEFORE
+    snapshot at 15:52 showing a queued MOC + no pending cancel is a
+    "will print at 16:00" warning even if the entry cutoff hasn't
+    hit yet.
+
+    Weekday + clock only.
     """
     now = config.now_ny()
     if now.weekday() >= 5:
@@ -247,9 +282,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     # in flight" warning fires after the BEFORE snapshot.
     if args.flatten_with == "MOC" and _past_moc_entry_cutoff() and not args.cancel_only:
         print(
-            "WARNING: --flatten-with MOC after ~15:50 ET — the exchange "
-            "typically rejects new MOC submissions past this cutoff. The "
-            "flatten may be a no-op."
+            "WARNING: --flatten-with MOC after NASDAQ's 15:55 ET entry "
+            "cutoff (SEC 34-84454, 2018 rule) — the exchange typically "
+            "rejects new MOC submissions past this cutoff. The flatten "
+            "may be a no-op."
         )
     if args.flatten_with == "MKT" and not _is_us_market_open_now() and not args.cancel_only:
         print(
@@ -273,16 +309,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         positions_before = broker.get_positions()
         _print_snapshot(orders_before, positions_before, "BEFORE")
 
-        # H3: warn about EXISTING MOC orders past the cutoff. Driven by the
-        # BEFORE snapshot + clock, NOT by --flatten-with — the default MKT
-        # panic won't help against MOC orders the daily already queued.
+        # H3: warn about EXISTING MOC orders past the CANCEL/MODIFY
+        # cutoff (NASDAQ 15:50). Driven by the BEFORE snapshot + clock,
+        # NOT by --flatten-with — the default MKT panic won't help
+        # against MOC orders the daily already queued. The relevant
+        # cutoff here is 15:50 (cancel/modify), NOT 15:55 (entry): an
+        # MOC already accepted at the exchange is unpullable past 15:50.
         moc_before = [o for o in orders_before if o.order_type == "MOC"]
-        if moc_before and _past_moc_entry_cutoff():
+        if moc_before and _past_moc_cancel_cutoff():
             print(
                 f"\nWARNING: {len(moc_before)} MOC order(s) present in the "
-                "BEFORE snapshot AND we are past the ~15:50 ET entry cutoff. "
-                "cancel_all() CANNOT pull them — they WILL execute at the "
-                "16:00 close. This kill switch cannot stop them."
+                "BEFORE snapshot AND we are past NASDAQ's 15:50 ET "
+                "CANCEL/MODIFY cutoff. cancel_all() CANNOT pull them — "
+                "they WILL execute at the 16:00 close. This kill switch "
+                "cannot stop them."
             )
 
         if args.dry_run:
@@ -421,16 +461,17 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.flatten_with == "MOC":
         if _past_moc_entry_cutoff():
-            # M4: past the cutoff, new MOC submissions are typically rejected.
-            # Do NOT claim success — the AFTER snapshot will still show the
+            # M4: past NASDAQ's 15:55 entry cutoff (SEC 34-84454, 2018
+            # rule), new MOC submissions are typically rejected. Do NOT
+            # claim success — the AFTER snapshot will still show the
             # positions and the operator needs to investigate.
             print(
-                f"\nNOT FLAT: MOC flatten submitted past the ~15:50 ET entry "
-                f"cutoff — the exchange likely rejected the new MOC orders. "
-                f"{len(nonflat_positions)} position(s) remain, "
+                f"\nNOT FLAT: MOC flatten submitted past NASDAQ's 15:55 "
+                f"ET ENTRY cutoff — the exchange likely rejected the new "
+                f"MOC orders. {len(nonflat_positions)} position(s) remain, "
                 f"{len(lingering_orders)} order(s) lingering, "
-                f"{len(failures)} failure(s). Verify, and consider MKT or the "
-                "next open."
+                f"{len(failures)} failure(s). Verify, and consider MKT or "
+                "the next open."
             )
             return 1
         print(

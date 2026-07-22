@@ -29,11 +29,11 @@ Rationale for the SMART choice on this book:
 
 * **Exit leg (MOC): two distinct premises — one enforced, one still
   unverified.** The argument is that because the active universe
-  (``top_100_universe.txt``) is effectively all NASDAQ-primary
-  listings, a SMART-routed MOC would land on each name's primary
-  close cross — which for these names IS the NASDAQ close auction
-  the model is calibrated to. Separate the argument into its two
-  premises:
+  (``top_49_universe.txt`` as of 2026-07-21; the plan is to scale
+  toward 500 later) is effectively all NASDAQ-primary listings, a
+  SMART-routed MOC would land on each name's primary close cross —
+  which for these names IS the NASDAQ close auction the model is
+  calibrated to. Separate the argument into its two premises:
 
   1. **"Every name we send an MOC for is NASDAQ-primary"** — now
      enforced. The ``primaryExchange == "NASDAQ"`` filter in
@@ -143,10 +143,12 @@ Coverage
 --------
 
 Every order path in ``live/`` — ``daily_orchestrator._submit_mkt_entries``
-(entry MKT), ``daily_orchestrator._submit_moc_flatten`` (exit MOC),
-``daily_orchestrator._prequalify_symbols`` (contract qualification;
-its ``primaryExchange == "NASDAQ"`` eligibility filter is ACTIVE —
-see the note below), and ``panic.main`` (kill-switch flatten) —
+(entry MKT), ``daily_orchestrator._submit_single_moc`` (per-symbol
+exit MOC used by both ``_fill_gated_moc_dispatch`` and
+``_sweep_moc_deadline``), ``daily_orchestrator._prequalify_symbols``
+(contract qualification; its ``primaryExchange == "NASDAQ"``
+eligibility filter is ACTIVE — see the note below), and
+``panic.main`` (kill-switch flatten) —
 threads ``ACTIVE_ROUTING`` to the ``exchange`` kwarg of
 ``Broker.buy`` / ``Broker.sell`` / ``Broker.close_position`` /
 ``Broker._make_contract``. The broker in turn passes it to
@@ -193,7 +195,9 @@ Expected filter behaviour on the current tiered universes:
   ``primaryExchange == "NASDAQ"``. The observation is recorded in
   ``ibkr_broker/src/ibkr_broker/broker.py:370-372`` from a real
   paper-TWS session.
-* ``top_100_universe.txt`` (the currently active universe) —
+* ``top_100_universe.txt`` (the previously active universe;
+     ``top_49_universe.txt`` is the currently active universe as of
+     2026-07-21) —
   **expected but not yet observed on this system**. The expectation
   is that 99 of the 100 qualify (ITCI fails IB qualification
   outright and is dropped by the still-active try/except upstream
@@ -234,4 +238,19 @@ NASDAQ_EXCHANGE: str = "ISLAND"
 # empirically verified on this system — see the "pre-live gate" note
 # in the module docstring for the venue check that must pass before
 # this routing goes to a live book.
+#
+# Round-2 open concern (SAFETY reviewer finding 7): the round-2
+# design widens the effective sweep window toward 15:55 (NASDAQ's
+# MOC entry cutoff). Because SMART's MOC venue behaviour is not
+# empirically verified for this book, an MOC that SMART routes to a
+# non-NASDAQ venue is bounded by that venue's own cutoff (potentially
+# 15:50 for NYSE). This is a KNOWN RISK that MUST be closed by the
+# pre-live gate above before flipping to live. If the paper-session
+# venue check reveals SMART is not always routing MOC to the NASDAQ
+# close cross, the mitigation is to flip MOC's exchange kwarg in
+# ``_submit_single_moc`` from ``ACTIVE_ROUTING`` to
+# ``NASDAQ_EXCHANGE`` (i.e. direct-route MOC to INET) while leaving
+# the entry MKT on SMART. Not shipped in round-2 because it changes
+# the tested-in-paper routing surface; but the code path is
+# structurally ready.
 ACTIVE_ROUTING: str = "SMART"

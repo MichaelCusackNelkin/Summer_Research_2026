@@ -8,20 +8,68 @@ Runs once per trading day. Timeline:
              against current IBKR positions
    15:50 ET  ENTRY batch: per-name MKT sized to ``target - current``
              via ``broker.buy`` / ``broker.sell`` (default tif=DAY).
-   15:50 ET  Bounded fill-wait (per-order + global budget tied to the
-             MOC cutoff), then belt-and-braces cancel of any entry
-             still in a non-terminal state.
-   15:50 ET  EXIT batch: per-name MOC sized to the ACTUAL post-entry
-             position (never to ``target - current``). This flattens
-             the managed universe to zero at the 16:00 auction.
-  <=15:55    hard stop for MOC EXIT submission
+   15:50 ET+ FILL-GATED MOC DISPATCH: a single-threaded polling loop
+             concurrently monitors every entry's status. As each entry
+             becomes terminal Filled, its opposite-side MOC is
+             submitted IMMEDIATELY, sized to the ACTUAL current
+             position (fresh ``broker.get_positions()``). An entry
+             that fills zero receives NO MOC from this path. A
+             staleness check (``baseline + signed_fill == snapshot``)
+             defers any lagging symbol to the sweep rather than
+             sizing an MOC off a pre-fill position book (round-4
+             fix: IB emits execution reports BEFORE position updates,
+             so a reducing entry against a nonzero baseline could
+             otherwise MOC off the stale +qty and end up short).
+   ~15:51    FIRST SWEEP (immediately after dispatcher): cancels any
+             entry still non-terminal, verifies dispatcher MOCs are
+             still live at the exchange (drops coverage credit for
+             any terminal-rejected MOC so the sweep re-fires),
+             takes a fresh ``get_positions()``, and issues MOCs for
+             every managed-universe symbol whose
+             ``held + covered_signed != 0`` (two-sided: TOPS UP an
+             under-cover, TRIMS an over-cover). Value: EARLY
+             exposure detection — pre-close signals fire in time
+             for the operator to run ``live.panic`` before 16:00.
+   <=15:55   SECOND SWEEP at the real ``sweep_deadline`` (computed
+             dynamically from book size — see
+             ``_compute_sweep_deadline``). SLEEP from ~15:51 to the
+             deadline is pumped with periodic ``get_positions()``
+             calls so the ib_async connection stays alive during
+             the wait. On a normal day the second sweep issues
+             ZERO orders — its value is confirmation: fresh
+             snapshot ~3-4 minutes later has caught up on any IB
+             position-propagation lag, re-verifies every prior MOC
+             (dispatcher + first sweep) is still live, and re-fires
+             for any residual. This is the GUARANTEE — no
+             residual/baseline position strands overnight because
+             its entry didn't fill today, and no late cancel-race
+             fill goes uncovered.
+   16:00     NASDAQ closing cross prints.
+  <=16:05    POST-CLOSE POSITION POLL: ``broker.get_positions()`` is
+             polled with backoff. Any nonzero managed-universe symbol
+             after this window = rc=11 (real overnight exposure).
+             This is the AUTHORITATIVE exposure verdict; earlier
+             signals are early warnings that can still short-circuit
+             to rc=11 pre-close so the operator has time to run panic.
 
-The two legs together capture the strategy's forecasted 15:50 -> 16:00
-close-auction move: the MKT batch enters intraday, the MOC exit lifts
-at the closing print, and the book is flat overnight. The MOC size is
-ALWAYS ``|current_qty|`` (measured immediately before the MOC send) so
-a partial MKT fill can never over-flatten into an opposite overnight
+The two-leg model captures the strategy's forecasted 15:50 -> 16:00
+close-auction move: MKT entries land intraday, MOC exits lift at the
+closing print, and the book is flat overnight. The MOC size is ALWAYS
+``|current_qty|`` (measured immediately before the MOC send) — a
+partial MKT fill can never over-flatten into an opposite overnight
 exposure.
+
+Ground-truth ON EXCHANGE DEADLINES (verified against SEC/Nasdaq/IB):
+- NASDAQ MOC ENTRY cutoff: 15:55:00 ET. MOC orders may be entered
+  4:00am - 15:55:00 ET. (Nasdaq extended this from 15:50 in the 2018
+  rule change, SEC release 34-84454.)
+- NASDAQ MOC CANCEL/MODIFY cutoff: 15:50:00 ET.
+- NYSE MOC entry cutoff: 15:50:00 ET (different venue, different rule).
+- NASDAQ LOC may be entered 15:55-15:58 given a First Reference Price.
+- Closing cross runs at 16:00:00.
+
+This strategy targets NASDAQ exclusively (see ``live/nasdaq_routing.py``),
+so 15:55 is the load-bearing cutoff.
 
 Everything broker-side happens through the ``ibkr_broker.Broker``
 primitives (``buy`` / ``sell`` / ``get_positions`` /
@@ -36,7 +84,7 @@ Safety defaults:
 
 Exit-code taxonomy (orchestrator only; see retrain.py and panic.py for
 their own spaces):
-  0   success (both legs sent; book will be flat after 16:00 close)
+  0   success (both legs sent; post-close position poll confirmed FLAT)
   2   feed abort or feature-build failure (no orders placed)
   3   solver failure (no orders placed)
   4   past MOC submit cutoff BEFORE any orders placed (safe skip)
@@ -45,13 +93,40 @@ their own spaces):
   7   --replay-submit without --replay-date
   8   broker connect failed (no orders placed)
   9   --lambda- <= 0 (invalid argument, no orders placed)
-  11  entries submitted but MOC exit could not fully cover the book:
-      legs skipped past cutoff, get_positions failed, the snapshot came
-      back stale-empty, the ground-truth cross-check found uncovered
-      symbols (partial-snapshot / budget-exhausted-with-real-fill /
-      TWS-brownout stale non-terminal), or the MOC acceptance audit
-      found exchange rejections (MOC placed after ~15:50 cutoff).
-      OVERNIGHT EXPOSURE POSSIBLE — page the operator.
+  11  OVERNIGHT EXPOSURE POSSIBLE — page the operator. Any of:
+        * pre-close signals (EARLY page so the operator has time to
+          run panic before 16:00): legs skipped past cutoff (either
+          the fill-gated dispatcher's per-tick cutoff refusal OR the
+          sweep's own past-cutoff refusal), get_positions failed,
+          stale-empty snapshot after fills, the ground-truth
+          cross-check found uncovered symbols, the MOC acceptance
+          audit found exchange rejections (MOC placed after NASDAQ's
+          15:55 cutoff), the sweep's belt-and-braces cancel failed
+          for an entry (uncancellable entries may still fill into
+          unhedged overnight positions), OR the fill-gated
+          dispatcher's per-symbol MOC submission raised at the
+          broker (a ``buy``/``sell`` exception may leave the request
+          in an indeterminate state at TWS — round-4 fix: this
+          signal was previously computed and dropped, reintroducing
+          the "neither moc_batch nor skipped" gap that risked a
+          double-flatten from the sweep);
+        * post-close (16:00-16:05) position poll found a nonzero
+          managed-universe symbol still on the book, OR the poll
+          itself failed (pessimistic verdict), OR reached its
+          deadline without a confirmed FLAT (never got the
+          ``DEFAULT_POST_CLOSE_MIN_CONSECUTIVE_FLAT_READS`` needed
+          past the ``DEFAULT_POST_CLOSE_POLL_NOT_BEFORE_TIME``
+          threshold), OR the poll block itself raised an
+          exception (round-3 pessimistic wrap — cannot verify =
+          cannot claim flat). This is the AUTHORITATIVE signal
+          — it replaces inference and runs for every code path
+          that reached the broker (including ``--replay-submit``,
+          except a ``--replay-submit`` REHEARSAL that reaches the
+          poll BEFORE today's ``DEFAULT_POST_CLOSE_POLL_NOT_BEFORE_TIME``
+          wall clock — the poll SKIPS with a WARNING because a
+          historical replay's fills cannot be verified against
+          today's auction; the operator MUST manually flatten
+          the paper account before the next real session).
 
 The pager predicate is ``rc >= 11``: rc=11 is the ONLY code that
 implies a live book at close. Everything else in [2, 10] is a safe
@@ -80,7 +155,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import joblib
 import numpy as np
@@ -176,16 +251,20 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help=(
             "Hard cutoff (HH:MM ET) for MOC EXIT submission. "
             "Default: " + config.DEFAULT_SUBMIT_BY_TIME + ". "
-            "Note: NYSE/Nasdaq MOC ENTRY cutoff is 15:50 ET, not 15:55 — "
-            "any leg placed after 15:50 is expected to face MOC rejection "
-            "on some exchanges. This flag ONLY bounds the MOC exit batch; "
-            "the MKT entry batch fires unconditionally so the operator is "
-            "never left with a filled entry and no queued exit. If the "
-            "cutoff was already past at orchestrator entry (no orders "
-            "placed), the process exits rc=4 (safe skip). If the cutoff "
-            "trips mid-flow AFTER entries filled, the process exits rc=11 "
-            "(OVERNIGHT EXPOSURE) and the target record lists the open "
-            "positions."
+            "This is NASDAQ's MOC ENTRY cutoff of 15:55:00 ET (SEC "
+            "release 34-84454, 2018 rule change). This flag ONLY bounds "
+            "the MOC exit batch; the MKT entry batch fires unconditionally "
+            "so the operator is never left with a filled entry and no "
+            "queued exit. The fill-gated dispatcher fires each MOC "
+            "immediately after its entry becomes terminal; the deadline "
+            "sweep at ``submit_by - sweep_margin`` (where sweep_margin "
+            "scales with book size — see ``_compute_sweep_deadline``) "
+            "guarantees every managed-universe held position has an MOC "
+            "away before the cutoff. If the cutoff was already past at "
+            "orchestrator entry (no orders placed), the process exits "
+            "rc=4 (safe skip). If the cutoff trips mid-flow AFTER "
+            "entries filled, the process exits rc=11 (OVERNIGHT "
+            "EXPOSURE) and the target record lists the open positions."
         ),
     )
     p.add_argument(
@@ -305,6 +384,19 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "combining with --live is refused (rc=6) regardless. If you "
             "enable this, flatten the paper account before the next real "
             "session."
+        ),
+    )
+    p.add_argument(
+        "--replay-ignore-cutoff", action="store_true", default=False,
+        help=(
+            "In replay mode, IGNORE the real ``--submit-by`` wall-clock "
+            "cutoff (neutralise it to now+1h). Off by default — replay "
+            "now HONOURS the real cutoff, so a late-in-the-day rehearsal "
+            "correctly surfaces the same rc=4 / rc=11 codes a real run "
+            "would. Pass this flag to preserve the earlier "
+            "afternoon-rehearsal ergonomics where you deliberately want "
+            "to exercise the order path even though ``now`` is past "
+            "15:55. Only meaningful with --replay-date."
         ),
     )
     return p.parse_args(argv)
@@ -614,17 +706,105 @@ def _stop_feed_safe(feed) -> None:
         logger.exception("feed stop failed (non-fatal)")
 
 
-def _sleep_until(target: datetime, poll: float = 5.0) -> None:
+def _sleep_until(
+    target: datetime,
+    poll: float = 5.0,
+    pump=None,
+    pump_interval: float = 30.0,
+) -> None:
     """Block until ``target`` (America/New_York timezone).
 
     Uses coarse polling so signals and Ctrl-C wake the process quickly.
+
+    ROUND-4 SAFETY FIX (SAFETY reviewer finding 4). ``time.sleep`` does
+    NOT service the asyncio event loop; ib_async only pumps inside
+    ``ib.sleep()`` (which is what ``Broker.get_positions`` internally
+    calls). A long unpumped sleep with the ib_async connection open
+    starves the loop while TWS keeps streaming position/order/account
+    updates into the socket — the connection can be dropped or wedged,
+    and every subsequent ``get_positions`` call would then raise. On
+    the rc=0 path that would drive ``_poll_positions_after_close`` into
+    its pessimistic EXPOSED branch, spuriously paging rc=11 on a
+    genuinely flat book.
+
+    If ``pump`` is supplied, it is invoked every ``pump_interval``
+    seconds during the wait to keep the underlying connection alive
+    (typically ``lambda: broker.get_positions()`` — that call's
+    internal ``ib.sleep(0.5)`` is what actually services the loop, and
+    the returned positions double as an early exposure canary). Pump
+    exceptions are logged as warnings but do not interrupt the wait —
+    a transient TWS blip during a 4-minute sleep must not delay the
+    downstream sweep / verdict, and the eventual authoritative check
+    (``_poll_positions_after_close``) has its own pessimistic-on-raise
+    behaviour.
     """
+    last_pump = time.time()
     while True:
         now = config.now_ny()
         remaining = (target - now).total_seconds()
         if remaining <= 0:
             return
         time.sleep(min(remaining, poll))
+        if pump is not None and (time.time() - last_pump) >= pump_interval:
+            try:
+                pump()
+            except Exception:
+                logger.warning(
+                    "pump callback raised during _sleep_until (non-fatal)",
+                    exc_info=True,
+                )
+            last_pump = time.time()
+
+
+def _wait_for_marks_pumped(
+    recorder,
+    broker,
+    timeout: float,
+    pump_interval: float = 30.0,
+) -> bool:
+    """``recorder.wait_for_marks`` in short slices with a broker pump
+    between slices to keep the ib_async connection alive.
+
+    ROUND-4 SAFETY FIX (SAFETY reviewer finding 4). ``wait_for_marks``
+    is a ``threading.Event.wait`` — does NOT service the asyncio event
+    loop. A ~350s wait right before the authoritative
+    ``_poll_positions_after_close`` was the last long unpumped stretch
+    in the rc=0 path; on a bad day it could wedge the connection and
+    force the poll into its pessimistic-EXPOSED branch, paging rc=11
+    on a genuinely flat book.
+
+    Returns True iff the marks thread signalled completion before the
+    total timeout. Pump exceptions are logged as warnings; the wait
+    continues so a transient TWS blip during this window cannot delay
+    the rc verdict.
+    """
+    if recorder is None:
+        return False
+    deadline = time.time() + timeout
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return False
+        this_wait = min(pump_interval, remaining)
+        try:
+            done = recorder.wait_for_marks(timeout=this_wait)
+        except Exception:
+            logger.warning(
+                "recorder.wait_for_marks raised (non-fatal); giving up "
+                "on marks wait so post-close poll can proceed",
+                exc_info=True,
+            )
+            return False
+        if done:
+            return True
+        if broker is not None:
+            try:
+                broker.get_positions()
+            except Exception:
+                logger.warning(
+                    "broker heartbeat during marks wait failed (non-fatal)",
+                    exc_info=True,
+                )
 
 
 
@@ -894,16 +1074,17 @@ def _prequalify_symbols(broker, symbols: list[str]) -> set[str]:
       qualify with ``primaryExchange == "NASDAQ"`` (recorded in
       ``ibkr_broker/src/ibkr_broker/broker.py:370-372`` from a real
       paper-TWS session).
-    * ``top_100_universe.txt`` (the currently active universe) —
-      **expected but not yet observed on this system**: 99 of the
-      100 should qualify with all 99 NASDAQ-primary (ITCI fails IB
-      qualification outright and is dropped by the still-active
-      try/except above, never reaching this filter). No paper-TWS
-      observation exists yet for the 100-name set; the one paper
-      run that would have exercised it (2026-07-20) rejected 46 of
-      46 requested symbols at the broker guard upstream of this
-      filter. The ``contracts pre-qualified`` log line below is the
-      operator signal — the pre-live gate in
+    * ``top_100_universe.txt`` (the previously active universe;
+      ``top_49_universe.txt`` is the currently active universe as of
+      2026-07-21) — **expected but not yet observed on this
+      system**: 99 of the 100 should qualify with all 99
+      NASDAQ-primary (ITCI fails IB qualification outright and is
+      dropped by the still-active try/except above, never reaching
+      this filter). No paper-TWS observation exists yet for the
+      100-name set; the one paper run that would have exercised it
+      (2026-07-20) rejected 46 of 46 requested symbols at the broker
+      guard upstream of this filter. The ``contracts pre-qualified``
+      log line below is the operator signal — the pre-live gate in
       ``live/nasdaq_routing.py`` calls for ``n_ok == n_requested``
       (or ``n_ok == n_requested - 1`` for the ITCI drop) on the
       first paper session to settle the claim.
@@ -997,17 +1178,21 @@ def _submit_mkt_entries(
 
     Routed via ``broker.buy`` / ``broker.sell`` with ``order_type="MKT"``
     and the primitive default ``tif="DAY"`` — a stuck MKT that never
-    fills is bounded by the belt-and-braces cancel loop in main() (any
-    entry whose status has not reached a terminal state by the end of
-    ``_wait_entry_fills`` gets an explicit ``broker.cancel``), which
-    runs before the MOC snapshot so a late fill can't leave an
-    unhedged position after the counter-flatten is sized.
+    fills is bounded by the round-2 fill-gated dispatcher
+    (``_fill_gated_moc_dispatch``) and the deadline sweep
+    (``_sweep_moc_deadline``): the dispatcher polls entries every
+    ``poll_interval_secs`` and stops waiting at
+    ``sweep_deadline``, and the sweep then cancels any entry still
+    non-terminal via ``broker.cancel``. That happens before the sweep
+    sizes its counter-flatten from a fresh get_positions, so a late
+    fill can't leave an unhedged position after MOCs go out.
 
     Fires unconditionally with respect to the MOC submit-by cutoff — an
     entered position with no exit is bad, but so is refusing to enter
     because we're worried about the exit; the operator needs to know
-    either way (the MOC-skip case is handled downstream by
-    ``_submit_moc_flatten``).
+    either way (the MOC-skip case is handled by
+    ``_fill_gated_moc_dispatch`` firing per-symbol and
+    ``_sweep_moc_deadline`` catching everything left).
 
     Out-of-universe symbols (``sym in current but not managed_universe``)
     are pinned to their current qty upstream, so they diff to zero here
@@ -1015,8 +1200,9 @@ def _submit_mkt_entries(
 
     Returns a list of dicts, one per attempted entry, with keys:
       symbol, side, requested_qty, order_id (str|None), error (str|None).
-    Downstream, ``_wait_entry_fills`` populates ``filled_qty`` and
-    ``status`` from ``broker.wait_for_fill``.
+    Downstream, ``_fill_gated_moc_dispatch`` populates ``filled_qty``
+    and ``status`` from ``broker.get_order_status``; the sweep does
+    the same for any entry the dispatcher gave up on.
     """
     entries: list[dict] = []
     for sym, tgt in sorted(targets.items()):
@@ -1073,7 +1259,14 @@ _TERMINAL_ORDER_STATES: frozenset[str] = frozenset({
 
 
 def _cancel_non_terminal_entries(broker, entries: list[dict]) -> list[str]:
-    """Cancel every entry whose status is not in a terminal state.
+    """ORPHANED as of round 2 — superseded by the belt-and-braces cancel
+    step inside ``_sweep_moc_deadline``. Retained for reference so a
+    reader who chases the module's historical execution model still
+    finds the semantics, and so a future rollback can restore the
+    two-phase model with a one-line call-site edit. No main()
+    call site exercises this function today.
+
+    Cancel every entry whose status is not in a terminal state.
 
     Plain MKT orders in a liquid name at 15:50 should be terminal within
     milliseconds, so under normal conditions this loop is a no-op. It
@@ -1126,7 +1319,15 @@ def _wait_entry_fills(
     per_order_timeout: float = config.DEFAULT_ENTRY_FILL_TIMEOUT_SECS,
     safety_buffer_secs: float = 30.0,
 ) -> list[dict]:
-    """Block until each submitted entry order is terminal, bounded by a
+    """ORPHANED as of round 2 — superseded by
+    ``_fill_gated_moc_dispatch``, which polls entries concurrently
+    (single-threaded fast poll) and fires each opposite-side MOC the
+    moment the entry becomes terminal. Retained for reference. No
+    main() call site exercises this function today; the round-2 sweep
+    deadline replaces the ``submit_by - safety_buffer_secs`` bound
+    this function computed.
+
+    Block until each submitted entry order is terminal, bounded by a
     GLOBAL deadline tied to ``submit_by``.
 
     Rationale (R5): a naive ``N * per_order_timeout`` loop can burn 8+
@@ -1210,7 +1411,15 @@ def _submit_moc_flatten(
     managed_universe: set[str],
     submit_by: datetime,
 ) -> tuple[list[dict], list[str], bool]:
-    """EXIT batch: MOC counter-orders sized to the ACTUAL current position.
+    """ORPHANED as of round 2 — superseded by the pair
+    ``_fill_gated_moc_dispatch`` (per-symbol MOC as each entry fills) +
+    ``_sweep_moc_deadline`` (deadline top-up sized from a fresh
+    get_positions). Retained for reference. No main() call site
+    exercises this function today. The signature-refuses-target-side-
+    args safety invariant it documented is now enforced identically by
+    ``_submit_single_moc`` and ``_sweep_moc_deadline``.
+
+    EXIT batch: MOC counter-orders sized to the ACTUAL current position.
 
     Snapshots ``broker.get_positions()`` fresh, aggregates by symbol
     (R4: IB can duplicate rows for the same symbol on rare occasions —
@@ -1316,6 +1525,1016 @@ def _submit_moc_flatten(
     return moc_batch, skipped, False
 
 
+def _compute_sweep_deadline(
+    submit_by: datetime,
+    n_managed_symbols: int,
+) -> tuple[datetime, float]:
+    """Return ``(sweep_deadline, sweep_margin_secs)``.
+
+    The sweep runs before ``submit_by`` (NASDAQ MOC entry cutoff, default
+    15:55:00 ET) with enough headroom for its full worst-case cost:
+
+      * two ``get_positions()`` calls (each ~0.5-0.6s of hard-coded
+        ib_async sleep — one for the sweep's own snapshot and one
+        residual buffer for the dispatcher's final tick)
+      * one ``get_order_status`` call per entry (belt-and-braces cancel
+        pass)
+      * one ``placeOrder`` per not-already-covered symbol (~0.13s)
+
+    Formula:
+        margin = max(SWEEP_MIN_MARGIN_SECS,
+                     n * (SWEEP_PER_ORDER_SECS + SWEEP_PER_STATUS_SECS)
+                     + 2 * SWEEP_GET_POSITIONS_SECS
+                     + SWEEP_FIXED_OVERHEAD_SECS)
+
+    Scales with book size so the same code path works at 49 names today
+    (floor: 15s) and 500 names later (~121s) without a manual tuning knob.
+    """
+    per_order = config.SWEEP_PER_ORDER_SECS
+    per_status = config.SWEEP_PER_STATUS_SECS
+    get_positions = config.SWEEP_GET_POSITIONS_SECS
+    overhead = config.SWEEP_FIXED_OVERHEAD_SECS
+    floor = config.SWEEP_MIN_MARGIN_SECS
+    margin = max(
+        floor,
+        n_managed_symbols * (per_order + per_status)
+        + 2 * get_positions
+        + overhead,
+    )
+    deadline = submit_by - timedelta(seconds=margin)
+    return deadline, margin
+
+
+def _submit_single_moc(
+    broker,
+    symbol: str,
+    current_qty: int,
+    submit_by: datetime,
+) -> tuple[Optional[dict], str]:
+    """Submit ONE opposite-side MOC for ``symbol`` sized to ``|current_qty|``.
+
+    Signature deliberately admits no target-side data — only the ACTUAL
+    ``current_qty`` (from a fresh ``broker.get_positions()`` snapshot)
+    can size this leg. Same structural invariant every LEG-2 sender
+    upholds — a refactor that added a target argument must be
+    rejected at review. Additionally, ``submit_by`` is REQUIRED so
+    every submission is guarded against the NASDAQ MOC entry cutoff:
+    a submit past ``submit_by`` is refused BEFORE ``placeOrder`` is
+    called, so we never send a MOC the exchange will silently reject
+    past 15:55.
+
+    Returns ``(leg_dict_or_None, outcome)``. ``outcome`` is one of:
+      * ``"ok"``          — leg was sent; ``leg_dict`` populated.
+      * ``"skipped_cutoff"`` — wall clock is past ``submit_by``;
+        nothing sent. Caller must treat as EXPOSURE for that symbol.
+      * ``"skipped_zero"`` — ``current_qty`` was 0; nothing to
+        flatten (safe).
+      * ``"error"``       — broker raised on submission. Caller must
+        treat as EXPOSURE.
+    """
+    if current_qty == 0:
+        return None, "skipped_zero"
+    if config.now_ny() > submit_by:
+        logger.error(
+            "MOC exit REFUSED — wall clock past --submit-by cutoff. "
+            "POSITION LEFT OPEN.",
+            extra={"symbol": symbol, "current_qty": current_qty,
+                   "submit_by": submit_by.isoformat(),
+                   "now": config.now_ny().isoformat()},
+        )
+        return None, "skipped_cutoff"
+    qty = abs(int(current_qty))
+    side = "SELL" if current_qty > 0 else "BUY"
+    try:
+        if side == "BUY":
+            oid = broker.buy(symbol, qty, order_type="MOC",
+                             exchange=ACTIVE_ROUTING)
+        else:
+            oid = broker.sell(symbol, qty, order_type="MOC",
+                              exchange=ACTIVE_ROUTING)
+    except Exception as e:
+        logger.warning(
+            "MOC exit submission failed",
+            extra={"symbol": symbol, "side": side, "qty": qty,
+                   "error": str(e)[:200]},
+        )
+        return None, "error"
+    signed_qty = qty if side == "BUY" else -qty
+    logger.info(
+        "MOC exit placed",
+        extra={"symbol": symbol, "side": side, "qty": qty,
+               "current_qty": current_qty, "order_id": oid},
+    )
+    return {
+        "oid": oid, "symbol": symbol, "side": side,
+        "qty": qty, "signed_qty": signed_qty,
+    }, "ok"
+
+
+def _snapshot_managed_positions(
+    broker,
+    managed_universe: set[str],
+) -> Optional[dict[str, int]]:
+    """One ``broker.get_positions()`` call → managed-universe qty map.
+
+    Returns ``None`` iff ``get_positions()`` raised (positions
+    UNKNOWN — caller must escalate to the exposure path). Otherwise a
+    fresh ``{symbol: signed_qty}`` for every managed-universe symbol
+    that has a nonzero row. Aggregates duplicate rows the same way
+    ``_sweep_moc_deadline`` does (multi-account / update-race).
+
+    Consolidating N per-symbol ``_current_position_for`` calls into ONE
+    per-tick call is the round-2 fix for the dispatcher's O(N)
+    hard-coded 0.5s sleep from ``broker.get_positions()`` — at 500
+    names the earlier per-symbol pattern would have added 250s of pure
+    sleep to the dispatcher window and blown the 15:55 cutoff.
+    """
+    try:
+        positions = broker.get_positions()
+    except Exception as e:
+        logger.error(
+            "MOC exit: get_positions FAILED during fill-gated dispatch — "
+            "POSITIONS MAY BE LIVE INTO THE CLOSE, OPERATOR MUST "
+            "MANUALLY FLATTEN",
+            extra={"error": str(e)[:200]},
+        )
+        return None
+    agg: dict[str, int] = {}
+    for p in positions:
+        if p.symbol not in managed_universe:
+            continue
+        agg[p.symbol] = agg.get(p.symbol, 0) + int(p.quantity)
+    return agg
+
+
+def _fill_gated_moc_dispatch(
+    broker,
+    entries: list[dict],
+    managed_universe: set[str],
+    sweep_deadline: datetime,
+    submit_by: datetime,
+    baseline: Optional[dict[str, int]] = None,
+    poll_interval_secs: float = 0.25,
+    max_wait_secs: Optional[float] = None,
+) -> tuple[list[dict], dict[str, int], list[str], list[str], bool]:
+    """CONCURRENTLY monitor entry fills and fire each MOC as soon as
+    its entry becomes terminal.
+
+    Design: single-threaded fast-polling loop rather than a
+    ThreadPoolExecutor of ``wait_for_fill`` calls. ib_async is NOT
+    thread-safe, so multi-thread wait calls would race the event loop.
+    Instead, iterate every pending entry once per tick, read its
+    terminal-state via ``broker.get_order_status`` (a local self._trades
+    dict read — O(N) microseconds per call, not a network round-trip),
+    and if terminal Filled with ``filled > 0``, immediately submit the
+    counter-side MOC sized from a per-tick ``broker.get_positions()``
+    snapshot for that symbol. An entry that reaches terminal state
+    with ``filled == 0`` (Cancelled, Inactive, or Filled-zero) receives
+    NO MOC from this path — its position stays flat.
+
+    ROUND-2 SCALABILITY FIX. Earlier round-1 code called
+    ``broker.get_positions()`` ONCE PER FILLED SYMBOL inside the inner
+    loop. ``ibkr_broker.Broker.get_positions`` contains a hard-coded
+    ``self._ib.sleep(0.5)``, so N calls costs ~0.5*N seconds regardless
+    of anything the strategy does. At the operator's planned 500-name
+    book that was 250s of pure sleep, blowing the 15:55 cutoff before
+    the sweep even ran. The new pattern is:
+
+      * take ONE ``broker.get_positions()`` at the top of each tick
+        via ``_snapshot_managed_positions`` — cost 0.5s/tick, not
+        0.5s/name.
+      * index that snapshot by symbol; per-terminal-entry lookups are
+        O(1).
+      * check the wall clock against the ``effective_deadline`` INSIDE
+        the inner symbol loop as well as at the top of the tick, so a
+        single long pass cannot silently overrun the sweep deadline.
+
+    Concurrency in the operator's sense: each symbol's MOC fires as
+    soon as its entry becomes terminal, not after all N entries are
+    checked.
+
+    The loop exits when either
+    (a) every entry has reached terminal state (Filled or otherwise), or
+    (b) the wall clock crosses ``sweep_deadline``.
+
+    In case (b) the remaining non-terminal entries are LEFT for the
+    caller's sweep to cancel and reconcile.
+
+    Every ``_submit_single_moc`` call carries ``submit_by`` so a slow
+    fill that pushed us past the cutoff mid-tick refuses to submit
+    (returning outcome ``"skipped_cutoff"``) rather than firing a MOC
+    the exchange will silently reject.
+
+    ROUND-4 SAFETY FIX (SAFETY reviewer finding 2). ``baseline`` is
+    the pre-entry position book ``{symbol: signed_qty}`` from the
+    orchestrator's initial ``broker.get_positions()`` call. Real IB
+    emits the execution report BEFORE the position update, so a
+    dispatcher tick that observes ``status=Filled`` may still read the
+    PRE-fill position quantity. With a nonzero baseline (residual
+    carried in from a prior day, or a manual position that pre-dates
+    today's run), a REDUCING entry against that baseline would size
+    an MOC to the STALE pre-fill position — a SELL 100 entry against
+    baseline +100 filling to 0 would still see current=+100, submit
+    SELL MOC 100, and end up with a naked SHORT 100 overnight because
+    the true post-fill position was 0. Fix: for each newly-terminal
+    entry, compute the deterministic expected post-fill quantity
+    ``expected = baseline.get(sym, 0) + (filled if BUY else -filled)``
+    and refuse to submit an MOC when ``tick_snapshot[sym] != expected``.
+    The symbol stays in ``pending`` so the sweep (which snapshots
+    later, giving IB more time to catch up) re-verifies. This is NOT
+    the forbidden ``target - current`` sizing — the MOC is still sized
+    to the observed snapshot when it agrees with expectations; we only
+    use ``baseline + signed_fill`` as a STALENESS CHECK, and the same
+    arithmetic is what ``_coverage_cross_check`` treats as ground
+    truth. ``baseline=None`` (default) skips the check — used only by
+    direct unit tests where the caller doesn't have a baseline handy.
+    Main() ALWAYS passes it.
+
+    Returns ``(moc_batch, covered_qty, uncovered_symbols,
+    skipped_past_cutoff, positions_unknown)``:
+
+    * ``moc_batch`` — MOC legs the fill-gated path submitted.
+    * ``covered_qty`` — ``{symbol: signed_qty_MOC_sent}``. The sweep
+      consumes this to compute a residual per symbol (see
+      ``_sweep_moc_deadline``) — a fill-gated MOC that under-sized
+      relative to the true post-tick position gets a top-up from the
+      sweep instead of being silently skipped.
+    * ``uncovered_symbols`` — symbols whose entry became terminal
+      Filled but whose ``_submit_single_moc`` returned ``"error"``
+      (broker ``buy``/``sell`` raised at submission time — the API
+      call itself failed, not the sizing snapshot). Snapshot failure
+      is signalled separately via ``positions_unknown``. Feeds
+      pre-close exposure directly (rc=11) because a submission
+      exception can leave the request in an indeterminate state at
+      TWS — some paths accept then raise the read timeout AFTER the
+      order was queued at the exchange, so a bare "assume nothing
+      happened" would defer to the sweep and risk a double-flatten.
+    * ``skipped_past_cutoff`` — symbols whose ``_submit_single_moc``
+      was refused because the wall clock crossed ``submit_by``. Feeds
+      the pre-close exposure signal directly (rc=11).
+    * ``positions_unknown`` — True if any ``get_positions()`` raised
+      during dispatch. Callers should treat this as an early exposure
+      signal.
+
+    Mutates each entry in place: sets ``filled_qty`` and ``status``
+    from ``get_order_status`` when known so ``_coverage_cross_check``
+    can consume the same rows.
+    """
+    if baseline is None:
+        baseline = {}
+    if not entries:
+        return [], {}, [], [], False
+
+    pending = {
+        e["order_id"]: e
+        for e in entries
+        if e.get("order_id") is not None
+    }
+    for e in entries:
+        if e.get("order_id") is None:
+            e["filled_qty"] = 0
+            e["status"] = "not_submitted"
+
+    moc_batch: list[dict] = []
+    covered_qty: dict[str, int] = {}
+    uncovered: list[str] = []
+    skipped_past_cutoff: list[str] = []
+    positions_unknown = False
+
+    # Effective deadline caps at ``max_wait_secs`` past dispatch start
+    # so a book of stuck entries can't tie up the dispatcher for the
+    # whole ~5-minute pre-sweep window. Under normal conditions
+    # (liquid MKT, sub-second fills) the loop exits almost
+    # immediately as every entry becomes terminal Filled.
+    if max_wait_secs is None:
+        max_wait_secs = config.DEFAULT_ENTRY_FILL_TIMEOUT_SECS
+    max_dispatcher_deadline = (
+        config.now_ny() + timedelta(seconds=max_wait_secs)
+    )
+    effective_deadline = min(sweep_deadline, max_dispatcher_deadline)
+
+    while pending:
+        if config.now_ny() >= effective_deadline:
+            # Deadline reached — return leaving remaining entries as
+            # "still pending". The sweep handles them.
+            for oid, e in pending.items():
+                e.setdefault("filled_qty", 0)
+                e.setdefault("status", "pending_at_sweep_deadline")
+                logger.warning(
+                    "fill-gated dispatch: sweep deadline reached with "
+                    "entry still non-terminal; leaving for sweep",
+                    extra={"order_id": oid, "symbol": e.get("symbol")},
+                )
+            break
+
+        # ROUND-3 SAFETY FIX (SAFETY reviewer finding 1): read order
+        # status FIRST (fast, local ib_async cache), then take the
+        # position snapshot ONLY AFTER we know some entries are newly
+        # terminal. Real IB propagates the position update AFTER the
+        # execution report — the earlier ordering (snapshot first,
+        # status second) let a REDUCING entry against a nonzero
+        # baseline get MOC-sized to the PRE-fill position. The
+        # snapshot call also carries a 0.5s ib.sleep, which gives IB
+        # time to catch up between the status observation and the
+        # position read. If the snapshot is still stale, the sweep's
+        # two-sided top-up/trim (below) is the second line of
+        # defence.
+        newly_terminal: list[tuple[str, dict, int, str]] = []
+        deadline_hit_mid_tick = False
+        entries_to_pop: list[str] = []
+        for oid, e in list(pending.items()):
+            # Round-2: check deadline INSIDE the inner loop too. At
+            # 500 names a full tick can approach the sweep margin;
+            # without this a single pass could silently overrun.
+            if config.now_ny() >= effective_deadline:
+                deadline_hit_mid_tick = True
+                break
+            sym = e["symbol"]
+            try:
+                info = broker.get_order_status(oid)
+                status = getattr(info, "status", "") or ""
+                filled = int(getattr(info, "filled", 0) or 0)
+            except Exception as ex:
+                logger.warning(
+                    "fill-gated dispatch: get_order_status failed; "
+                    "leaving entry for sweep",
+                    extra={"order_id": oid, "symbol": sym,
+                           "error": str(ex)[:200]},
+                )
+                # Leave in pending; if it repeats we hit the deadline
+                # and the sweep will pick it up.
+                continue
+            if status not in _TERMINAL_ORDER_STATES:
+                continue
+            # Terminal.
+            e["filled_qty"] = filled
+            e["status"] = status
+            if filled <= 0:
+                # No position to flatten from this entry — leave it
+                # alone. Operator's stated behaviour: "A symbol whose
+                # entry filled ZERO gets NO MOC leg from the fill-gated
+                # path." The sweep will still catch any residual
+                # baseline position.
+                logger.info(
+                    "fill-gated dispatch: entry terminal with 0 fill; "
+                    "no MOC from fill-gated path",
+                    extra={"order_id": oid, "symbol": sym,
+                           "status": status},
+                )
+                entries_to_pop.append(oid)
+                continue
+            newly_terminal.append((oid, e, filled, status))
+
+        if deadline_hit_mid_tick:
+            # Emit the deadline log and break out — remaining pending
+            # entries fall through to the sweep. Do NOT pop the
+            # newly_terminal ones on this last partial pass, so the
+            # sweep can still cover them by position snapshot.
+            for oid, e in pending.items():
+                e.setdefault("filled_qty", 0)
+                e.setdefault("status", "pending_at_sweep_deadline")
+                logger.warning(
+                    "fill-gated dispatch: sweep deadline reached mid-tick; "
+                    "leaving remaining entries for sweep",
+                    extra={"order_id": oid, "symbol": e.get("symbol")},
+                )
+            break
+
+        # Pop terminal-zero-fill entries now.
+        for oid in entries_to_pop:
+            pending.pop(oid, None)
+
+        if not newly_terminal:
+            # No new fills this tick — sleep and retry without paying
+            # the 0.5s get_positions cost. Cheaper polling loop.
+            if pending:
+                time.sleep(poll_interval_secs)
+            continue
+
+        # Snapshot AFTER observing terminal fills, so the 0.5s ib_async
+        # sleep inside get_positions gives IB time to propagate the
+        # position update for the just-observed fills. This is the
+        # SAFETY reviewer's fix (1) — cheapest defensible ordering
+        # without changing the concurrency model.
+        tick_snapshot = _snapshot_managed_positions(broker, managed_universe)
+        if tick_snapshot is None:
+            positions_unknown = True
+            # We cannot size any MOC this tick — sleep and retry until
+            # deadline. Every filled entry stays in ``pending`` so
+            # the sweep sees them.
+            time.sleep(poll_interval_secs)
+            continue
+
+        for oid, e, filled, status in newly_terminal:
+            sym = e["symbol"]
+            current = tick_snapshot.get(sym, 0)
+            # ROUND-4 SAFETY FIX (SAFETY reviewer finding 2): the
+            # deterministic expected post-fill quantity for this
+            # symbol is baseline + signed_fill. If the tick snapshot
+            # disagrees, the position update hasn't propagated yet
+            # (IB emits execution reports BEFORE position updates)
+            # and sizing an MOC off ``current`` would be wrong. Leave
+            # in pending so the sweep re-verifies with a fresh
+            # snapshot ~4 minutes later; every managed-universe
+            # symbol still holding a position at sweep time gets an
+            # MOC via the two-sided residual arithmetic.
+            side = e.get("side", "")
+            signed_fill = filled if side == "BUY" else -filled
+            expected = int(baseline.get(sym, 0)) + int(signed_fill)
+            if int(current) != expected:
+                logger.warning(
+                    "fill-gated dispatch: position snapshot lags fill "
+                    "event (expected != current) — deferring MOC to "
+                    "the sweep to avoid mis-sizing off a stale book",
+                    extra={
+                        "order_id": oid, "symbol": sym,
+                        "baseline": int(baseline.get(sym, 0)),
+                        "side": side, "filled": int(filled),
+                        "expected_qty": expected,
+                        "snapshot_qty": int(current),
+                    },
+                )
+                # Keep in pending so the sweep re-verifies. Also mark
+                # the entry as ``defer_to_sweep_for_moc`` in-place so
+                # the sweep's belt-and-braces cancel loop leaves the
+                # (already-terminal) entry alone — the entry IS
+                # terminal, we just declined to submit the MOC here.
+                continue
+            if current == 0:
+                # Entry filled and position book agrees the net is 0
+                # (a reducing entry against a nonzero baseline that
+                # exactly cancels). No MOC needed — the position is
+                # already flat. The sweep would compute residual=0
+                # and skip as well.
+                logger.info(
+                    "fill-gated dispatch: entry filled and position "
+                    "confirmed flat (baseline+signed_fill=0); no MOC "
+                    "needed for this symbol",
+                    extra={"order_id": oid, "symbol": sym,
+                           "filled": filled},
+                )
+                pending.pop(oid, None)
+                continue
+            leg, outcome = _submit_single_moc(
+                broker, sym, current, submit_by,
+            )
+            if outcome == "ok" and leg is not None:
+                moc_batch.append(leg)
+                # Track SIGNED covered qty per symbol.
+                covered_qty[sym] = (
+                    covered_qty.get(sym, 0) + leg["signed_qty"]
+                )
+            elif outcome == "skipped_cutoff":
+                skipped_past_cutoff.append(sym)
+            elif outcome == "error":
+                # Submission raised — treat as uncovered so the
+                # pre-close signals escalate.
+                uncovered.append(sym)
+            pending.pop(oid, None)
+
+        if pending:
+            time.sleep(poll_interval_secs)
+
+    return moc_batch, covered_qty, uncovered, skipped_past_cutoff, positions_unknown
+
+
+def _sweep_moc_deadline(
+    broker,
+    entries: list[dict],
+    managed_universe: set[str],
+    covered_qty: dict[str, int],
+    submit_by: datetime,
+    dispatcher_legs: Optional[list[dict]] = None,
+) -> tuple[list[dict], list[str], list[str], list[str], bool]:
+    """DEADLINE SWEEP.
+
+    Runs at the sweep_deadline. Guarantees every managed-universe symbol
+    holding a nonzero position gets an MOC away before ``submit_by``
+    (NASDAQ 15:55 cutoff), including residual/baseline positions carried
+    in from a prior day and any position whose entry filled after the
+    dispatcher gave up. Also TOPS UP or TRIMS any dispatcher MOC whose
+    size does not match the true post-fill position (see the "residual"
+    section below).
+
+    Steps:
+      1. Cancel any entry order still non-terminal at
+         ``get_order_status`` time (belt-and-braces — the dispatcher
+         should have left few). Cancel failures are surfaced up the
+         return tuple (an entry that could not be pulled is by
+         definition an uncontrolled position source).
+      2. Verify each dispatcher-submitted MOC is still live at the
+         exchange (``dispatcher_legs`` carries per-leg oid + symbol +
+         signed_qty). A dispatcher MOC that reached terminal
+         Cancelled with filled=0 (exchange rejection during the
+         cancel race) is EXCLUDED from ``effective_covered_qty``;
+         without this the sweep would credit the coverage and skip
+         the symbol, leaving it uncovered until the audit fires ~1s
+         later — with no re-MOC path. Fixes the ROUND-2 SAFETY
+         REVIEWER'S third finding.
+      3. Take a FRESH ``broker.get_positions()`` snapshot.
+      4. Iterate over EVERY symbol that either shows a nonzero held
+         quantity OR appears in ``effective_covered_qty`` (two-sided:
+         so the sweep can TRIM an over-cover, not just top up a
+         short-cover). Compute
+         ``residual = held + effective_covered_qty.get(sym, 0)``.
+         This is the SIGNED quantity the sweep must submit to zero
+         the book.
+         * ``residual == 0`` → dispatcher already covered exactly;
+           skip.
+         * ``residual > 0`` → net long → submit SELL MOC ``|residual|``.
+         * ``residual < 0`` → net short (dispatcher over-covered a
+           reducing entry against a nonzero baseline, or the
+           snapshot lagged the fill) → submit BUY MOC ``|residual|``
+           as an offset. Fixes the ROUND-2 SAFETY REVIEWER'S first
+           (critical) finding.
+      5. Any leg past ``submit_by`` is recorded as skipped (exposure).
+
+    ``covered_qty`` is signed — ``covered_qty[sym] = -60`` for a
+    dispatcher SELL MOC of 60. So for held=100 the residual is
+    ``100 + (-60) = 40 → SELL MOC 40`` (top-up); for held=0 the
+    residual is ``0 + (-60) = -60 → BUY MOC 60`` (trim, offsets the
+    over-flatten).
+
+    Parameters
+    ----------
+    dispatcher_legs
+        The MOC legs the fill-gated dispatcher already submitted (the
+        ``fg_moc_batch``). Needed so the sweep can drop a rejected
+        dispatcher MOC's credit from ``covered_qty`` before computing
+        residuals. Pass ``None`` (default) to skip verification
+        entirely — used only by direct unit tests where the caller
+        doesn't have a leg list handy; in main() ALWAYS pass the
+        real leg list.
+
+    Returns
+    -------
+    ``(moc_batch, cancelled_oids, cancel_failed_syms, skipped_symbols,
+    positions_unknown)``:
+      - ``moc_batch`` — MOC legs the sweep submitted (in addition to
+        the dispatcher's).
+      - ``cancelled_oids`` — order ids the sweep cancelled cleanly.
+      - ``cancel_failed_syms`` — symbols whose non-terminal entry
+        cancel raised. These entries may still be working and their
+        eventual fill is uncontrolled — the caller must OR this into
+        the pre-close exposure signal.
+      - ``skipped_symbols`` — managed symbols that needed an MOC but
+        submit_by was already past.
+      - ``positions_unknown`` — True if ``get_positions()`` raised.
+    """
+    # (1) Cancel any still-non-terminal entry from the fill-gated path.
+    cancelled_oids: list[str] = []
+    cancel_failed_syms: list[str] = []
+    for e in entries:
+        oid = e.get("order_id")
+        if oid is None:
+            continue
+        status = e.get("status") or ""
+        try:
+            info = broker.get_order_status(oid)
+            live_status = getattr(info, "status", "") or ""
+            live_filled = int(getattr(info, "filled", 0) or 0)
+        except Exception:
+            live_status = status
+            live_filled = int(e.get("filled_qty", 0) or 0)
+        if live_status in _TERMINAL_ORDER_STATES:
+            # Update the entry's status in case the dispatcher didn't
+            # observe the terminal transition. (Round-2 simplification:
+            # single get_order_status call, not the earlier duplicated
+            # info + info2 read.)
+            e["status"] = live_status
+            e["filled_qty"] = live_filled
+            continue
+        try:
+            broker.cancel(oid)
+            cancelled_oids.append(oid)
+            logger.info(
+                "sweep: cancelled non-terminal entry",
+                extra={"order_id": oid, "symbol": e.get("symbol"),
+                       "status": live_status},
+            )
+            e["status"] = "ApiCancelled"
+        except Exception as ex:
+            # Round-2 fix: track cancel failures. An entry we could
+            # not pull is uncontrolled — it may still fill mid-window
+            # and end up as an overnight position no MOC covers.
+            sym_cf = e.get("symbol")
+            if sym_cf:
+                cancel_failed_syms.append(sym_cf)
+            logger.warning(
+                "sweep: cancel failed — entry may still be working",
+                extra={"order_id": oid, "symbol": sym_cf,
+                       "error": str(ex)[:200]},
+            )
+
+    # (2) Verify each dispatcher MOC's live status. ROUND-3 SAFETY FIX
+    # (SAFETY reviewer finding 3): _submit_single_moc returns outcome
+    # 'ok' the instant broker.buy/sell returns an oid, which is BEFORE
+    # any exchange ack. An MOC rejected at the exchange (short-sale
+    # restriction, margin, contract/venue issue) can flip terminal
+    # Cancelled with filled=0 within seconds. If we credit the
+    # dispatcher's covered_qty regardless, the sweep would skip the
+    # symbol (residual == 0 arithmetic) — but the exchange has no
+    # cover and the audit only fires later, with no re-MOC path.
+    # Drop rejected dispatcher legs from the effective credit here so
+    # the sweep can resubmit.
+    effective_covered_qty: dict[str, int] = dict(covered_qty)
+    if dispatcher_legs:
+        for leg in dispatcher_legs:
+            oid = leg.get("oid")
+            sym = leg.get("symbol")
+            signed = int(leg.get("signed_qty", 0) or 0)
+            if oid is None or not sym or signed == 0:
+                continue
+            try:
+                info = broker.get_order_status(oid)
+                d_status = getattr(info, "status", "") or ""
+                d_filled = int(getattr(info, "filled", 0) or 0)
+            except Exception as ex:
+                # Cannot verify — leave the credit in place (worst
+                # case: rely on the coverage cross-check / audit
+                # downstream). Not zeroing here avoids a spurious
+                # double-flatten on a transient status-poll blip.
+                logger.warning(
+                    "sweep: dispatcher MOC status poll failed; leaving "
+                    "coverage credit in place",
+                    extra={"order_id": oid, "symbol": sym,
+                           "error": str(ex)[:200]},
+                )
+                continue
+            if d_status in _TERMINAL_ORDER_STATES and d_filled == 0:
+                logger.error(
+                    "sweep: dispatcher MOC terminal-rejected; dropping "
+                    "coverage credit so sweep re-submits",
+                    extra={"order_id": oid, "symbol": sym,
+                           "status": d_status,
+                           "dropped_signed_qty": signed},
+                )
+                # Undo this leg's contribution.
+                effective_covered_qty[sym] = (
+                    effective_covered_qty.get(sym, 0) - signed
+                )
+                if effective_covered_qty[sym] == 0:
+                    del effective_covered_qty[sym]
+
+    # (3) Fresh position snapshot.
+    try:
+        positions = broker.get_positions()
+    except Exception as e:
+        logger.error(
+            "sweep: get_positions FAILED — POSITIONS MAY BE LIVE INTO "
+            "THE CLOSE, OPERATOR MUST MANUALLY FLATTEN",
+            extra={"error": str(e)[:200]},
+        )
+        return [], cancelled_oids, cancel_failed_syms, [], True
+
+    # Aggregate duplicate rows (multi-account / update-race).
+    agg: dict[str, int] = {}
+    for p in positions:
+        if p.symbol not in managed_universe:
+            continue
+        agg[p.symbol] = agg.get(p.symbol, 0) + int(p.quantity)
+
+    # ROUND-3 TWO-SIDED SWEEP (SAFETY reviewer finding 1): iterate
+    # over the UNION of "symbols currently held" (``agg``) and
+    # "symbols the dispatcher already MOC'd" (``effective_covered_qty``),
+    # so a symbol that is FLAT NOW but has a dispatcher MOC still
+    # queued (e.g. the reducing-entry-against-baseline case where the
+    # snapshot lagged the fill, so dispatcher over-covered) gets a
+    # TRIM MOC in the opposite direction — restoring the invariant
+    # ``held + Σ signed_MOC == 0``.
+    #
+    # SAFETY reviewer's critical case: baseline AAPL +100, entry
+    # SELL 100 (reducing to 0). IB emits the Filled event before
+    # the position update, so the dispatcher's tick snapshot read
+    # +100 while status read Filled. dispatcher submitted SELL MOC
+    # 100 → covered_qty[AAPL] = -100. True held after fill = 0.
+    # Old sweep iterated only ``agg`` and skipped AAPL (not in the
+    # dict), leaving the naked SHORT of 100 shares undetected until
+    # 16:05. New sweep: sym in union, held = agg.get(AAPL, 0) = 0,
+    # residual = 0 + (-100) = -100 < 0 → BUY MOC 100 offset. Net at
+    # close: +100 baseline + (-100 entry) + (-100 MOC) + (+100 sweep)
+    # = 0. Correct.
+    #
+    # The dispatcher-partial-plus-late-fill case (holds 100 but
+    # dispatcher only covered 60) still works: held=100, covered=-60,
+    # residual = 40 > 0 → SELL MOC 40 top-up. Both cases in one loop.
+    moc_batch: list[dict] = []
+    skipped: list[str] = []
+    all_syms = sorted(set(agg) | set(effective_covered_qty))
+    for sym in all_syms:
+        if sym not in managed_universe:
+            # Defensive — effective_covered_qty is keyed by dispatcher
+            # symbols which are already managed; this is a belt-and-
+            # braces filter.
+            continue
+        held = agg.get(sym, 0)
+        already_signed = effective_covered_qty.get(sym, 0)
+        residual = held + already_signed
+        if residual == 0:
+            # Book zeros out — dispatcher covered exactly, or symbol
+            # is fully flat and uncovered.
+            continue
+        leg, outcome = _submit_single_moc(
+            broker, sym, residual, submit_by,
+        )
+        if outcome == "ok" and leg is not None:
+            moc_batch.append(leg)
+        elif outcome == "skipped_cutoff":
+            skipped.append(sym)
+        # "error" is logged inside _submit_single_moc; treat as skipped
+        # so pre-close exposure catches it.
+        elif outcome == "error":
+            skipped.append(sym)
+
+    if skipped:
+        logger.error(
+            "sweep: MOC legs skipped past submit cutoff — POSITIONS "
+            "LEFT OPEN",
+            extra={"n_skipped": len(skipped), "symbols": skipped[:20]},
+        )
+
+    return moc_batch, cancelled_oids, cancel_failed_syms, skipped, False
+
+
+def _moc_legs_corroborate_flat(
+    broker,
+    moc_legs: list[dict],
+    book_was_opened: bool,
+) -> Optional[bool]:
+    """Independent evidence for ``_poll_positions_after_close`` that the
+    book MUST be flat, used to disambiguate an empty position response.
+
+    Returns:
+    * ``True``  — positive evidence of flat: either no book was ever
+      opened (no entry filled, so there is nothing to flatten), or every
+      MOC leg reached terminal ``Filled`` with ``filled > 0``.
+    * ``False`` — positive evidence AGAINST flat: at least one MOC leg is
+      terminal-not-Filled or still open.
+    * ``None``  — cannot tell (a status poll raised, or a book was opened
+      but no MOC legs exist to corroborate against). Treated by the
+      caller exactly like ``False``: not proof, so not flat.
+
+    Deliberately order-state-based rather than position-based: the whole
+    point is to cross-check the position stream against a SEPARATE
+    source, so a single wiped subscription cannot satisfy both.
+    """
+    if not book_was_opened:
+        return True
+    if not moc_legs:
+        return None
+    for leg in moc_legs:
+        oid = leg.get("oid")
+        if oid is None:
+            return None
+        try:
+            info = broker.get_order_status(oid)
+        except Exception:
+            return None
+        status = getattr(info, "status", "")
+        filled = int(getattr(info, "filled", 0) or 0)
+        if status != "Filled" or filled <= 0:
+            return False
+    return True
+
+
+def _poll_positions_after_close(
+    broker,
+    managed_universe: set[str],
+    poll_until: datetime,
+    not_before: Optional[datetime] = None,
+    min_consecutive_flat_reads: int = 2,
+    initial_interval_secs: float = config.DEFAULT_POST_CLOSE_POLL_INITIAL_INTERVAL_SECS,
+    max_interval_secs: float = config.DEFAULT_POST_CLOSE_POLL_MAX_INTERVAL_SECS,
+    corroborator: Optional[Callable[[], Optional[bool]]] = None,
+) -> tuple[bool, list[str], Optional[str]]:
+    """AUTHORITATIVE post-auction exposure verdict.
+
+    After 16:00 the NASDAQ close cross has printed and MOC fills are
+    reflected in ``broker.get_positions()``. IB can take a few seconds
+    to a few minutes to propagate the fill; we poll with exponential
+    backoff until ``poll_until`` (default 16:05 ET).
+
+    ROUND-2 SAFETY BOUNDS. Two independent guards close the "poll
+    returns FLAT before the auction printed" bug the round-1 code had:
+
+    * ``not_before`` — if set, the poll REFUSES to return the FLAT
+      verdict until ``config.now_ny() >= not_before``. In prod, this
+      is ``today_ny(16, 0) + DEFAULT_POST_CLOSE_POLL_SETTLE_SECS`` so
+      no code path can declare FLAT before the 16:00 auction has had
+      a chance to print. A run that reaches the poll early (recorder
+      short-circuit, empty book by mid-afternoon, etc.) keeps polling
+      until it can honestly answer. If EVERY successful poll before
+      ``not_before`` is empty AND the loop hits ``poll_until`` before
+      ``not_before`` is reached (only possible with a misconfigured
+      ``poll_until``), we return PESSIMISTIC EXPOSED to fail closed.
+
+    * ``min_consecutive_flat_reads`` — require N consecutive
+      successful all-flat reads before returning FLAT (default 2). A
+      single transient empty response from a broker that returned rows
+      on a prior poll is suspect, not authoritative; requiring a
+      confirmation poll defeats the ``empty_snapshot_after_fills``
+      failure mode (a TWS stream that momentarily returns []).
+
+    Rule:
+      * Any nonzero managed-universe position at ``poll_until``
+        → EXPOSED (rc=11).
+      * ``get_positions()`` fails on EVERY attempt in the window
+        → PESSIMISTIC EXPOSED (rc=11) — we cannot verify flat, so we
+        cannot claim it.
+      * All managed-universe positions are zero AND we are past
+        ``not_before`` AND we have N consecutive flat reads
+        → FLAT (rc=0 gate).
+
+    Returns ``(is_exposed, nonzero_symbols, error_msg)``.
+    * ``is_exposed`` — True iff we should return rc=11.
+    * ``nonzero_symbols`` — sorted list of managed-universe symbols
+      still non-flat at the last successful poll (empty if never
+      succeeded or last read was empty-but-pre-not_before).
+    * ``error_msg`` — last exception string if all polls failed OR a
+      synthetic reason if we exited without a confirmed flat read
+      (``"pre_not_before_no_confirmed_flat"``, etc.); ``None`` on a
+      genuine FLAT verdict.
+    """
+    interval = initial_interval_secs
+    last_error: Optional[str] = None
+    last_nonzero: list[str] = []
+    at_least_one_success = False
+    consecutive_flat = 0
+    while True:
+        now_before_poll = config.now_ny()
+        try:
+            positions = broker.get_positions()
+        except Exception as e:
+            last_error = str(e)[:200]
+            # A raise is not a "flat" read — reset the counter.
+            consecutive_flat = 0
+            logger.warning(
+                "post-close position poll: get_positions failed; retrying",
+                extra={"error": last_error,
+                       "poll_until": poll_until.isoformat()},
+            )
+        else:
+            at_least_one_success = True
+            # Clear any error from an EARLIER failed poll that has since
+            # recovered, so the fail-closed reason reported below names
+            # the condition that actually held at the deadline rather
+            # than a stale connection fault. Set before the
+            # uncorroborated-empty branch, which legitimately re-sets it.
+            last_error = None
+            agg: dict[str, int] = {}
+            for p in positions:
+                if p.symbol not in managed_universe:
+                    continue
+                agg[p.symbol] = agg.get(p.symbol, 0) + int(p.quantity)
+            last_nonzero = sorted(s for s, q in agg.items() if q != 0)
+            # A WHOLLY EMPTY position response is ambiguous and must not
+            # be read as proof of flat on its own. ``broker.get_positions``
+            # is ``reqPositions(); sleep(0.5); positions()`` — it returns
+            # ib_async's CACHED position set and returns [] WITHOUT
+            # raising if the subscription was torn down and re-established
+            # (e.g. a TWS drop / auto-reconnect across the 16:00 auction)
+            # and has not yet repopulated. A genuinely flat book and a
+            # wiped cache are byte-identical at this layer, so
+            # ``min_consecutive_flat_reads`` does not separate them — a
+            # persistently-empty stream satisfies the counter just as a
+            # real flat book does. This is the post-close analogue of the
+            # pre-close ``empty_snapshot_after_fills`` guard.
+            #
+            # We therefore require INDEPENDENT corroboration before an
+            # empty read may count toward the flat tally. ``corroborator``
+            # returns True only on positive evidence the book must be flat
+            # (every MOC leg terminal-Filled, or no book was ever opened);
+            # False on positive evidence it is not; None when it cannot
+            # tell. Anything other than True leaves the tally at zero, so
+            # the loop runs to ``poll_until`` and exits through the
+            # fail-closed "insufficient_flat_confirmations" branch below.
+            # A NON-empty response is trusted as-is: the stream is
+            # demonstrably reporting, so "rows present, none of ours
+            # nonzero" is real evidence of flat.
+            raw_empty = not positions
+            if not last_nonzero and raw_empty:
+                corro: Optional[bool] = None
+                if corroborator is not None:
+                    try:
+                        corro = corroborator()
+                    except Exception as e:
+                        # Never let a corroborator bug mask exposure.
+                        corro = None
+                        logger.warning(
+                            "post-close position poll: corroborator "
+                            "raised; treating empty read as "
+                            "UNCORROBORATED",
+                            extra={"error": str(e)[:200]},
+                        )
+                if corro is not True:
+                    consecutive_flat = 0
+                    last_error = "uncorroborated_empty_position_read"
+                    logger.warning(
+                        "post-close position poll: EMPTY position "
+                        "response with no corroboration that the book "
+                        "is flat — NOT counting toward FLAT (a wiped "
+                        "position cache looks identical to a flat "
+                        "book); continuing to poll",
+                        extra={"corroborated": corro,
+                               "poll_until": poll_until.isoformat()},
+                    )
+                    now = config.now_ny()
+                    if now >= poll_until:
+                        break
+                    sleep_for = min(
+                        interval, (poll_until - now).total_seconds(),
+                    )
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+                    interval = min(interval * 1.5, max_interval_secs)
+                    continue
+            if not last_nonzero:
+                # Empty read. Only count it toward the consecutive-flat
+                # tally if we're past not_before — otherwise a stale
+                # early read could otherwise satisfy the counter before
+                # the auction has printed.
+                if not_before is not None and now_before_poll < not_before:
+                    logger.info(
+                        "post-close position poll: empty read pre-auction; "
+                        "not counting toward FLAT confirmation",
+                        extra={"not_before": not_before.isoformat(),
+                               "now": now_before_poll.isoformat()},
+                    )
+                    consecutive_flat = 0
+                else:
+                    consecutive_flat += 1
+                    if consecutive_flat >= min_consecutive_flat_reads:
+                        logger.info(
+                            "post-close position poll: FLAT",
+                            extra={"n_managed_symbols": len(managed_universe),
+                                   "consecutive_flat_reads": consecutive_flat},
+                        )
+                        return False, [], None
+                    logger.info(
+                        "post-close position poll: flat read; awaiting "
+                        "confirmation",
+                        extra={"consecutive_flat_reads": consecutive_flat,
+                               "required": min_consecutive_flat_reads},
+                    )
+            else:
+                consecutive_flat = 0
+                logger.warning(
+                    "post-close position poll: still non-flat, retrying",
+                    extra={"n_nonzero": len(last_nonzero),
+                           "sample_symbols": last_nonzero[:20]},
+                )
+        now = config.now_ny()
+        if now >= poll_until:
+            break
+        sleep_for = min(interval, (poll_until - now).total_seconds())
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        interval = min(interval * 1.5, max_interval_secs)
+
+    if not at_least_one_success:
+        # Every poll raised. Pessimistic verdict — cannot confirm flat.
+        logger.error(
+            "post-close position poll: every attempt FAILED — cannot "
+            "confirm flat, treating as EXPOSED",
+            extra={"error": last_error},
+        )
+        return True, [], last_error
+    if last_nonzero:
+        logger.error(
+            "post-close position poll: managed-universe symbols still "
+            "non-flat after deadline — OVERNIGHT EXPOSURE",
+            extra={"n_nonzero": len(last_nonzero),
+                   "symbols": last_nonzero[:50]},
+        )
+        return True, last_nonzero, None
+    # We reached poll_until with successful reads but no confirmed
+    # FLAT (either not_before was never reached, or we didn't get
+    # ``min_consecutive_flat_reads`` in a row). Fail closed — do NOT
+    # silently declare flat.
+    # Prefer the specific reason when we have one — an operator reading
+    # ``post_close_poll_error`` needs to distinguish "the position stream
+    # went empty and nothing could corroborate it" from a generic
+    # shortfall of consecutive reads. ``last_error`` is only set on the
+    # uncorroborated-empty path here: a poll that RAISED sets it too,
+    # but every successful poll clears it above, so by the time we get
+    # here it can only describe the most recent read — not a stale
+    # connection fault that already recovered.
+    _reason = last_error or "insufficient_flat_confirmations"
+    logger.error(
+        "post-close position poll: reached deadline without a confirmed "
+        "FLAT (either pre-not_before never elapsed or insufficient "
+        "consecutive flat reads) — treating as EXPOSED",
+        extra={
+            "consecutive_flat": consecutive_flat,
+            "required": min_consecutive_flat_reads,
+            "not_before": not_before.isoformat() if not_before else None,
+            "poll_until": poll_until.isoformat(),
+            "reason": _reason,
+        },
+    )
+    return True, [], _reason
+
+
 def _audit_moc_acceptance(
     broker,
     moc_batch: list[dict],
@@ -1326,13 +2545,24 @@ def _audit_moc_acceptance(
 
     ``broker._place`` (via ``buy``/``sell``) returns synchronously the
     moment TWS accepts the API-level placeOrder call. That is BEFORE
-    any exchange ack. An MOC submitted past the ~15:50 exchange entry
-    cutoff (e.g. a 15:50:20+ MOC send on a slow day) is API-accepted,
-    an oid is returned, but the exchange REJECTS it — the order flips
-    to ``Cancelled`` / ``Inactive`` with ``filled=0`` within seconds
-    to a minute. Without this audit, the coverage cross-check scores
-    the symbol as covered (an oid came back) and rc=0 despite an open
-    overnight position.
+    any exchange ack. An MOC submitted past NASDAQ's 15:55:00 MOC
+    ENTRY cutoff (SEC release 34-84454) is API-accepted, an oid is
+    returned, but the exchange REJECTS it — the order flips to
+    ``Cancelled`` / ``Inactive`` with ``filled=0`` within seconds to
+    a minute. Without this audit, the coverage cross-check scores
+    the symbol as covered (an oid came back) and could show rc=0
+    despite an open overnight position (the post-close poll would
+    still catch it, but this audit is the EARLY warning so the
+    operator can run panic before 16:00).
+
+    Note the two distinct NASDAQ deadlines: 15:55:00 is the ENTRY
+    cutoff (last moment an MOC will be accepted); 15:50:00 is the
+    CANCEL/MODIFY cutoff (past 15:50 an already-accepted MOC cannot
+    be pulled). Both matter here: the audit fires slightly after the
+    sweep (~15:54-15:55), so a rejection detected here is caught
+    AFTER the cancel window has already closed. The audit is
+    diagnostic (surface it to rc=11 → operator page) rather than
+    corrective.
 
     We wait per-oid for a terminal state via ``broker.wait_for_fill``:
     - Terminal (Cancelled / ApiCancelled / Inactive) with ``filled=0``
@@ -1343,11 +2573,11 @@ def _audit_moc_acceptance(
     - Exception → pessimistic: add to unfilled set (safer than
       silently assuming acceptance).
 
-    Wall-clock budget is bounded so a run doesn't sit ~8 min waiting
-    until 16:00 for the real fill. Residual risk: an MOC that was
-    accepted at ack then Cancelled after the audit window is not
-    caught here (rare; would need TWS-side pathology or an operator
-    ``panic --cancel-only`` running against the same client-id).
+    Wall-clock budget is bounded so a run doesn't sit ~5-8 min
+    waiting until 16:00 for the real fill. Residual risk: an MOC
+    that was accepted at ack then Cancelled after the audit window
+    is not caught here — but the post-close position poll catches
+    it definitively.
 
     Returns a set of REJECTED symbols. Empty = every MOC was
     accepted (or actually filled early).
@@ -1419,14 +2649,21 @@ def _coverage_cross_check(
 ) -> list[str]:
     """RR1: per-symbol GROUND-TRUTH coverage check.
 
-    ``entries['filled_qty']`` is derived from ``_wait_entry_fills``,
-    which can lie in two ways under slow-TWS conditions:
-      (1) budget-exhausted branches hard-set ``filled_qty=0`` even
-          though the MKT truly filled at the exchange;
-      (2) truncated wait misses a late-arriving Filled status update.
+    ``entries['filled_qty']`` is derived from
+    ``_fill_gated_moc_dispatch`` (via its per-tick
+    ``broker.get_order_status`` reads) and from ``_sweep_moc_deadline``
+    for entries the dispatcher gave up on. Both can lie in two ways
+    under slow-TWS conditions:
+      (1) the dispatcher's ``max_wait_secs`` cap or the sweep deadline
+          fires before an entry's Filled event lands, and the entry
+          is recorded as ``filled_qty=0``, ``status="pending_at_sweep_deadline"``
+          / ``"wait_budget_exhausted"`` even though the MKT truly
+          filled at the exchange;
+      (2) a truncated ``get_order_status`` read misses a late-arriving
+          Filled status update.
 
-    And the MOC snapshot can be silently partial (TWS reconnect during
-    the ``get_positions()`` request returns 3 of 10 held names).
+    And any ``get_positions()`` call can be silently partial (TWS
+    reconnect during the request returns 3 of 10 held names).
 
     Both defeats have the same shape: state derived from polling looks
     "no exposure" while the exchange actually holds an open book. Close
@@ -1996,10 +3233,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     # ------------------------------------------------------------------
 
     now = config.now_ny()
-    # Replay mode: the wall clock is unrelated to the historical date, so the
-    # 15:55 cutoff would always fire on a rehearsal run late in the day.
-    # Skip it in replay only; live/paper still honour it.
-    if not replay_mode and now > submit_by_at:
+    # Round-2 change: replay HONOURS ``--submit-by`` by default so a
+    # late-in-the-day rehearsal correctly surfaces the same rc=4 code
+    # a real run would. Opt out with ``--replay-ignore-cutoff`` to
+    # preserve the earlier afternoon-rehearsal ergonomics (the cutoff
+    # is neutralised further down alongside ``effective_submit_by``).
+    #
+    # This rc=4 check ONLY applies to runs that will actually attempt
+    # to place orders. Dry-run and broker-free replay (default replay
+    # without ``--replay-submit``) never reach the broker, so the
+    # cutoff is not relevant to them.
+    replay_cutoff_disabled = replay_mode and args.replay_ignore_cutoff
+    broker_free_run = args.dry_run or (replay_mode and not args.replay_submit)
+    if (not broker_free_run
+            and not replay_cutoff_disabled
+            and now > submit_by_at):
         # rc=4: past cutoff BEFORE any orders were placed. Distinct from
         # rc=11 (past cutoff AFTER entries filled) — this one is a safe
         # skip; no book, no exposure.
@@ -2211,6 +3459,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         logger.exception("trade recorder init failed (non-fatal)")
         recorder = None
 
+    # Armed immediately before LEG 1 submission. Read ONLY by the
+    # last-resort ``except`` on the order-path ``try`` below, to decide
+    # whether an unhandled exception is a safe pre-order failure (rc=1)
+    # or a possible uncovered book (rc=11). Must be initialised OUTSIDE
+    # the ``try`` so the handler can always read it.
+    orders_may_be_live = False
+
     try:
         # M2 (part 2): reconcile against yesterday's saved book, if any.
         prev = _load_previous_target_record()
@@ -2283,15 +3538,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         # would still leave open exposure, so we always try to route the exit;
         # if the wall clock has crossed submit_by by then we exit rc=4 loudly.
         #
-        # F1: in replay mode the wall clock is unrelated to the historical
-        # date, so ``submit_by_at`` (anchored to TODAY 15:55) would silently
-        # skip every leg on an afternoon rehearsal. Compute an effective
-        # cutoff comfortably in the future for replay only; live/paper
-        # keep the real cutoff.
-        if replay_mode:
+        # Replay policy: HONOUR the real wall-clock cutoff by default so a
+        # late-in-the-day rehearsal correctly surfaces the same rc=4 / rc=11
+        # codes a real run would (the previous silent neutralisation left
+        # replay's ``n_skipped_past_cutoff:0`` counter uninformative and let
+        # a late replay MOC never be flagged). Opt out with
+        # ``--replay-ignore-cutoff`` to preserve the earlier afternoon-
+        # rehearsal ergonomics where you deliberately want to exercise the
+        # order path even though ``now`` is past 15:55.
+        if replay_mode and args.replay_ignore_cutoff:
             effective_submit_by = config.now_ny() + timedelta(hours=1)
             logger.info(
-                "replay mode: per-leg submit-by neutralised",
+                "replay mode: per-leg submit-by neutralised "
+                "(--replay-ignore-cutoff)",
                 extra={"effective_submit_by": effective_submit_by.isoformat()},
             )
         else:
@@ -2300,9 +3559,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         # --------------------------------------------------------------
         # LEG 1: plain MKT entries sized to (target - current). Fires
         # unconditionally with respect to the MOC cutoff. Default
-        # tif=DAY; the belt-and-braces cancel loop below bounds any
-        # entry still non-terminal at the end of _wait_entry_fills.
+        # tif=DAY; the fill-gated dispatcher below observes each entry
+        # transitioning to terminal state and either fires the MOC
+        # (Filled) or leaves it for the sweep (Cancelled / stuck).
         # --------------------------------------------------------------
+        # ARM the exposure gate BEFORE the call, not after: a batch that
+        # raises partway through has already put live orders on the book,
+        # and a post-call assignment would never run.
+        orders_may_be_live = True
         entries = _submit_mkt_entries(
             broker=broker,
             targets=extended_targets,
@@ -2336,45 +3600,221 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "n_failed": sum(1 for e in entries if e.get("error")),
             },
         )
-        # R5: bounded fill wait tied to effective_submit_by so a slow
-        # TWS can't drag the MOC snapshot past the cutoff. Ground-truth
-        # for the MOC size is always broker.get_positions() below — not
-        # this poll.
-        _wait_entry_fills(
-            broker, entries,
-            submit_by=effective_submit_by,
-            per_order_timeout=config.DEFAULT_ENTRY_FILL_TIMEOUT_SECS,
+
+        # --------------------------------------------------------------
+        # LEG 2: PER-SYMBOL FILL-GATED MOC + DEADLINE SWEEP
+        # --------------------------------------------------------------
+        # Concurrent (from the operator's perspective) fill-gated MOC:
+        # each entry's opposite-side MOC fires the moment its entry
+        # becomes terminal Filled. Sized off a FRESH
+        # broker.get_positions() for that symbol so a partial MKT fill
+        # cannot over-flatten into an opposite overnight exposure.
+        # Runs single-threaded (ib_async is not thread-safe) but polls
+        # all entries concurrently in a tight loop — no symbol waits
+        # for any other.
+        #
+        # Sweep deadline is computed dynamically from book size (see
+        # ``_compute_sweep_deadline``) so the same code path scales
+        # from today's 49-name book to a future 500-name book without
+        # a manual tuning knob. Above the sweep deadline, the sweep
+        # cancels any remaining unfilled entry, takes a fresh
+        # get_positions, and submits an MOC for every managed-universe
+        # symbol still holding a nonzero position that isn't already
+        # covered — this is what guarantees a residual/baseline
+        # position (from a prior day, or from a symbol whose entry
+        # didn't fill today) still gets flattened.
+        # --------------------------------------------------------------
+        # Book size the sweep budgets for = the full managed universe.
+        # The sweep must be able to fire an MOC for every possibly-held
+        # managed symbol; the actual number of sweep MOCs is usually
+        # smaller (dispatcher covers most), but budgeting for the whole
+        # universe fails safe.
+        n_managed_symbols = len(universe_set)
+        sweep_deadline, sweep_margin_secs = _compute_sweep_deadline(
+            effective_submit_by, n_managed_symbols,
+        )
+        logger.info(
+            "MOC sweep deadline computed",
+            extra={
+                "sweep_deadline": sweep_deadline.isoformat(),
+                "submit_by": effective_submit_by.isoformat(),
+                "sweep_margin_secs": sweep_margin_secs,
+                "n_managed_symbols": n_managed_symbols,
+            },
         )
 
-        # R2 belt-and-braces: cancel every entry that never reached a
-        # terminal state. Plain MKT should fill within milliseconds on a
-        # liquid tape, but a placed-but-not-acked / illiquid-hang order
-        # can survive. Cancel BEFORE the MOC snapshot so late fills
-        # don't leave an unhedged position past the counter-flatten.
-        cancelled_oids = _cancel_non_terminal_entries(broker, entries)
-        if cancelled_oids:
-            logger.info(
-                "non-terminal entries cancelled before MOC snapshot",
-                extra={"n_cancelled": len(cancelled_oids)},
-            )
-
-        # --------------------------------------------------------------
-        # LEG 2: MOC counter-flatten sized to ACTUAL positions.
-        # Structural invariant: the MOC size is drawn from a fresh
-        # broker.get_positions() snapshot, NEVER from `target - current`
-        # or from the entry's requested_qty. Partial-fill scenarios
-        # therefore cannot over-flatten into an opposite overnight
-        # exposure. See _submit_moc_flatten docstring.
-        # --------------------------------------------------------------
-        (moc_batch, moc_skipped,
-         moc_positions_unknown) = _submit_moc_flatten(
+        (fg_moc_batch, covered_qty_by_sym,
+         fg_uncovered_from_submit_error,
+         fg_skipped_past_cutoff,
+         fg_positions_unknown) = _fill_gated_moc_dispatch(
             broker=broker,
+            entries=entries,
             managed_universe=universe_set,
+            sweep_deadline=sweep_deadline,
             submit_by=effective_submit_by,
+            baseline=current,
+        )
+
+        # ROUND-4 SAFETY FIX (SAFETY reviewer finding 3). Historically
+        # the "sweep" fired immediately after the dispatcher — on the
+        # normal 49-name day that meant ~15:51 with the real
+        # ``sweep_deadline`` at ~15:54:42, leaving the 15:51-15:54:42
+        # window completely uncovered: cancel-race MKT fills after
+        # the first snapshot, dispatcher MOCs that flip terminal-
+        # rejected between 15:51 and 15:54, and any lag-deferred
+        # symbols (finding 2) all had no belt-and-braces coverage
+        # until the post-close poll at 16:00-16:05 — well past both
+        # cutoffs (entry 15:55, cancel/modify 15:50). Fix: TWO
+        # sweeps.
+        #   * FIRST sweep runs immediately after the dispatcher. Its
+        #     value is EARLY detection so pre-close signals fire in
+        #     time for the operator to run ``live.panic`` before
+        #     16:00. Cancels non-terminal entries, verifies dispatcher
+        #     MOCs, tops-up / trims / re-fires as needed.
+        #   * SLEEP until ``sweep_deadline`` (~15:54:42 for 49 names,
+        #     ~15:53:00 for 500 names). Pump the broker every 30s so
+        #     the ib_async connection is exercised — a wedged
+        #     connection would break the second sweep AND the
+        #     authoritative post-close poll (finding 4).
+        #   * SECOND sweep at the real deadline. Fresh position
+        #     snapshot (well past any plausible IB propagation lag),
+        #     verifies EVERY prior MOC (dispatcher + first sweep) is
+        #     still live, and re-fires for any residual. On a normal
+        #     day this issues zero orders — the value is confirmation
+        #     under the ACTUAL "book state we hand to 16:00".
+        (sweep_moc_batch, cancelled_oids, cancel_failed_syms,
+         sweep_skipped, sweep_positions_unknown) = _sweep_moc_deadline(
+            broker=broker,
+            entries=entries,
+            managed_universe=universe_set,
+            covered_qty=covered_qty_by_sym,
+            submit_by=effective_submit_by,
+            dispatcher_legs=fg_moc_batch,
+        )
+
+        # Sleep until the real sweep_deadline with a periodic
+        # broker.get_positions() pump. If we are already past the
+        # deadline (dispatcher exited slow and first sweep took real
+        # time), _sleep_until returns immediately.
+        #
+        # REPLAY EXEMPTION: in replay mode ``sweep_deadline`` is
+        # computed off ``effective_submit_by`` which is either today's
+        # wall-clock 15:54 (irrelevant to the historical replay date)
+        # or ``now + 1h`` (with --replay-ignore-cutoff — an
+        # arbitrary neutralised value). Neither makes sense as a
+        # wall-clock wait: the historical feed has no late fills, and
+        # a real paper broker's rejections come in seconds, not hours.
+        # Skip the sleep in replay — the second sweep still runs
+        # immediately so the code path is exercised end-to-end.
+        if not replay_mode:
+            try:
+                _sleep_until(
+                    sweep_deadline,
+                    pump=lambda: broker.get_positions(),
+                    pump_interval=30.0,
+                )
+            except Exception:
+                # A raise in the sleep loop itself should not gate
+                # the second sweep — press on. The sweep's own error
+                # paths are pessimistic.
+                logger.exception(
+                    "sleep-to-sweep-deadline raised (non-fatal); "
+                    "proceeding with second sweep",
+                )
+
+        # Combined covered_qty going into the second sweep = dispatcher
+        # legs + first-sweep legs, signed.
+        combined_covered_qty: dict[str, int] = dict(covered_qty_by_sym)
+        for _leg in sweep_moc_batch:
+            _sym = _leg["symbol"]
+            combined_covered_qty[_sym] = (
+                combined_covered_qty.get(_sym, 0)
+                + int(_leg["signed_qty"])
+            )
+        (sweep2_moc_batch, cancelled2_oids, cancel_failed2_syms,
+         sweep2_skipped, sweep2_positions_unknown) = _sweep_moc_deadline(
+            broker=broker,
+            entries=entries,
+            managed_universe=universe_set,
+            covered_qty=combined_covered_qty,
+            submit_by=effective_submit_by,
+            dispatcher_legs=fg_moc_batch + sweep_moc_batch,
+        )
+        # Second sweep only OBSERVES cancel failures on non-terminal
+        # entries — after the first sweep those should be terminal
+        # already, so this list is expected empty on a normal day.
+        # Union defensively.
+        cancelled_oids = list(cancelled_oids) + list(cancelled2_oids)
+        cancel_failed_syms = list(cancel_failed_syms) + list(cancel_failed2_syms)
+        # Combined skipped-past-cutoff = dispatcher's per-tick
+        # refusals + both sweeps' own past-cutoff refusals. Any is an
+        # exposure signal.
+        moc_skipped: list[str] = (
+            list(fg_skipped_past_cutoff)
+            + list(sweep_skipped)
+            + list(sweep2_skipped)
+        )
+
+        moc_batch = (
+            list(fg_moc_batch)
+            + list(sweep_moc_batch)
+            + list(sweep2_moc_batch)
+        )
+        moc_positions_unknown = bool(
+            fg_positions_unknown
+            or sweep_positions_unknown
+            or sweep2_positions_unknown
         )
         moc_order_ids = [leg["oid"] for leg in moc_batch]
-        moc_signed_by_sym = {leg["symbol"]: leg["signed_qty"]
-                             for leg in moc_batch}
+        # ROUND-3 SAFETY FIX (SAFETY + CORRECTNESS reviewer finding 2/6):
+        # accumulate signed_qty per symbol rather than last-wins, AND
+        # exclude MOC legs that are already visibly terminal-not-Filled
+        # at coverage-check time. Two reasons:
+        #   * The round-2 dispatcher-then-sweep pipeline deliberately
+        #     emits TWO MOC legs per symbol on the partial-fill
+        #     top-up path (dispatcher SELL 60 + sweep SELL 40 for a
+        #     held 100 = correctly zero at close). A dict
+        #     comprehension keyed by symbol would drop the
+        #     dispatcher leg, causing _coverage_cross_check to
+        #     under-count coverage and spuriously page rc=11 on the
+        #     fix's OWN success path.
+        #   * The round-3 sweep re-fires when the dispatcher's MOC
+        #     was terminal-rejected (SAFETY finding 3). If we
+        #     blindly summed every submitted signed_qty here, a
+        #     symbol whose dispatcher AND sweep MOCs both got
+        #     rejected would show up in moc_signed_by_sym with
+        #     twice the intended coverage — the coverage
+        #     cross-check would then report the symbol as uncovered
+        #     at 2*|held| under-coverage even though the truth
+        #     (both rejections leave the position 100% uncovered)
+        #     is that exposure equals held. We use a local
+        #     get_order_status re-poll per leg (O(N) local dict
+        #     reads, negligible) to only count MOCs currently in a
+        #     good live state.
+        moc_signed_by_sym: dict[str, int] = {}
+        for _leg in moc_batch:
+            _sym = _leg["symbol"]
+            _oid = _leg["oid"]
+            _include = True
+            try:
+                _info = broker.get_order_status(_oid)
+                _st = getattr(_info, "status", "") or ""
+                _fl = int(getattr(_info, "filled", 0) or 0)
+                # Terminal-rejected (Cancelled/Inactive with 0 fills)
+                # covers nothing.
+                if _st in _TERMINAL_ORDER_STATES and _fl == 0:
+                    _include = False
+            except Exception:
+                # If we can't poll, INCLUDE — pessimistic direction
+                # for coverage (assume the MOC is live, so downstream
+                # signals see it as coverage; if it isn't, other
+                # signals will fire).
+                _include = True
+            if _include:
+                moc_signed_by_sym[_sym] = (
+                    moc_signed_by_sym.get(_sym, 0)
+                    + int(_leg["signed_qty"])
+                )
         moc_oid_to_sym = {leg["oid"]: leg["symbol"] for leg in moc_batch}
         # Recorder — one MOC submission row per successful leg. Skipped
         # symbols (past cutoff / snapshot failed) don't have oids and
@@ -2409,10 +3849,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             },
         )
 
-        # RR1: GROUND-TRUTH coverage cross-check. Independent of
-        # _wait_entry_fills (which can hard-set filled_qty=0 on the
-        # budget-exhausted branch) AND independent of the MOC snapshot
-        # (which can return partial). Re-polls each entry's true fill
+        # RR1: GROUND-TRUTH coverage cross-check. Independent of the
+        # dispatcher (which can leave an entry in
+        # ``pending_at_sweep_deadline`` with ``filled_qty=0`` even when
+        # the exchange fill landed after the deadline) AND independent
+        # of any get_positions snapshot (which can return partial).
+        # Re-polls each entry's true fill
         # via broker.get_order_status and verifies every non-zero
         # managed-universe expected holding was actually flattened.
         # RRR5 note: broker.get_order_status is a local self._trades
@@ -2451,12 +3893,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         # RRR1: MOC exchange acceptance audit. broker.buy/sell returns
         # the oid the moment TWS accepts the API call — BEFORE the
-        # exchange ack. A MOC submitted past the ~15:50 cutoff is
-        # API-accepted then Cancelled at exchange. Wait a bounded window
-        # for terminal state; anything terminal-not-Filled is a rejection.
-        # See _audit_moc_acceptance for the trade-off between short wait
-        # (fast operator feedback) and full 15:55->16:00 wait (fully
-        # safe but slow).
+        # exchange ack. A MOC submitted past NASDAQ's 15:55:00 ENTRY
+        # cutoff (SEC 34-84454) is API-accepted then Cancelled at
+        # exchange. Wait a bounded window for terminal state; anything
+        # terminal-not-Filled is a rejection. See _audit_moc_acceptance
+        # for the trade-off between short wait (fast operator feedback)
+        # and full 15:55->16:00 wait (fully safe but slow).
         try:
             unfilled_moc_syms = _audit_moc_acceptance(
                 broker, moc_batch,
@@ -2472,16 +3914,41 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             unfilled_moc_syms = {leg["symbol"] for leg in moc_batch}
 
-        # RRR2: decide the exposure verdict from every signal known at
-        # this point, BEFORE any I/O that could raise and short-circuit
-        # the rc=11 branch (persist + JSONL audit). A raised exception
-        # from disk-full / permissions would otherwise propagate,
-        # main() exits rc=1, and the pager (keyed on rc >= 11) drops
-        # the real exposure page.
-        exposure = bool(
+        # PRE-CLOSE exposure signals — the EARLY warning signals. These
+        # existed in the pre-refactor code as the SOLE authority; now
+        # they short-circuit to rc=11 IMMEDIATELY so the operator has
+        # time to run ``live.panic`` before 16:00. The AUTHORITATIVE
+        # verdict — the post-close position poll — runs later on the
+        # non-exposed path. See the "Reconciliation" note below.
+        #
+        # NOTE for future reviewers: any signal known here that has
+        # ALREADY declared exposure is worth paging on RIGHT NOW.
+        # Waiting 5-8 minutes for the post-close poll to concur adds
+        # zero information (the poll is monotonic vs these signals —
+        # each of them is a superset of "definitely exposed" that the
+        # poll cannot revoke) and burns the operator's remediation
+        # window.
+        # Cancel failures during the sweep are a NEW pre-close exposure
+        # signal (round-2 fix). An entry we could not cancel may still
+        # fill in the [sweep, 16:00] window without an MOC cover —
+        # that's a naked overnight position.
+        # ROUND-4 SAFETY FIX (SAFETY reviewer finding 1). The
+        # dispatcher's ``fg_uncovered_from_submit_error`` list carries
+        # symbols whose per-symbol MOC submission RAISED at the broker
+        # (a ``broker.buy``/``sell`` exception AFTER TWS accepted the
+        # request is possible — a read timeout AFTER the exchange
+        # queued the order looks the same to the caller). Ignoring it
+        # in the exposure signal reintroduced the "neither in moc_batch
+        # nor in skipped" gap: the symbol has no MOC in flight FROM
+        # THIS PATH, the sweep would then see held=+q, covered=0, and
+        # fire a SECOND MOC — a double-flatten to the naked-short
+        # opposite side. Route the signal into the pre-close exposure
+        # decision so the operator knows to run panic BEFORE 16:00.
+        pre_close_exposure = bool(
             moc_skipped or moc_positions_unknown
             or empty_snapshot_after_fills or uncovered_symbols
-            or unfilled_moc_syms
+            or unfilled_moc_syms or cancel_failed_syms
+            or fg_uncovered_from_submit_error
         )
 
         # Persist the ACTUAL executed record next to the intended one so
@@ -2501,6 +3968,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         target_record["uncovered_symbols"] = uncovered_symbols
         target_record["unfilled_moc_symbols"] = sorted(unfilled_moc_syms)
         target_record["cancelled_entry_oids"] = cancelled_oids
+        target_record["cancel_failed_symbols"] = sorted(set(cancel_failed_syms))
+        target_record["sweep_deadline_ny"] = sweep_deadline.isoformat()
+        target_record["sweep_margin_secs"] = sweep_margin_secs
+        target_record["covered_by_fill_gated"] = sorted(covered_qty_by_sym)
+        # Round-4: persist the fill-gated submission-error list so post-
+        # trade analysis can see WHICH symbols the dispatcher failed to
+        # queue an MOC for. Feeds the pre-close exposure signal above.
+        target_record["fill_gated_submit_errors"] = sorted(
+            set(fg_uncovered_from_submit_error)
+        )
         try:
             _write_target_record(target_record)
         except Exception:
@@ -2510,28 +3987,27 @@ def main(argv: Optional[list[str]] = None) -> int:
         # rc=11 is THE pager predicate (per CLAUDE.md), so NOTHING
         # recording-related may run before this return — a marks
         # wait or a MOC fill audit here would delay the operator's
-        # window to run ``live.panic`` before the 16:00 close. This
-        # is the second time the pattern has bitten (round 1 removed
-        # ``finalize(wait=30)`` from the ``finally``, round 2 moved
-        # a 350s wait into the exact same seat). The ``finally``
-        # below does the minimal safe cleanup: ``finalize(wait=None)``
-        # (fast), ``_stop_feed_safe`` (fast, idempotent),
-        # ``broker.disconnect()``.
-        if exposure:
+        # window to run ``live.panic`` before the 16:00 close.
+        if pre_close_exposure:
             panic_cmd = ("python -m live.panic --paper --flatten-with MKT "
                          "(or --live --live-confirm=... --yes for live)")
             unfilled_list = sorted(unfilled_moc_syms)
+            cancel_failed_list = sorted(set(cancel_failed_syms))
+            fg_submit_error_list = sorted(set(fg_uncovered_from_submit_error))
             logger.error(
-                "OVERNIGHT EXPOSURE — MOC exit incomplete. RUN: %s. "
-                "Uncovered symbols: %s. MOC rejected at exchange: %s. "
-                "Skipped: %s. Positions unknown: %s. Empty snapshot "
-                "after fills: %s.",
+                "OVERNIGHT EXPOSURE (pre-close) — MOC exit incomplete. "
+                "RUN: %s. Uncovered symbols: %s. MOC rejected at "
+                "exchange: %s. Skipped: %s. Positions unknown: %s. "
+                "Empty snapshot after fills: %s. Cancel-failed entries: %s. "
+                "Fill-gated submission errors: %s.",
                 panic_cmd,
                 uncovered_symbols[:20] or "(see logs above)",
                 unfilled_list[:20] or "(none)",
                 moc_skipped[:20],
                 moc_positions_unknown,
                 empty_snapshot_after_fills,
+                cancel_failed_list[:20] or "(none)",
+                fg_submit_error_list[:20] or "(none)",
                 extra={
                     "n_skipped": len(moc_skipped),
                     "skipped_symbols": moc_skipped[:20],
@@ -2542,40 +4018,279 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "n_uncovered": len(uncovered_symbols),
                     "unfilled_moc_symbols": unfilled_list[:20],
                     "n_unfilled_moc": len(unfilled_list),
+                    "cancel_failed_symbols": cancel_failed_list[:20],
+                    "n_cancel_failed": len(cancel_failed_list),
+                    "fill_gated_submit_errors": fg_submit_error_list[:20],
+                    "n_fill_gated_submit_errors": len(fg_submit_error_list),
                     "panic_command": panic_cmd,
                 },
             )
             return 11
 
-        # Non-exposure path from here on: recorder finalization work.
-        # None of this runs on the rc=11 path (above) so it can't
-        # delay the operator page.
+        # Non-exposure path from here on: post-close position poll +
+        # recorder finalization work. None of this runs on the pre-close
+        # rc=11 path (above) so it can't delay the operator page.
 
         # Stop the live feed EARLY — as soon as the recorder's marks
-        # background thread has landed (or given up). Otherwise
-        # ``_fill_audit`` blocks to ~16:00 for MOC fills and the
+        # background thread has landed (or given up). Otherwise the
         # Databento buffers accumulate the whole closing auction's
-        # worth of tbbo per name in the meantime, which is pure
-        # memory growth on a long-running live box. On replay this
-        # is a no-op (the feed was already stopped at feature-build
-        # time).
+        # worth of tbbo per name in the meantime, which is pure memory
+        # growth on a long-running live box. On replay this is a no-op
+        # (the feed was already stopped at feature-build time).
         if recorder is not None:
             # Bounded wait: 5min for the T+MAX target instant + some
-            # slack for the snapshot itself. If the thread hasn't
-            # landed by then we still stop the feed — the per-mark
-            # columns just stay null on those rows. This wait is
-            # AFTER the rc=11 exposure gate above, so a delay here
-            # never gates the operator page.
-            trade_recorder.safe_call(
-                recorder.wait_for_marks, timeout=350.0,
-            )
+            # slack for the snapshot itself. This wait is AFTER the
+            # pre-close rc=11 gate above, so a delay here never gates
+            # the operator page for pre-close signals.
+            #
+            # ROUND-4 SAFETY FIX (SAFETY reviewer finding 4). Use the
+            # pumped variant so a ~350s ``threading.Event.wait`` cannot
+            # starve the ib_async event loop with the connection open
+            # — a wedged connection would break the post-close poll
+            # (now the sole authoritative verdict) and spuriously
+            # page rc=11 on a genuinely flat book.
+            try:
+                _wait_for_marks_pumped(
+                    recorder=recorder,
+                    broker=broker,
+                    timeout=350.0,
+                    pump_interval=30.0,
+                )
+            except Exception:
+                logger.exception(
+                    "pumped marks wait failed (non-fatal); proceeding to "
+                    "post-close poll",
+                )
         _stop_feed_safe(feed)
 
+        # POST-CLOSE POSITION POLL — the AUTHORITATIVE exposure verdict.
+        # Runs whenever the process reached the broker (both live/paper
+        # AND ``--replay-submit`` — the historical feed is unrelated to
+        # the wall clock but the orders are real, so the same post-
+        # auction verification is required). A broker-free replay
+        # (default replay without ``--replay-submit``) short-circuited
+        # much earlier at rc=0 and never gets here.
+        #
+        # Round-2 guards against a stale/early FLAT verdict:
+        #   1. ``not_before`` — refuse FLAT until >= 16:00 + settle,
+        #      so a code path that reached the poll before the auction
+        #      cannot declare flat on a pre-auction empty snapshot.
+        #   2. ``min_consecutive_flat_reads`` — need N=2 confirmations
+        #      so a transient empty response is not authoritative.
+        #   3. ``poll_until`` upper-bound clamp — never spin beyond
+        #      ``config.POST_CLOSE_POLL_MAX_WINDOW_MINS`` past NOW,
+        #      even if the configured deadline is far in the future
+        #      (config typo, clock skew).
+        #
+        # Round-3 fixes on top:
+        #   * The whole poll block is wrapped in try/except; any
+        #     exception is treated as pessimistic EXPOSED (SAFETY
+        #     reviewer finding 4). Without this, a raise from
+        #     config.parse_hhmm / config.today_ny / the poll itself
+        #     would propagate to main() and yield rc=1 — below the
+        #     rc>=11 pager threshold, silently degrading a genuine
+        #     exposure to a non-page.
+        #   * If ``now < not_before`` at entry (a rehearsal or a run
+        #     that raced ahead), we either sleep until ``not_before``
+        #     (live/paper — the auction hasn't printed yet; MUST
+        #     wait) or SKIP the poll with a WARNING (replay-submit —
+        #     the historical replay date is unrelated to today's
+        #     auction; the paper positions are real but no post-
+        #     auction print is coming for hours). The old code let
+        #     the loop spin the whole MAX_WINDOW then falsely return
+        #     "insufficient_flat_confirmations" (CORRECTNESS
+        #     reviewer finding 7).
+        #   * After any sleep we RE-CLAMP poll_until so the window
+        #     never closes before we have room for
+        #     ``min_consecutive_flat_reads`` reads.
+        post_close_exposed = False
+        post_close_nonzero_syms: list[str] = []
+        post_close_error: Optional[str] = None
+        post_close_skipped_reason: Optional[str] = None
+        try:
+            post_close_until_hh, post_close_until_mm = config.parse_hhmm(
+                config.DEFAULT_POST_CLOSE_POLL_UNTIL_TIME,
+            )
+            post_close_until_configured = config.today_ny(
+                post_close_until_hh, post_close_until_mm,
+            )
+            not_before_hh, not_before_mm = config.parse_hhmm(
+                config.DEFAULT_POST_CLOSE_POLL_NOT_BEFORE_TIME,
+            )
+            post_close_not_before = config.today_ny(
+                not_before_hh, not_before_mm,
+            ) + timedelta(
+                seconds=config.DEFAULT_POST_CLOSE_POLL_SETTLE_SECS,
+            )
+            _now_ny = config.now_ny()
+            # Replay rehearsal short-circuit: a --replay-submit run
+            # that reached here BEFORE the wall-clock auction time
+            # cannot verify by definition (real paper orders were
+            # placed, but the historical date's close is not today's
+            # close). Skip with a WARNING; the operator MUST run
+            # panic to flatten the paper account before the next
+            # real session (see live/README.md replay section).
+            if replay_mode and _now_ny < post_close_not_before:
+                post_close_skipped_reason = "replay_pre_not_before"
+                logger.warning(
+                    "post-close position poll SKIPPED — replay-submit "
+                    "rehearsal reached the poll before today's 16:00 "
+                    "auction wall clock. Paper positions from this "
+                    "rehearsal are LIVE in the paper account; run "
+                    "``python -m live.panic --paper`` to flatten "
+                    "before the next real session.",
+                    extra={
+                        "now": _now_ny.isoformat(),
+                        "not_before": post_close_not_before.isoformat(),
+                        "replay_date": args.replay_date,
+                    },
+                )
+            else:
+                if _now_ny < post_close_not_before:
+                    # Live/paper: the auction hasn't printed yet.
+                    # Sleep to ``not_before`` — this is the honest
+                    # answer, and matches the design that the
+                    # post-close poll is the AUTHORITATIVE verdict.
+                    #
+                    # ROUND-4 SAFETY FIX (SAFETY reviewer finding 4).
+                    # Pump the broker every 30s so the ib_async loop
+                    # is serviced during this potentially-long
+                    # ``time.sleep``. Without the pump, a wedged
+                    # connection here would flip the entire post-
+                    # close poll into its pessimistic-EXPOSED branch,
+                    # paging rc=11 on a genuinely flat book.
+                    logger.info(
+                        "post-close position poll: waiting for "
+                        "not_before wall clock",
+                        extra={
+                            "now": _now_ny.isoformat(),
+                            "not_before": post_close_not_before.isoformat(),
+                            "wait_secs": (
+                                post_close_not_before - _now_ny
+                            ).total_seconds(),
+                        },
+                    )
+                    _sleep_until(
+                        post_close_not_before,
+                        pump=lambda: broker.get_positions(),
+                        pump_interval=30.0,
+                    )
+                    _now_ny = config.now_ny()
+                # Compute a poll_until that (a) never exceeds the
+                # configured DEFAULT_POST_CLOSE_POLL_UNTIL_TIME, (b)
+                # never spins beyond POST_CLOSE_POLL_MAX_WINDOW_MINS
+                # from NOW, and (c) is always at least long enough
+                # for ``min_consecutive_flat_reads`` reads to have a
+                # chance — otherwise we'd fail-closed on the narrow
+                # "reached the poll at 16:04:59" window (~5s), which
+                # is spurious rc=11.
+                min_reads = int(
+                    config.DEFAULT_POST_CLOSE_MIN_CONSECUTIVE_FLAT_READS
+                )
+                min_window_secs = max(
+                    2.0,
+                    (min_reads + 1)
+                    * float(
+                        config.DEFAULT_POST_CLOSE_POLL_MAX_INTERVAL_SECS
+                    ),
+                )
+                post_close_max_window_end = _now_ny + timedelta(
+                    minutes=config.POST_CLOSE_POLL_MAX_WINDOW_MINS,
+                )
+                post_close_until = min(
+                    post_close_until_configured,
+                    post_close_max_window_end,
+                )
+                # Clamp UP: at least min_window_secs from now, but
+                # never beyond the MAX_WINDOW ceiling (the ceiling
+                # is the hard safety cap against configuration typos).
+                post_close_until = max(
+                    post_close_until,
+                    _now_ny + timedelta(seconds=min_window_secs),
+                )
+                post_close_until = min(
+                    post_close_until, post_close_max_window_end,
+                )
+                (post_close_exposed, post_close_nonzero_syms,
+                 post_close_error) = _poll_positions_after_close(
+                    broker=broker,
+                    managed_universe=universe_set,
+                    poll_until=post_close_until,
+                    not_before=post_close_not_before,
+                    min_consecutive_flat_reads=min_reads,
+                    # "book_was_opened" must mean "a position could
+                    # exist", NOT "an entry filled today". A residual
+                    # carried in from a prior day is live even when
+                    # nothing filled today — ``_reconcile_from_previous``
+                    # only LOGS drift, it never trades — so a nonzero
+                    # managed baseline counts as an opened book.
+                    # Separately, ``moc_batch`` holds only legs that were
+                    # successfully sent: a skipped or errored leg appends
+                    # nothing, so "every leg in moc_batch filled" proves
+                    # only "every MOC I managed to send filled", NOT
+                    # "every position was covered". If anything was
+                    # skipped we therefore refuse to corroborate at all.
+                    corroborator=lambda: (
+                        None if moc_skipped
+                        else _moc_legs_corroborate_flat(
+                            broker,
+                            moc_batch,
+                            n_filled_entries > 0 or any(
+                                q != 0
+                                for s, q in current.items()
+                                if s in universe_set
+                            ),
+                        )
+                    ),
+                )
+        except Exception as exc:
+            # Any raise in the poll block cannot silently downgrade to
+            # rc=1 — the poll is the sole authoritative post-auction
+            # verdict, so inability to run it MUST page.
+            logger.exception(
+                "post-close position poll block raised — pessimistic "
+                "verdict: EXPOSED (cannot verify book)",
+            )
+            post_close_exposed = True
+            post_close_error = f"poll_block_raised: {str(exc)[:200]}"
+            post_close_nonzero_syms = []
+
+        target_record["post_close_nonzero_symbols"] = post_close_nonzero_syms
+        target_record["post_close_poll_error"] = post_close_error
+        target_record["post_close_skipped_reason"] = post_close_skipped_reason
+        try:
+            _write_target_record(target_record)
+        except Exception:
+            logger.exception(
+                "target record write failed (non-fatal, post-close)"
+            )
+        if post_close_exposed:
+            panic_cmd = (
+                "python -m live.panic --paper --flatten-with MKT "
+                "(or --live --live-confirm=... --yes for live)"
+            )
+            logger.error(
+                "OVERNIGHT EXPOSURE (post-close) — managed-universe "
+                "positions still non-flat after 16:00 auction, or "
+                "post-close position poll failed. RUN: %s. "
+                "Nonzero symbols: %s. Poll error: %s.",
+                panic_cmd,
+                post_close_nonzero_syms[:20] or "(unknown — poll failed)",
+                post_close_error or "(none)",
+                extra={
+                    "n_nonzero_post_close": len(post_close_nonzero_syms),
+                    "post_close_nonzero_symbols": post_close_nonzero_syms[:20],
+                    "post_close_error": post_close_error,
+                    "panic_command": panic_cmd,
+                },
+            )
+            return 11
+
         # M2 (part 3): JSONL fill audit — best-effort logging only,
-        # NOT tied to the rc gate (RRR2). Fills happen at 16:00 close,
-        # so we cap the wait at 15 minutes past submit-by to avoid
-        # the process lingering past the trading day. The MOC
-        # acceptance audit above is the rc-gating check.
+        # NOT tied to the rc gate (RRR2). MOC fills happen at 16:00
+        # close, so cap the wait at 15 minutes past submit-by to avoid
+        # the process lingering past the trading day. The post-close
+        # position poll above is the rc-gating check.
         audit_ids = [e["order_id"] for e in entries if e.get("order_id")]
         audit_ids += moc_order_ids
         # (leg, symbol) index for the trade recorder — needed so the
@@ -2594,6 +4309,61 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
         except Exception:
             logger.exception("fill audit failed (non-fatal)")
+    except Exception as exc:
+        # LAST-RESORT EXPOSURE GATE.
+        #
+        # Everything from the pre-trade reconcile through the post-close
+        # position poll lives in this ``try``. It previously had a
+        # ``finally`` but NO ``except``, so ANY unhandled raise between
+        # entry submission and the rc gate propagated out of main() and
+        # the process exited rc=1 — BELOW the ``rc >= 11`` pager
+        # predicate — while a filled book sat uncovered. The concrete
+        # path: IB hands back a position row whose ``quantity`` is None
+        # and ``int(p.quantity)`` raises TypeError inside the sweep,
+        # after LEG 1 has already filled.
+        #
+        # rc=1 is only safe BEFORE any order is live. ``orders_may_be_live``
+        # is armed immediately before the LEG 1 submission call (not
+        # after it — a partial batch that raises mid-submission has
+        # already put orders on the book), so the two cases separate
+        # cleanly:
+        #   * armed   -> a book may exist with no verified MOC cover.
+        #                Page. rc=11.
+        #   * unarmed -> nothing was ever submitted. Safe failure, rc=1,
+        #                which matches the pre-order refusal codes.
+        #
+        # This runs BEFORE the ``finally`` below, so the operator page is
+        # emitted ahead of recorder finalization / feed teardown, exactly
+        # as the in-band rc=11 returns do.
+        logger.exception(
+            "UNHANDLED EXCEPTION in the order path",
+            extra={"orders_may_be_live": orders_may_be_live},
+        )
+        if orders_may_be_live:
+            panic_cmd = (
+                "python -m live.panic --paper --flatten-with MKT "
+                "(or --live --live-confirm=... --yes for live)"
+            )
+            logger.error(
+                "OVERNIGHT EXPOSURE (unhandled exception) — the order "
+                "path raised AFTER entry submission, so the book state "
+                "is UNKNOWN and may be live with no MOC cover. RUN: %s. "
+                "Exception: %s",
+                panic_cmd,
+                str(exc)[:300],
+                extra={
+                    "panic_command": panic_cmd,
+                    "exception_type": type(exc).__name__,
+                    "exception": str(exc)[:300],
+                },
+            )
+            return 11
+        logger.error(
+            "order path raised BEFORE any order was submitted — no book "
+            "can be live; exiting rc=1 (safe, non-paging)",
+            extra={"exception_type": type(exc).__name__},
+        )
+        return 1
     finally:
         # Finalize the recorder WITHOUT waiting for the marks thread
         # — the ``finally`` fires on the rc=11 OVERNIGHT-EXPOSURE
@@ -2611,7 +4381,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "trade recorder finalize failed (non-fatal)"
                 )
         _stop_feed_safe(feed)
-        broker.disconnect()
+        # A bare raise here would DISCARD an in-flight ``return 11`` and
+        # propagate out of main() as rc=1 — the exact hole the order-path
+        # ``except`` above closes, re-opened through the ``finally``. The
+        # risk is correlated, not theoretical: the TWS drop that makes a
+        # post-close verdict pessimistic is the same event that makes
+        # ``disconnect()`` likely to raise.
+        try:
+            broker.disconnect()
+        except Exception:
+            logger.exception("broker disconnect failed (non-fatal)")
 
     return 0
 
