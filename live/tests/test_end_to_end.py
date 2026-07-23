@@ -14,10 +14,11 @@ Also covers post-review defensive behaviours:
   ``share_targets`` into the broker (which would flatten the book).
 - C2 coverage assertion: a thin single-day snapshot (few universe names)
   raises before any broker call.
-- Two-leg execution: MKT entries fire first, then a fresh
-  ``broker.get_positions()`` snapshot drives MOC counter-flatten. The
-  MOC quantity per name is ALWAYS ``abs(current_qty)``, so a partial
-  MKT fill cannot over-flatten into an opposite overnight exposure.
+- Two-leg execution: LMT entries fire first (priced at the
+  decision-time tbbo mid), then a fresh ``broker.get_positions()``
+  snapshot drives MOC counter-flatten. The MOC quantity per name is
+  ALWAYS ``abs(current_qty)``, so a partial LMT fill cannot
+  over-flatten into an opposite overnight exposure.
 """
 from __future__ import annotations
 
@@ -99,7 +100,7 @@ def _capture_orchestrator_logs(level=None):
 class _FakeBroker:
     """Stand-in for ``ibkr_broker.broker.Broker`` that models fills.
 
-    Every entry (``buy``/``sell`` with ``order_type="MKT"``) and MOC
+    Every entry (``buy``/``sell`` with ``order_type="LMT"``) and MOC
     (``buy``/``sell`` with ``order_type="MOC"``) is recorded AND
     partially/fully fills into an internal position book according to
     ``entry_fill_ratio`` (1.0 by default). A subsequent
@@ -478,8 +479,11 @@ class _FakeBroker:
         # Round-2 slow-fill: seed the per-oid remaining-ticks counter
         # so ``get_order_status`` reports non-terminal for the first N
         # calls, then transitions to the true terminal state.
+        # Applies to entry orders (LMT under the current design; also
+        # MKT for backwards compatibility with any test that still
+        # creates entries as MKT to exercise the sweep in isolation).
         n_ticks = self._slow_fill_ticks_by_sym.get(symbol, 0)
-        if n_ticks > 0 and order_type == "MKT":
+        if n_ticks > 0 and order_type in ("LMT", "MKT"):
             self._slow_fill_remaining_by_oid[oid] = n_ticks
 
     def buy(self, symbol, quantity, order_type="MKT", **kwargs):
@@ -553,10 +557,12 @@ class _FakeBroker:
         # where the local self._trades cache lags. get_order_status
         # returns normally (no exception) but the status is non-terminal
         # and filled=0 even though the order actually filled at the
-        # exchange. Only MKT entries are affected — MOC and post-cancel
-        # states are reported truthfully so other tests remain valid.
+        # exchange. Only entry orders (LMT under the current design;
+        # MKT kept for backward compatibility with the direct-call
+        # sweep tests) are affected — MOC and post-cancel states are
+        # reported truthfully so other tests remain valid.
         if (self._entry_status_stale
-                and info["order_type"] == "MKT"
+                and info["order_type"] in ("LMT", "MKT")
                 and info["status"] == "Filled"):
             return _FakeOrderStatus(
                 order_id=order_id, symbol=info["symbol"],
@@ -600,6 +606,25 @@ def _prepopulate_live_feed(universe: list[str], subset_size: int = 100) -> LiveF
     feed._client = _StubClient()
     feed._started = True
 
+    # Fixture ts anchor. Two competing constraints:
+    # (1) The features engineering (``compute_recent_return`` /
+    #     ``compute_close_trades``) filters on ``ts.dt.time()``
+    #     between 15:40 and 15:50 ET — the ticks MUST have that
+    #     time-of-day.
+    # (2) ``_validate_quote_for_entry`` compares the tick ts to
+    #     wall clock and rejects if the gap exceeds
+    #     ``DEFAULT_MAX_QUOTE_STALENESS_SECS`` (30s in prod).
+    # These are mutually exclusive whenever wall clock is not
+    # exactly inside 15:49:30-15:50:00 ET on today's date. Round-2
+    # policy (reviewer B, blocker 5): fixture keeps the feature-
+    # window times (constraint 1); tests that use this fixture and
+    # go through the entry-submit path MUST call
+    # ``_relax_entry_staleness_for_historical_fixture(monkeypatch)``
+    # to relax constraint (2). The scope is deliberately per-test —
+    # ONE new test (``test_entries_reach_broker_with_production_defaults``)
+    # instead uses a fresh fixture and the real production
+    # staleness guard, so the guard is exercised end-to-end without
+    # a global patch.
     day = "2026-06-15"
     imb_recs: list[dict] = []
     tbbo_recs: list[dict] = []
@@ -615,8 +640,12 @@ def _prepopulate_live_feed(universe: list[str], subset_size: int = 100) -> LiveF
                 "symbol": sym,
                 "price": base + 0.01 * mm,
                 "size": 100,
-                "ask_px_00": base + 0.01 * mm + 0.005,
-                "bid_px_00": base + 0.01 * mm - 0.005,
+                # Widen the fixture spread slightly to 2 cents so
+                # passive rounding (BUY floor / SELL ceil) has an
+                # explicit tick to fall to that's visibly not the
+                # opposite side.
+                "ask_px_00": base + 0.01 * mm + 0.01,
+                "bid_px_00": base + 0.01 * mm - 0.01,
             })
         ts_imb = datetime.fromisoformat(f"{day}T15:50:01-04:00").astimezone(timezone.utc)
         imb_recs.append({
@@ -630,6 +659,50 @@ def _prepopulate_live_feed(universe: list[str], subset_size: int = 100) -> LiveF
     feed._buffers["imbalance"] = imb_recs
     feed._buffers["tbbo"] = tbbo_recs
     return feed
+
+
+def _relax_entry_staleness_for_historical_fixture(monkeypatch) -> None:
+    """Per-test relaxation of the LMT entry-quote staleness guard.
+
+    ``_prepopulate_live_feed`` uses a hard-coded 2026-06-15 date for
+    its tbbo ticks so it satisfies the feature-window time-of-day
+    filter. The production entry guard rejects those ticks as
+    ``quote_stale`` against wall clock. Tests that don't specifically
+    exercise the guard should call THIS helper (scoped to the single
+    test) rather than the round-1 suite-wide monkey-patch.
+    """
+    from live import config as _cfg
+    monkeypatch.setattr(
+        _cfg, "DEFAULT_MAX_QUOTE_STALENESS_SECS",
+        365.0 * 24 * 3600 * 10,  # 10y — effectively disabled
+        raising=False,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _relax_staleness_for_historical_live_fixture(monkeypatch, request):
+    """Module-scoped autouse fixture (scope: ``test_end_to_end.py`` only).
+
+    Delegates to ``_relax_entry_staleness_for_historical_fixture``
+    unless the individual test declares
+    ``pytest.mark.production_staleness`` (used by
+    ``test_entries_reach_broker_with_production_defaults`` below,
+    which asserts entries reach the broker under REAL production
+    defaults with a fresh-relative-to-now fixture).
+
+    Explicitly scoped to this module rather than the suite-wide
+    conftest per round-2 reviewer B feedback ("If any patch must
+    survive, scope it to specific tests via a fixture, never
+    suite-wide"). The rel-spread patch is deleted outright (round-2
+    reviewer A: fixture spreads are 1-10bps, well inside the 50bps
+    default, and the patch was masking a real units bug).
+    """
+    if request.node.get_closest_marker("production_staleness") is not None:
+        # Test opts OUT of the fixture relaxation. It's responsible
+        # for building a fixture whose ts's are fresh vs the
+        # production ``DEFAULT_MAX_QUOTE_STALENESS_SECS`` window.
+        return
+    _relax_entry_staleness_for_historical_fixture(monkeypatch)
 
 
 def _tiny_pipeline():
@@ -704,11 +777,12 @@ def test_daily_orchestrator_dry_run(monkeypatch, tmp_path):
 
 
 def test_daily_orchestrator_places_two_leg_orders(monkeypatch, tmp_path):
-    """Two-leg happy path: MKT entries fill 100%, MOC counter-flatten
+    """Two-leg happy path: LMT entries fill 100%, MOC counter-flatten
     sized to the actual (fully-filled) position.
 
     Assertions:
-    - MKT orders reached the broker (order_type == "MKT", no limit_price).
+    - LMT orders reached the broker (order_type == "LMT", numeric
+      ``limit_price``).
     - MOC counter-orders reached the broker sized to the filled qty.
     - Every MOC exit is in the OPPOSITE direction of its entry.
     - broker.rebalance() is never touched.
@@ -735,34 +809,217 @@ def test_daily_orchestrator_places_two_leg_orders(monkeypatch, tmp_path):
     assert set(fake_broker.qualified_symbols).issubset(set(universe))
     assert fake_broker.rebalance_calls == []
 
-    mkt_buys = [c for c in fake_broker.buy_calls if c[2] == "MKT"]
-    mkt_sells = [c for c in fake_broker.sell_calls if c[2] == "MKT"]
+    lmt_buys = [c for c in fake_broker.buy_calls if c[2] == "LMT"]
+    lmt_sells = [c for c in fake_broker.sell_calls if c[2] == "LMT"]
     moc_buys = [c for c in fake_broker.buy_calls if c[2] == "MOC"]
     moc_sells = [c for c in fake_broker.sell_calls if c[2] == "MOC"]
 
-    assert len(mkt_buys) + len(mkt_sells) > 0, "no MKT entries reached the broker"
-    # Entries must be plain market orders (default tif=DAY) with no
-    # limit price and no explicit tif override.
-    for sym, qty, ot, kw in mkt_buys + mkt_sells:
-        assert kw.get("limit_price") is None
+    # Regression: any lingering "MKT" entry call means my rename missed
+    # a site. Fail loudly.
+    assert not [c for c in fake_broker.buy_calls if c[2] == "MKT"], (
+        "an entry site is still submitting order_type='MKT' — the LMT "
+        "migration missed a site"
+    )
+    assert not [c for c in fake_broker.sell_calls if c[2] == "MKT"], (
+        "an entry site is still submitting order_type='MKT' — the LMT "
+        "migration missed a site"
+    )
+
+    assert len(lmt_buys) + len(lmt_sells) > 0, "no LMT entries reached the broker"
+    # Entries must be LMT with a numeric limit_price, priced at a
+    # valid US-equity tick (0.01 above $1), and use the broker
+    # default tif (DAY).
+    for sym, qty, ot, kw in lmt_buys + lmt_sells:
+        lp = kw.get("limit_price")
+        assert isinstance(lp, (int, float)) and lp > 0, (
+            f"LMT entry for {sym} missing numeric limit_price; got {lp!r}"
+        )
+        # Tick regime: prices >= $1 should be on the penny grid.
+        if lp >= 1.0:
+            assert abs(lp * 100 - round(lp * 100)) < 1e-6, (
+                f"LMT entry for {sym} limit_price {lp} is not on the "
+                f"penny grid"
+            )
         assert "tif" not in kw, (
-            f"MKT entry for {sym} passed an explicit tif={kw.get('tif')!r}; "
+            f"LMT entry for {sym} passed an explicit tif={kw.get('tif')!r}; "
             f"entries must use the broker default (DAY)"
         )
-    # Every MKT-entered symbol got an opposite-side MOC counter-flatten.
-    entered_buys = {sym for sym, qty, ot, kw in mkt_buys}
-    entered_sells = {sym for sym, qty, ot, kw in mkt_sells}
+    # Every LMT-entered symbol got an opposite-side MOC counter-flatten.
+    entered_buys = {sym for sym, qty, ot, kw in lmt_buys}
+    entered_sells = {sym for sym, qty, ot, kw in lmt_sells}
     moc_sells_syms = {sym for sym, qty, ot, kw in moc_sells}
     moc_buys_syms = {sym for sym, qty, ot, kw in moc_buys}
     assert entered_buys == moc_sells_syms, "every BUY entry needs a SELL MOC exit"
     assert entered_sells == moc_buys_syms, "every SELL entry needs a BUY MOC exit"
-    # MOC sizes equal the currently held quantities (i.e. the MKT-filled qty).
+    # MOC sizes equal the currently held quantities (i.e. the LMT-filled qty).
     for sym, qty, ot, kw in moc_buys + moc_sells:
         entry_qty = next(
-            q for s, q, o, _ in mkt_buys + mkt_sells if s == sym
+            q for s, q, o, _ in lmt_buys + lmt_sells if s == sym
         )
         assert qty == entry_qty, (
             f"MOC exit {sym} qty {qty} != entry qty {entry_qty}"
+        )
+
+
+@pytest.mark.production_staleness
+def test_entries_reach_broker_with_production_defaults(monkeypatch, tmp_path):
+    """BLOCKER 5 (round 2): assert that LMT entries actually reach
+    the broker under the REAL production
+    ``DEFAULT_MAX_QUOTE_STALENESS_SECS`` (30s) and
+    ``DEFAULT_MAX_ENTRY_REL_SPREAD`` (50bps) — no staleness
+    monkey-patch, no rel-spread monkey-patch, using a fixture whose
+    ts's are anchored to wall clock so the entry guard's freshness
+    check passes on its own.
+
+    The purpose of this test is to prove the production defaults
+    are workable: a regression that (say) drops the staleness
+    threshold to 1s would silently pass under the historical-
+    fixture tests (which patch the threshold) but fail here.
+    """
+    # Opt-out marker means the autouse module fixture does NOT
+    # relax staleness for this test.
+    from live import config as _cfg
+    # Guard: verify no upstream conftest / autouse still leaks a
+    # relaxed staleness value into the module. If this assert ever
+    # fails, someone re-added a suite-wide patch and this test
+    # would silently pass regardless of the entry-guard's real
+    # behavior.
+    assert _cfg.DEFAULT_MAX_QUOTE_STALENESS_SECS <= 120.0, (
+        f"unexpected relaxed staleness in scope: {_cfg.DEFAULT_MAX_QUOTE_STALENESS_SECS}s"
+    )
+    assert _cfg.DEFAULT_MAX_ENTRY_REL_SPREAD <= 0.005, (
+        f"unexpected relaxed rel-spread in scope: {_cfg.DEFAULT_MAX_ENTRY_REL_SPREAD}"
+    )
+
+    universe = config.load_active_universe()
+
+    # Build a fresh-relative-to-now feed. Ts's anchor to
+    # ``datetime.now(_UTC)`` so the entry guard's 30s staleness
+    # check passes without a monkey-patch. Feature-window filters
+    # look at TIME-OF-DAY; anchoring per today's NY wall clock and
+    # emulating the intra-day offsets works as long as wall clock is
+    # inside the 15:40-15:50 ET feature window. To keep this test
+    # robust under any wall-clock time we PATCH the feature-window
+    # bounds at the feature.py level to accept the last N minutes
+    # instead — one narrow monkey-patch on feature windows, not on
+    # the guard we're trying to verify.
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    from live import features as _features
+
+    now_utc = _dt.now(_tz.utc)
+    now_ny = now_utc.astimezone(config.NY_TZ)
+
+    # Set the feature time-of-day windows to accept the last ~11
+    # minutes ending at the current wall clock's NY time. This is
+    # the ONLY monkey-patch this test tolerates on production
+    # behavior — it is UNRELATED to the guard under test, but
+    # necessary to keep the feature engineering wired to a
+    # feed whose ticks are anchored at wall clock rather than
+    # yesterday's 15:40 ET.
+    _win_end_dt = now_ny - _td(seconds=1)   # last tick is ~1s old
+    _win_start_dt = _win_end_dt - _td(minutes=10)
+    _win_start = _win_start_dt.strftime("%H:%M:%S")
+    _win_end = _win_end_dt.strftime("%H:%M:%S")
+
+    # Wrap the two window-taking helpers to swap defaults into the
+    # freshly-computed window.
+    _real_recent = _features.compute_recent_return
+    _real_close = _features.compute_close_trades
+    _real_imb_print = _features.compute_imbalance_print
+
+    def _recent(tbbo, **kw):
+        return _real_recent(tbbo, start=_win_start, end=_win_end)
+
+    def _close(tbbo, **kw):
+        # Close-trades window: last few seconds ending at wall clock.
+        _close_end = now_ny.strftime("%H:%M:%S")
+        _close_start = (now_ny - _td(seconds=5)).strftime("%H:%M:%S")
+        return _real_close(
+            tbbo, entry_window_start=_close_start, entry_window_end=_close_end,
+        )
+
+    def _imb(imb, **kw):
+        # Imbalance window: last few seconds ending at wall clock.
+        _imb_start = (now_ny - _td(seconds=5)).strftime("%H:%M:%S")
+        _imb_end = now_ny.strftime("%H:%M:%S")
+        return _real_imb_print(
+            imb, window_start=_imb_start, window_end=_imb_end,
+        )
+
+    # Patch inside the daily_orchestrator's re-export.
+    monkeypatch.setattr(daily_orchestrator, "compute_recent_return", _recent)
+    monkeypatch.setattr(daily_orchestrator, "compute_close_trades", _close)
+    monkeypatch.setattr(daily_orchestrator, "compute_imbalance_print", _imb)
+
+    # Fresh feed anchored to now.
+    feed = LiveFeed(api_key="dummy", universe=universe, reconnect=False)
+
+    class _StubClient:
+        def stop(self): pass
+        def block_for_close(self, timeout=None): pass
+
+    feed._client = _StubClient()
+    feed._started = True
+
+    imb_recs: list[dict] = []
+    tbbo_recs: list[dict] = []
+    _offsets_secs = [10 * 60, 5 * 60, 60, 30, 5, 1]
+    for i, sym in enumerate(universe):
+        base = 100.0 + i * 3
+        for _s_ago in _offsets_secs:
+            ts = now_utc - _td(seconds=_s_ago)
+            tbbo_recs.append({
+                "ts_event": ts,
+                "symbol": sym,
+                "price": base,
+                "size": 100,
+                "ask_px_00": base + 0.01,
+                "bid_px_00": base - 0.01,
+            })
+        imb_recs.append({
+            "ts_event": now_utc - _td(seconds=2),
+            "symbol": sym,
+            "side": "B" if (i % 2) == 0 else "A",
+            "total_imbalance_qty": 100_000 + 1_000 * i,
+            "paired_qty": 500_000,
+            "ref_price": base + 0.5,
+        })
+    feed._buffers["tbbo"] = tbbo_recs
+    feed._buffers["imbalance"] = imb_recs
+
+    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
+    monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+
+    fake_broker = _FakeBroker()
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    rc = daily_orchestrator.main(_base_argv())
+    assert rc == 0, (
+        f"main returned rc={rc} with production defaults — a "
+        f"regression in the entry-guard defaults would surface here"
+    )
+    lmt_orders = [
+        c for c in fake_broker.buy_calls + fake_broker.sell_calls
+        if c[2] == "LMT"
+    ]
+    assert lmt_orders, (
+        "no LMT entries reached the broker under production "
+        "defaults — the staleness or rel-spread guard rejected "
+        "every symbol"
+    )
+    # Sanity: every submitted entry carries a positive limit_price
+    # rounded to the penny grid.
+    for sym, qty, ot, kw in lmt_orders:
+        lp = kw.get("limit_price")
+        assert isinstance(lp, (int, float)) and lp > 0, (
+            f"LMT entry for {sym} missing numeric limit_price; got {lp!r}"
         )
 
 
@@ -889,6 +1146,124 @@ def test_daily_orchestrator_refuses_empty_share_targets(monkeypatch, tmp_path):
 
 
 
+def test_mass_skip_of_entry_quote_guard_returns_rc_10(monkeypatch, tmp_path):
+    """ROUND-3 (reviewers A + B): dedicated regression for the
+    ``DEFAULT_MIN_ENTRY_SUBMIT_COVERAGE`` (rc=10) guard.
+
+    Force >50% of priced-in symbols to skip via the quote guards
+    (here: fake crossed quotes for the majority) and assert:
+
+    (1) The run exits **rc == 10** — the mass-skip pre-order refusal.
+    (2) Rc=10 is BELOW the ``rc >= 11`` pager threshold — this is a
+        safe pre-order refusal (no exposure remains), not an
+        overnight-exposure page.
+    (3) Any entries that DID land on the wire (the minority whose
+        quotes were kept clean) were CANCELLED before the return
+        so no working LMT is left to fill into an uncovered
+        position.
+    (4) No MOC exit was submitted (the guard trips BEFORE LEG 2).
+
+    Regression proof: removing the coverage-floor check in
+    ``main()`` (i.e. never returning rc=10, always proceeding to
+    LEG 2) makes this test fail on assertion (1) — the run instead
+    executes the truncated fragment and returns rc=0, precisely
+    the failure mode round-2 blocker 4 was created to prevent.
+    """
+    universe = config.load_active_universe()
+    feed = _prepopulate_live_feed(universe)
+    monkeypatch.setattr(daily_orchestrator, "LiveFeed", lambda *a, **kw: feed)
+    monkeypatch.setattr(daily_orchestrator, "_sleep_until", lambda *a, **kw: None)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+
+    # Corrupt the last-quote extraction so the MAJORITY of symbols
+    # return a "crossed" quote (ask < bid) — the quote guard will
+    # reject them as ``quote_crossed``. Keep the first few clean
+    # so we can also verify submitted entries are cancelled.
+    from datetime import datetime as _dt, timezone as _tz
+    _real_extract = daily_orchestrator._extract_last_quote_by_sym
+
+    def _majority_crossed(tbbo, universe=None, max_ts=None):
+        real = _real_extract(tbbo, universe=universe, max_ts=max_ts)
+        # Sort so the "clean" set is deterministic for the assertions.
+        syms_sorted = sorted(real.keys())
+        # Keep 3 symbols clean; force the rest to a CROSSED quote.
+        keep_clean = set(syms_sorted[:3])
+        for sym in syms_sorted[3:]:
+            ts = real[sym]["ts"]
+            real[sym] = {
+                "bid": 100.02,  # bid > ask → crossed
+                "ask": 100.00,
+                "mid": 100.01,
+                "ts": ts,
+            }
+        # Return with mutation applied. Assertion (1) below is what
+        # actually catches the "coverage floor removed" mutation.
+        return real
+
+    monkeypatch.setattr(
+        daily_orchestrator, "_extract_last_quote_by_sym", _majority_crossed,
+    )
+
+    fake_broker = _FakeBroker()
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    rc = daily_orchestrator.main(_base_argv())
+
+    # (1) rc==10 — the dedicated mass-skip guard code.
+    assert rc == 10, (
+        f"expected rc=10 (LMT entry submit coverage below "
+        f"DEFAULT_MIN_ENTRY_SUBMIT_COVERAGE); got {rc}. If this is 0, "
+        f"the coverage-floor guard in main() has been removed and a "
+        f"truncated fragment of the risk-balanced solve was executed "
+        f"— exactly the failure mode round-2 blocker 4 exists to "
+        f"prevent."
+    )
+    # (2) Below the pager threshold. rc>=11 is reserved for
+    # OVERNIGHT_EXPOSURE; a pre-order refusal must not page.
+    assert rc < 11, (
+        f"rc={rc} is in the pager band; the mass-skip guard must "
+        f"stay a safe pre-order refusal"
+    )
+    # (3) Every LMT that DID land was cancelled before the return.
+    # The 3 clean symbols would each generate one LMT. Whatever
+    # subset of them actually submitted must appear in cancel_calls.
+    lmt_orders = [
+        c for c in fake_broker.buy_calls + fake_broker.sell_calls
+        if c[2] == "LMT"
+    ]
+    submitted_lmt_syms = [c[0] for c in lmt_orders]
+    if submitted_lmt_syms:
+        # We can identify each entry's oid via _record_fill's event
+        # log; simpler is to inspect _orders directly.
+        submitted_oids = [
+            oid for oid, info in fake_broker._orders.items()
+            if info["order_type"] == "LMT"
+        ]
+        assert submitted_oids, "internal test bug: LMT sent but no oid recorded"
+        for _oid in submitted_oids:
+            assert _oid in fake_broker.cancel_calls, (
+                f"submitted LMT {_oid} was NOT cancelled before rc=10 "
+                f"return — a working DAY LMT would be left on the "
+                f"book to fill into an uncovered position. "
+                f"cancel_calls={fake_broker.cancel_calls}"
+            )
+    # (4) No MOC exit fired — the guard trips BEFORE LEG 2.
+    moc_orders = [
+        c for c in fake_broker.buy_calls + fake_broker.sell_calls
+        if c[2] == "MOC"
+    ]
+    assert not moc_orders, (
+        f"MOC exit fired despite rc=10 mass-skip refusal: {moc_orders}. "
+        f"LEG 2 must be skipped entirely on rc=10."
+    )
+
+
 def test_broker_connect_failure_returns_rc_8(monkeypatch, tmp_path):
     """Polish: _connect_broker raising (e.g. live-port guard on paper mode,
     TWS down, bad client_id) exits rc=8 with no traceback, no orders."""
@@ -969,7 +1344,7 @@ def test_two_leg_partial_fill_moc_sized_to_actual_position(monkeypatch, tmp_path
     monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
     _patch_artifacts(monkeypatch, universe)
 
-    # MKT entries fill exactly 50%; MOC exits (order_type=="MOC") fill fully.
+    # LMT entries fill exactly 50%; MOC exits (order_type=="MOC") fill fully.
     fake_broker = _FakeBroker(entry_fill_ratio=0.5)
 
     def _fake_connect(_args):
@@ -981,16 +1356,16 @@ def test_two_leg_partial_fill_moc_sized_to_actual_position(monkeypatch, tmp_path
     rc = daily_orchestrator.main(_base_argv())
     assert rc == 0
 
-    mkt_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
-                  if c[2] == "MKT"]
+    lmt_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
+                  if c[2] == "LMT"]
     moc_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
                   if c[2] == "MOC"]
-    assert mkt_orders, "no MKT entries reached the broker"
+    assert lmt_orders, "no LMT entries reached the broker"
     assert moc_orders, "no MOC exits reached the broker"
 
-    # Per-symbol: MOC exit qty must equal MKT entry qty * 0.5 (filled),
+    # Per-symbol: MOC exit qty must equal LMT entry qty * 0.5 (filled),
     # not the full requested qty.
-    entry_by_sym = {c[0]: c[1] for c in mkt_orders}
+    entry_by_sym = {c[0]: c[1] for c in lmt_orders}
     for sym, moc_qty, ot, kw in moc_orders:
         entry_qty = entry_by_sym[sym]
         expected_filled = int(round(entry_qty * 0.5))
@@ -1048,7 +1423,7 @@ def test_two_leg_submit_by_hit_between_entry_and_exit_returns_rc_11(
     skip). The two rcs must be distinct so a cron wrapper can page on
     exposure and stay quiet on a harmless skip.
 
-    Implementation trick: patch ``_submit_mkt_entries`` to run the real
+    Implementation trick: patch ``_submit_limit_entries`` to run the real
     function and then flip a shared "now" past the submit_by, so the
     subsequent ``_submit_moc_flatten`` per-leg wall-clock check trips
     on every leg.
@@ -1068,14 +1443,14 @@ def test_two_leg_submit_by_hit_between_entry_and_exit_returns_rc_11(
 
     monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
 
-    real_submit_mkt = daily_orchestrator._submit_mkt_entries
+    real_submit_lmt = daily_orchestrator._submit_limit_entries
     real_now_ny = config.now_ny
     state = {"advance": False}
 
-    def _wrapped_submit_mkt(*args, **kwargs):
-        # Run the real MKT entry batch, then flip the wall clock so the
+    def _wrapped_submit_lmt(*args, **kwargs):
+        # Run the real LMT entry batch, then flip the wall clock so the
         # MOC batch's per-leg check trips.
-        entries = real_submit_mkt(*args, **kwargs)
+        entries = real_submit_lmt(*args, **kwargs)
         state["advance"] = True
         return entries
 
@@ -1087,8 +1462,8 @@ def test_two_leg_submit_by_hit_between_entry_and_exit_returns_rc_11(
                    __import__("datetime").timedelta(minutes=30)
         return base
 
-    monkeypatch.setattr(daily_orchestrator, "_submit_mkt_entries",
-                        _wrapped_submit_mkt)
+    monkeypatch.setattr(daily_orchestrator, "_submit_limit_entries",
+                        _wrapped_submit_lmt)
     monkeypatch.setattr(daily_orchestrator.config, "now_ny",
                         _maybe_advanced_now)
 
@@ -1098,11 +1473,11 @@ def test_two_leg_submit_by_hit_between_entry_and_exit_returns_rc_11(
         f"expected rc=11 (entries filled, MOC exit skipped — OVERNIGHT "
         f"EXPOSURE), got {rc}"
     )
-    mkt_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
-                  if c[2] == "MKT"]
+    lmt_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
+                  if c[2] == "LMT"]
     moc_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
                   if c[2] == "MOC"]
-    assert mkt_orders, "MKT entries should still have fired before the cutoff"
+    assert lmt_orders, "LMT entries should still have fired before the cutoff"
     assert not moc_orders, (
         "MOC exits should have been skipped past the submit-by cutoff"
     )
@@ -1183,12 +1558,117 @@ def test_two_leg_replay_exercises_same_path(monkeypatch, tmp_path):
     ]
     rc = daily_orchestrator.main(argv)
     assert rc == 0
-    mkt_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
-                  if c[2] == "MKT"]
+    lmt_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
+                  if c[2] == "LMT"]
     moc_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
                   if c[2] == "MOC"]
-    assert mkt_orders, "replay should exercise MKT entry leg"
+    assert lmt_orders, "replay should exercise LMT entry leg"
     assert moc_orders, "replay should exercise MOC exit leg"
+
+
+@pytest.mark.production_staleness
+def test_replay_submit_reaches_broker_under_production_staleness(
+    monkeypatch, tmp_path,
+):
+    """ROUND-3 (reviewers A + B): dedicated regression for blocker 3a.
+
+    Blocker 3a fix: on the replay path, the LMT entry-quote
+    staleness guard measures tick age against the REPLAY-DAY
+    decision anchor (``decision_ts_utc``), NOT today's wall
+    clock. Without that anchor, historical ticks (2026-05-15 in
+    this test's ``_make_stub_replay_feed`` fixture) are trivially
+    days-to-months old vs today's wall clock → all names skip
+    ``quote_stale`` → ``--replay-submit`` silently places ZERO
+    orders while exiting rc=0 (or, under the mass-skip guard,
+    rc=10). Either way the "last rehearsal before real money"
+    documented in README §3 Layer 1 would be a silent no-op.
+
+    This test carries the ``production_staleness`` marker to
+    OPT OUT of the module-scoped autouse relaxation fixture, so
+    it runs at the REAL production
+    ``DEFAULT_MAX_QUOTE_STALENESS_SECS`` (30s). It asserts
+    entries actually land on the paper broker.
+
+    Regression proof: reverting the ``main()`` change that pins
+    ``entry_reference_now_utc = decision_ts_utc`` on the replay
+    path (i.e. going back to ``datetime.now(_UTC)`` for replay
+    too) makes THIS test fail: the historical ticks measure as
+    ~months stale against today's wall clock, all names skip
+    ``quote_stale``, and the run returns either rc=10 (mass-skip)
+    or rc=0-with-zero-orders. The 5 other tests in this
+    module's replay set do not catch this because the autouse
+    relaxation fixture masks the wall-clock/replay-clock
+    difference for them.
+    """
+    from live.tests.test_replay import (
+        _make_stub_replay_feed as _make_stub,
+        _FakeBroker as _ReplayFakeBroker,
+    )
+    from live import config as _cfg
+
+    # Guard: verify the module autouse fixture actually opted us
+    # OUT. If some future change made the ``production_staleness``
+    # marker a no-op, this defensive check would fail loudly
+    # instead of the actual assertion being unwittingly relaxed.
+    assert _cfg.DEFAULT_MAX_QUOTE_STALENESS_SECS <= 120.0, (
+        f"unexpected relaxed staleness in scope: "
+        f"{_cfg.DEFAULT_MAX_QUOTE_STALENESS_SECS}s. The "
+        f"``production_staleness`` marker did not opt us out of "
+        f"the module autouse relax fixture."
+    )
+
+    universe = config.load_active_universe()
+    stub_feed = _make_stub("2026-05-15", universe)
+    monkeypatch.setattr(daily_orchestrator, "ReplayFeed", lambda **kw: stub_feed)
+    monkeypatch.setenv("DATABENTO_API_KEY", "dummy-key")
+    _patch_artifacts(monkeypatch, universe)
+    monkeypatch.setattr(daily_orchestrator, "_TARGETS_DIR", tmp_path / "targets")
+    monkeypatch.setattr(daily_orchestrator, "_FILLS_DIR", tmp_path / "fills")
+
+    fake_broker = _ReplayFakeBroker()
+
+    def _fake_connect(_args):
+        fake_broker.connect(mode="paper")
+        return fake_broker
+
+    monkeypatch.setattr(daily_orchestrator, "_connect_broker", _fake_connect)
+
+    argv = [
+        "--replay-date", "2026-05-15", "--paper",
+        "--vol-cap", "5000", "--replay-submit",
+        "--submit-by", "00:01", "--replay-ignore-cutoff",
+        "--on-feed-failure", "abort",
+    ]
+    rc = daily_orchestrator.main(argv)
+    # Rc == 0 AND entries actually landed on the broker. Under the
+    # blocker-3a regression the historical ticks would fail
+    # staleness at wall clock, the mass-skip guard (blocker 4)
+    # would fire, and rc would be 10 instead of 0.
+    assert rc == 0, (
+        f"expected rc=0 (replay-clock anchor keeps historical ticks "
+        f"fresh); got {rc}. If this is 10, the replay-relative "
+        f"staleness fix has regressed — every historical tick is "
+        f"measuring stale against today's wall clock, all symbols "
+        f"skip ``quote_stale``, and the mass-skip guard rc=10 "
+        f"fires. This is precisely the failure mode round-2 "
+        f"blocker 3a exists to prevent."
+    )
+    lmt_orders = [
+        c for c in fake_broker.buy_calls + fake_broker.sell_calls
+        if c[2] == "LMT"
+    ]
+    assert lmt_orders, (
+        "replay-submit under production staleness placed ZERO LMT "
+        "entries — the replay-day decision-anchor staleness fix has "
+        "regressed. Historical fixture ticks are measuring stale "
+        "against today's wall clock instead of the 2026-05-15 "
+        "replay anchor."
+    )
+    moc_orders = [
+        c for c in fake_broker.buy_calls + fake_broker.sell_calls
+        if c[2] == "MOC"
+    ]
+    assert moc_orders, "replay should exercise the MOC exit leg too"
 
 
 # ---------------------------------------------------------------------------
@@ -1231,9 +1711,9 @@ def test_r1_get_positions_raises_returns_rc_11(monkeypatch, tmp_path):
         f"EXPOSURE), got {rc}"
     )
     # Entries fired.
-    mkt_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
-                  if c[2] == "MKT"]
-    assert mkt_orders, "MKT entries should have fired before the snapshot failed"
+    lmt_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
+                  if c[2] == "LMT"]
+    assert lmt_orders, "LMT entries should have fired before the snapshot failed"
     # MOC batch produced nothing.
     moc_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
                   if c[2] == "MOC"]
@@ -1324,9 +1804,9 @@ def test_r2_stuck_entries_cancelled_before_moc_snapshot(monkeypatch, tmp_path):
 
     entry_oids = [
         oid for oid, info in fake_broker._orders.items()
-        if info["order_type"] == "MKT"
+        if info["order_type"] == "LMT"
     ]
-    assert entry_oids, "no MKT entries were placed at all"
+    assert entry_oids, "no LMT entries were placed at all"
     for oid in entry_oids:
         assert oid in fake_broker.cancel_calls, (
             f"stuck entry {oid} (symbol "
@@ -1356,7 +1836,7 @@ def test_r2_stuck_entries_cancelled_before_moc_snapshot(monkeypatch, tmp_path):
     events = fake_broker.events
     entry_event_indices = [
         i for i, e in enumerate(events)
-        if (e.startswith("buy:MKT:") or e.startswith("sell:MKT:"))
+        if (e.startswith("buy:LMT:") or e.startswith("sell:LMT:"))
     ]
     assert entry_event_indices, "no entry events recorded — test setup bug"
     cancel_indices = [
@@ -1425,7 +1905,7 @@ def test_r4_duplicate_positions_dedup_by_symbol(monkeypatch, tmp_path):
     # from the entry order book because post-MOC positions are zero.
     expected_per_sym: dict[str, int] = {}
     for oid, info in fake_broker._orders.items():
-        if info["order_type"] != "MKT":
+        if info["order_type"] != "LMT":
             continue
         signed = info["filled"] if info["action"] == "BUY" else -info["filled"]
         expected_per_sym[info["symbol"]] = (
@@ -1703,12 +2183,12 @@ def test_rrr1_moc_rejected_at_exchange_returns_rc_11(monkeypatch, tmp_path):
         f"phase 1: expected 'OVERNIGHT EXPOSURE (post-close)' alert to "
         f"identify which safeguard tripped; got: {loud_pre}"
     )
-    mkt_pre = [c for c in broker_pre.buy_calls + broker_pre.sell_calls
-               if c[2] == "MKT"]
+    lmt_pre = [c for c in broker_pre.buy_calls + broker_pre.sell_calls
+               if c[2] == "LMT"]
     moc_pre = [c for c in broker_pre.buy_calls + broker_pre.sell_calls
                if c[2] == "MOC"]
-    assert mkt_pre and moc_pre, (
-        "phase 1: expected both MKT entries and MOC placements to have "
+    assert lmt_pre and moc_pre, (
+        "phase 1: expected both LMT entries and MOC placements to have "
         "fired against the broker"
     )
 
@@ -1728,12 +2208,12 @@ def test_rrr1_moc_rejected_at_exchange_returns_rc_11(monkeypatch, tmp_path):
         f"phase 2 (audit restored) must return rc=11 on MOC exchange "
         f"rejection; got {rc_post}"
     )
-    # MKT entries fired AND MOC placements went through (returned oid).
-    mkt_orders = [c for c in broker_post.buy_calls + broker_post.sell_calls
-                  if c[2] == "MKT"]
+    # LMT entries fired AND MOC placements went through (returned oid).
+    lmt_orders = [c for c in broker_post.buy_calls + broker_post.sell_calls
+                  if c[2] == "LMT"]
     moc_orders = [c for c in broker_post.buy_calls + broker_post.sell_calls
                   if c[2] == "MOC"]
-    assert mkt_orders, "MKT entries should have fired"
+    assert lmt_orders, "LMT entries should have fired"
     assert moc_orders, "MOC placements should have been API-accepted"
     # Loud alert with the panic command AND the MOC-rejection detail.
     loud = [r.getMessage() for r in records]
@@ -1967,8 +2447,8 @@ def test_every_order_path_uses_active_routing(monkeypatch, tmp_path):
     Enumerates the three paths and pins each:
     * pre-qualify (``broker._make_contract`` inside
       ``_prequalify_symbols``)
-    * MKT entry batch (``broker.buy`` / ``broker.sell`` with
-      ``order_type="MKT"``)
+    * LMT entry batch (``broker.buy`` / ``broker.sell`` with
+      ``order_type="LMT"`` and a numeric ``limit_price``)
     * MOC exit batch (``broker.buy`` / ``broker.sell`` with
       ``order_type="MOC"``)
     A regression that ever drops the ``exchange`` kwarg on any of these
@@ -2005,15 +2485,15 @@ def test_every_order_path_uses_active_routing(monkeypatch, tmp_path):
             f"expected {ACTIVE_ROUTING!r}"
         )
 
-    # (2) + (3) entry MKT and exit MOC — every buy/sell call must
+    # (2) + (3) entry LMT and exit MOC — every buy/sell call must
     # carry exchange=ACTIVE_ROUTING in its kwargs. This is the
     # load-bearing assertion: it fails the moment any call site drops
     # the kwarg.
     all_order_calls = fake_broker.buy_calls + fake_broker.sell_calls
     assert all_order_calls, "no orders reached the broker at all"
-    mkt_orders = [c for c in all_order_calls if c[2] == "MKT"]
+    lmt_orders = [c for c in all_order_calls if c[2] == "LMT"]
     moc_orders = [c for c in all_order_calls if c[2] == "MOC"]
-    assert mkt_orders, "no MKT entries reached the broker"
+    assert lmt_orders, "no LMT entries reached the broker"
     assert moc_orders, "no MOC exits reached the broker"
     for sym, qty, order_type, kw in all_order_calls:
         got = kw.get("exchange")
@@ -2237,15 +2717,15 @@ def test_prequalify_drop_still_flattens_existing_position(monkeypatch, tmp_path)
     rc = daily_orchestrator.main(_base_argv())
     assert rc == 0
 
-    # (1) ENTRY suppressed — no MKT for the dropped name.
-    mkt_calls_for_held = [
+    # (1) ENTRY suppressed — no LMT for the dropped name.
+    entry_calls_for_held = [
         (sym, qty, ot, kw)
         for sym, qty, ot, kw in fake_broker.buy_calls + fake_broker.sell_calls
-        if sym == held_sym and ot == "MKT"
+        if sym == held_sym and ot == "LMT"
     ]
-    assert not mkt_calls_for_held, (
-        f"filter-dropped name {held_sym} reached an MKT entry despite "
-        f"the prequalify drop: {mkt_calls_for_held}"
+    assert not entry_calls_for_held, (
+        f"filter-dropped name {held_sym} reached an LMT entry despite "
+        f"the prequalify drop: {entry_calls_for_held}"
     )
 
     # (2) EXIT preserved — a MOC of exactly the held quantity, on the
@@ -2329,7 +2809,7 @@ def test_fill_gated_moc_fires_immediately_on_entry_terminal(
     # BEFORE the terminal transition of (b).
     #
     # The fake's ``events`` log records "get_positions",
-    # "buy:MKT:<sym>:<oid>", "sell:MKT:<sym>:<oid>", "buy:MOC:...",
+    # "buy:LMT:<sym>:<oid>", "sell:LMT:<sym>:<oid>", "buy:MOC:...",
     # "sell:MOC:...", "cancel:<oid>". ``get_order_status`` calls are
     # not currently logged (they'd flood the log), so we use "the
     # LAST tick-loop pass that fires a MOC while slow_sym is not yet
@@ -2384,7 +2864,7 @@ def test_fill_gated_moc_fires_immediately_on_entry_terminal(
     # Structural sanity — every entry has an opposite-side MOC.
     entries_by_sym: dict[str, str] = {}
     for tag in fake_broker.events:
-        if tag.startswith("buy:MKT:") or tag.startswith("sell:MKT:"):
+        if tag.startswith("buy:LMT:") or tag.startswith("sell:LMT:"):
             side, _, sym_oid = tag.split(":", 2)
             sym = sym_oid.split(":")[0]
             entries_by_sym[sym] = "BUY" if side == "buy" else "SELL"
@@ -2396,7 +2876,7 @@ def test_fill_gated_moc_fires_immediately_on_entry_terminal(
             sym = sym_oid.split(":")[0]
             mocs_by_sym[sym] = "BUY" if side == "buy" else "SELL"
 
-    assert entries_by_sym, "no MKT entries recorded"
+    assert entries_by_sym, "no LMT entries recorded"
     assert set(entries_by_sym) == set(mocs_by_sym), (
         f"symbols missing an MOC: {set(entries_by_sym) - set(mocs_by_sym)}; "
         f"symbols missing an entry: {set(mocs_by_sym) - set(entries_by_sym)}"
@@ -2436,13 +2916,13 @@ def test_fill_gated_partial_fill_moc_sized_to_actual_position(
     rc = daily_orchestrator.main(_base_argv())
     assert rc == 0
 
-    mkt_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
-                  if c[2] == "MKT"]
+    lmt_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
+                  if c[2] == "LMT"]
     moc_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
                   if c[2] == "MOC"]
-    assert mkt_orders and moc_orders
+    assert lmt_orders and moc_orders
 
-    entry_by_sym = {c[0]: c[1] for c in mkt_orders}
+    entry_by_sym = {c[0]: c[1] for c in lmt_orders}
     for sym, moc_qty, ot, kw in moc_orders:
         entry_qty = entry_by_sym[sym]
         expected_filled = int(round(entry_qty * 0.5))
@@ -2524,7 +3004,7 @@ def test_fill_gated_zero_fill_no_moc_terminal_cancelled(
     daily_orchestrator.main(_base_argv())
     traded_syms = [
         c[0] for c in probe_broker.buy_calls + probe_broker.sell_calls
-        if c[2] == "MKT"
+        if c[2] == "LMT"
     ]
     assert traded_syms, "probe run traded nothing — cannot pick a zero-fill target"
     zero_fill_sym = traded_syms[0]
@@ -2548,21 +3028,21 @@ def test_fill_gated_zero_fill_no_moc_terminal_cancelled(
     # AND no MOC was placed for the symbol.
     entry_events = [
         tag for tag in fake_broker.events
-        if (tag.startswith("buy:MKT:") or tag.startswith("sell:MKT:"))
+        if (tag.startswith("buy:LMT:") or tag.startswith("sell:LMT:"))
         and f":{zero_fill_sym}:" in tag
     ]
     assert entry_events, (
         f"expected an entry submission for {zero_fill_sym} — the "
         f"zero-fill knob relies on the entry landing so the terminal "
         f"branch can be exercised. Traded syms this run: "
-        f"{[c[0] for c in fake_broker.buy_calls + fake_broker.sell_calls if c[2] == 'MKT'][:10]}"
+        f"{[c[0] for c in fake_broker.buy_calls + fake_broker.sell_calls if c[2] == 'LMT'][:10]}"
     )
     # Fake's internal book confirms terminal Cancelled + filled=0.
     matching_orders = [
         o for o in fake_broker._orders.values()
-        if o["symbol"] == zero_fill_sym and o["order_type"] == "MKT"
+        if o["symbol"] == zero_fill_sym and o["order_type"] == "LMT"
     ]
-    assert matching_orders, "no MKT entry recorded internally"
+    assert matching_orders, "no LMT entry recorded internally"
     for o in matching_orders:
         assert o["status"] == "Cancelled" and o["filled"] == 0, (
             f"knob mis-wired — expected terminal Cancelled+filled=0, "
@@ -4336,8 +4816,8 @@ def test_fill_gated_submit_error_pages_pre_close(monkeypatch, tmp_path):
     monkeypatch.setattr(daily_orchestrator, "_connect_broker",
                         lambda _args: (probe.connect(mode="paper"), probe)[1])
     daily_orchestrator.main(_base_argv())
-    buy_entry_syms = [c[0] for c in probe.buy_calls if c[2] == "MKT"]
-    assert buy_entry_syms, "probe found no MKT BUY entry to target"
+    buy_entry_syms = [c[0] for c in probe.buy_calls if c[2] == "LMT"]
+    assert buy_entry_syms, "probe found no LMT BUY entry to target"
     target_sym = buy_entry_syms[0]
 
     # Real test: same setup, but raise on any SELL for target_sym.

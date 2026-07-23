@@ -6,8 +6,43 @@ Runs once per trading day. Timeline:
    15:50 ET  snapshot buffers, engineer features, run alpha + MVO,
              convert dollar targets to signed share counts, reconcile
              against current IBKR positions
-   15:50 ET  ENTRY batch: per-name MKT sized to ``target - current``
-             via ``broker.buy`` / ``broker.sell`` (default tif=DAY).
+   15:50 ET+ ENTRY batch: per-name LMT sized to ``target - current``,
+             priced at the tbbo mid observed in the DECISION-TIME
+             snapshot (the same 15:50 ``feed.snapshot()`` that fed
+             the MVO, TIME-BOUNDED at the decision moment via
+             ``_extract_last_quote_by_sym(max_ts=decision_ts_utc)``
+             so the replay path cannot leak the 16:00 closing print
+             into the entry price). Same-observation pricing keeps
+             the price we solved against and the price we bid at
+             consistent — the tradeoff is that the mid is knowingly
+             stale by the MVO solve duration, so the staleness
+             guard (``DEFAULT_MAX_QUOTE_STALENESS_SECS``) measures
+             the tick's age at submission time (wall clock live,
+             replay-day decision anchor on replay). Sub-tick
+             precision is rounded PASSIVELY per side ($0.01 above
+             $1, $0.0001 below): BUY floors DOWN, SELL ceils UP —
+             see ``_round_to_tick`` for why passive-per-side is a
+             correctness requirement, not a preference. The entry
+             is DAY (default ``tif``) and works at the limit UNTIL
+             the sweep cancels it just before 15:55 (see
+             ``DEFAULT_ENTRY_WORKING_SECS``); this is materially
+             longer than the old MKT-era 30s fill-wait and is what
+             gives a passive limit a chance to actually cross. A
+             symbol whose decision-time tbbo is missing, stale,
+             crossed, non-positive, absurdly priced, or wider than
+             ``DEFAULT_MAX_ENTRY_REL_SPREAD`` is SKIPPED entirely
+             — no entry, no exposure, no MOC (a skipped entry
+             carries ``order_id=None`` and ``filled_qty=0`` so both
+             the fill-gated dispatcher and the coverage cross-
+             check treat it as "did not attempt"). If MORE than
+             ``1 - DEFAULT_MIN_ENTRY_SUBMIT_COVERAGE`` of the
+             priced-in universe is skipped by the quote guard the
+             orchestrator EXITS rc=10 before submitting any
+             remaining names — a truncated fragment of a
+             risk-balanced solve is worse than no book at all.
+             Submitted via ``broker.buy`` / ``broker.sell`` with
+             ``order_type="LMT"``, ``limit_price=<numeric>``, and
+             the broker default ``tif="DAY"``.
    15:50 ET+ FILL-GATED MOC DISPATCH: a single-threaded polling loop
              concurrently monitors every entry's status. As each entry
              becomes terminal Filled, its opposite-side MOC is
@@ -53,11 +88,12 @@ Runs once per trading day. Timeline:
              to rc=11 pre-close so the operator has time to run panic.
 
 The two-leg model captures the strategy's forecasted 15:50 -> 16:00
-close-auction move: MKT entries land intraday, MOC exits lift at the
-closing print, and the book is flat overnight. The MOC size is ALWAYS
-``|current_qty|`` (measured immediately before the MOC send) — a
-partial MKT fill can never over-flatten into an opposite overnight
-exposure.
+close-auction move: LMT entries land intraday at the decision-time
+tbbo mid, MOC exits lift at the closing print, and the book is flat
+overnight. The MOC size is ALWAYS ``|current_qty|`` (measured
+immediately before the MOC send) — a partial LMT fill can never
+over-flatten into an opposite overnight exposure, and an entry that
+never crossed simply leaves the position where it was.
 
 Ground-truth ON EXCHANGE DEADLINES (verified against SEC/Nasdaq/IB):
 - NASDAQ MOC ENTRY cutoff: 15:55:00 ET. MOC orders may be entered
@@ -93,6 +129,9 @@ their own spaces):
   7   --replay-submit without --replay-date
   8   broker connect failed (no orders placed)
   9   --lambda- <= 0 (invalid argument, no orders placed)
+  10  LMT entry submit coverage below ``DEFAULT_MIN_ENTRY_SUBMIT_COVERAGE``
+      (systemic feed wedge or quote-guard mass-skip; any entries that DID
+      land are cancelled before this return so no exposure remains).
   11  OVERNIGHT EXPOSURE POSSIBLE — page the operator. Any of:
         * pre-close signals (EARLY page so the operator has time to
           run panic before 16:00): legs skipped past cutoff (either
@@ -134,7 +173,7 @@ pre-order refusal or clean shutdown.
 
 CONCURRENCY NOTE: do NOT run ``python -m live.panic`` against the
 same TWS client-id while an orchestrator run is in flight — panic's
-``cancel_all()`` will pull the orchestrator's own MKT entries and MOC
+``cancel_all()`` will pull the orchestrator's own LMT entries and MOC
 exits mid-flow, corrupting the coverage cross-check's ground-truth
 poll. Panic uses client-id 99 by default; the orchestrator uses 1.
 Distinct ids let them coexist against the same TWS but they should
@@ -149,11 +188,13 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import sys
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -196,7 +237,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
             "Daily live orchestrator: stream -> features -> alpha -> MVO "
-            "-> MKT entries -> MOC exits."
+            "-> LMT entries -> MOC exits."
         ),
     )
     mode = p.add_mutually_exclusive_group()
@@ -253,7 +294,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "Default: " + config.DEFAULT_SUBMIT_BY_TIME + ". "
             "This is NASDAQ's MOC ENTRY cutoff of 15:55:00 ET (SEC "
             "release 34-84454, 2018 rule change). This flag ONLY bounds "
-            "the MOC exit batch; the MKT entry batch fires unconditionally "
+            "the MOC exit batch; the LMT entry batch fires unconditionally "
             "so the operator is never left with a filled entry and no "
             "queued exit. The fill-gated dispatcher fires each MOC "
             "immediately after its entry becomes terminal; the deadline "
@@ -529,25 +570,161 @@ def _load_reference_stats(path_override: Optional[str], universe: list[str]) -> 
 # Feature engineering (live)
 # ---------------------------------------------------------------------------
 
+def _extract_last_quote_by_sym(
+    tbbo: pl.DataFrame,
+    universe: Optional[list[str]] = None,
+    max_ts: Optional[datetime] = None,
+) -> dict[str, dict]:
+    """Extract per-symbol last-observed quote from a tbbo frame.
+
+    Returns ``{sym: {"bid": float, "ask": float, "mid": float,
+    "ts": datetime}}`` for every symbol seen in ``tbbo`` (optionally
+    filtered to ``universe`` and to ``ts_event <= max_ts``). ``ts``
+    is the tbbo record's ``ts_event`` (tz-aware UTC on the live
+    path, tz-aware NY on the replay path — the tz mixes cleanly
+    because both are anchored to UTC internally by polars). The
+    caller (``_validate_quote_for_entry``) converts to UTC before
+    the age comparison.
+
+    ``max_ts`` (round-2 look-ahead defence): the LIVE path passes
+    None because the feed buffers only what has already arrived.
+    The REPLAY path passes the replay-day decision timestamp;
+    otherwise the cached parquet delivers the entire trading day
+    (including the 16:00 closing print) and ``.last()`` would pick
+    a tick from AFTER the 15:50 decision moment. That would price
+    LMT entries off the closing cross itself — the exact tick the
+    strategy is trying to forecast — turning replay into a
+    look-ahead PnL cheat.
+
+    Pre-group filters (round-2 correctness):
+      * ``symbol`` in universe (if provided)
+      * ``ts_event <= max_ts`` (if provided)
+      * ``bid_px_00`` and ``ask_px_00`` both finite AND positive
+        AND uncrossed. A name whose LAST tick is a bad print
+        (NaN, negative, crossed) but whose second-to-last is
+        clean should keep the clean quote — filtering FINITE rows
+        BEFORE the last() aggregation is what preserves that. If
+        every tick for a symbol is bad, the symbol is naturally
+        excluded from the output and the entry gets a
+        ``no_usable_quote_at_entry`` skip downstream.
+
+    Aggregation is explicit-and-tie-stable
+    (``sort_by("ts_event").last()``): polars 1.40's implicit
+    ordering behavior happens to line up today, but pinning the
+    intent means a future polars change can't silently return a
+    different tick per symbol under duplicate timestamps.
+
+    One definition of "the mid" lives here — ``_build_live_day_frame``
+    calls through it once per decision-time snapshot and threads the
+    result to both share sizing (``_compute_share_targets``) and LMT
+    entry pricing (``_submit_limit_entries``). Broken out for
+    testability and to keep the polars aggregation from being
+    duplicated inline.
+    """
+    if tbbo is None or tbbo.is_empty():
+        return {}
+    if universe is not None:
+        tbbo = tbbo.filter(pl.col("symbol").is_in(list(universe)))
+        if tbbo.is_empty():
+            return {}
+    if max_ts is not None:
+        # LiveFeed stamps UTC; ReplayFeed converts to
+        # America/New_York. Normalise both sides to UTC for the
+        # comparison — a polars ``<=`` on datetimes across two
+        # different tzs errors out ("could not evaluate '<='
+        # comparison"), so we can't rely on tz-implicit
+        # broadcasting. The cast is a no-op on the LIVE path.
+        if max_ts.tzinfo is None:
+            raise ValueError("_extract_last_quote_by_sym: max_ts must be tz-aware")
+        max_ts_utc = max_ts.astimezone(_UTC)
+        tbbo = tbbo.with_columns(
+            pl.col("ts_event").dt.convert_time_zone("UTC")
+        ).filter(pl.col("ts_event") <= max_ts_utc)
+        if tbbo.is_empty():
+            return {}
+    # Drop bad prints BEFORE the group_by so one bad final tick
+    # does not evict a symbol whose earlier ticks are clean.
+    tbbo = tbbo.filter(
+        pl.col("bid_px_00").is_finite()
+        & pl.col("ask_px_00").is_finite()
+        & (pl.col("bid_px_00") > 0)
+        & (pl.col("ask_px_00") > 0)
+        & (pl.col("ask_px_00") >= pl.col("bid_px_00"))
+    )
+    if tbbo.is_empty():
+        return {}
+    last = (
+        tbbo
+        .with_columns(
+            ((pl.col("ask_px_00") + pl.col("bid_px_00")) / 2).alias("mid"),
+        )
+        .group_by("symbol", maintain_order=False)
+        .agg(
+            # Explicit ``sort_by("ts_event").last()`` pins the
+            # intent: the returned tick is the one with the largest
+            # ``ts_event``. Polars 1.40.1's ``.last()`` on an
+            # unsorted group_by is documented to return "any" row;
+            # today it happens to preserve source order, but that's
+            # an implementation detail we shouldn't rely on.
+            pl.col("bid_px_00").sort_by("ts_event").last().alias("bid"),
+            pl.col("ask_px_00").sort_by("ts_event").last().alias("ask"),
+            pl.col("mid").sort_by("ts_event").last().alias("mid"),
+            pl.col("ts_event").sort_by("ts_event").last().alias("ts"),
+        )
+    )
+    out: dict[str, dict] = {}
+    for row in last.iter_rows(named=True):
+        sym = row["symbol"]
+        # Categorical dtype -> str
+        if not isinstance(sym, str):
+            sym = str(sym)
+        out[sym] = {
+            "bid": row["bid"],
+            "ask": row["ask"],
+            "mid": row["mid"],
+            "ts": row["ts"],
+        }
+    return out
+
+
 def _build_live_day_frame(
     feed: LiveFeed,
     universe: list[str],
     reference_stats: pl.DataFrame,
     min_coverage: float = 0.5,
-) -> tuple[pl.DataFrame, dict[str, float]]:
+    decision_ts_utc: Optional[datetime] = None,
+) -> tuple[pl.DataFrame, dict[str, float], dict[str, datetime], dict[str, dict]]:
     """Snapshot the live feed and produce the single-day feature frame.
 
     ``min_coverage`` is the fraction of the universe that must appear in
     the alpha-ready ``day_df`` before we return. Anything less and we raise
     ``RuntimeError`` — silent-empty is unacceptable in the live path.
 
+    ``decision_ts_utc`` (round-2 look-ahead defence) bounds the
+    tbbo frame at ``ts_event <= decision_ts_utc`` before extracting
+    the per-symbol last quote — so the LMT entry pricing sees only
+    ticks that would have arrived by the decision moment. On the
+    LIVE path pass ``None`` (the feed buffer only holds what has
+    arrived); on the REPLAY path pass the replay-day 15:50 anchor
+    so the cached whole-day parquet doesn't leak the 16:00 closing
+    print into the entry limit price.
+
     Returns
     -------
-    (day_df, last_mid_by_sym)
+    (day_df, last_mid_by_sym, last_mid_ts_by_sym, last_quote_by_sym)
         ``day_df`` has the columns the optimizer's ForecastModel / CostModel /
         ImpactModel need. ``last_mid_by_sym`` is the freshest mid we saw for
         each symbol in the snapshot — used to convert dollar targets to
         shares (falling back to ``entry_price`` when needed).
+        ``last_mid_ts_by_sym`` is the ts of the tick that produced the mid,
+        threaded into the recorder for ``arrival_ts_utc`` /
+        ``arrival_staleness_secs``.
+        ``last_quote_by_sym`` is the per-symbol ``{"bid": float, "ask":
+        float, "mid": float, "ts": datetime}`` derived from the SAME
+        snapshot — the LMT entry batch prices off THIS (not a fresh
+        re-snapshot); the staleness guard measures the tick's age at
+        submission time. Same observation for optimizer and bid means
+        the price we solved against and the price we bid at agree.
     """
     frames = feed.snapshot()
     imb = frames.get("imbalance", pl.DataFrame())
@@ -599,23 +776,17 @@ def _build_live_day_frame(
 
     # Last mid + last-observed ts per symbol. The mid is used for share
     # sizing (fresher than ``entry_price`` if we kept streaming after
-    # the 15:50 print). The ts is threaded into the trade recorder so
+    # the 15:50 print), the ts is threaded into the trade recorder so
     # ``arrival_ts_utc`` / ``arrival_staleness_secs`` can flag thin
-    # names whose last print was minutes ago — those rows would
-    # otherwise pool with clean rows under an analyst's naive
-    # decision-time slippage average.
-    last_mid = (
-        tbbo
-        .sort("ts_event")
-        .with_columns(((pl.col("ask_px_00") + pl.col("bid_px_00")) / 2).alias("mid"))
-        .group_by("symbol", maintain_order=False)
-        .agg(
-            pl.col("mid").last().alias("last_mid"),
-            pl.col("ts_event").last().alias("last_mid_ts"),
-        )
+    # names whose last print was minutes ago, AND the full quote
+    # (bid/ask/mid/ts) is passed downstream to
+    # ``_submit_limit_entries`` so LMT prices are computed off the
+    # SAME observation the optimizer used.
+    last_quote_by_sym = _extract_last_quote_by_sym(
+        tbbo, universe=None, max_ts=decision_ts_utc,
     )
-    last_mid_by_sym = dict(zip(last_mid["symbol"].to_list(), last_mid["last_mid"].to_list()))
-    last_mid_ts_by_sym = dict(zip(last_mid["symbol"].to_list(), last_mid["last_mid_ts"].to_list()))
+    last_mid_by_sym = {sym: q["mid"] for sym, q in last_quote_by_sym.items()}
+    last_mid_ts_by_sym = {sym: q["ts"] for sym, q in last_quote_by_sym.items()}
 
     # C2 hard coverage assertion: refuse to hand back a thin day_df. A live
     # snapshot at 15:50 should cover most of the top-100 — anything less
@@ -636,7 +807,7 @@ def _build_live_day_frame(
             "coverage": coverage,
         },
     )
-    return day_df, last_mid_by_sym, last_mid_ts_by_sym
+    return day_df, last_mid_by_sym, last_mid_ts_by_sym, last_quote_by_sym
 
 
 def _compute_share_targets(
@@ -1168,43 +1339,251 @@ def _max_leg_size(extended_targets: dict[str, int], current: dict[str, int]) -> 
     )
 
 
-def _submit_mkt_entries(
+def _round_to_tick(price: float, side: str) -> float:
+    """Round a price to a valid US-equity tick, PASSIVELY per side.
+
+    Rule NMS 612: prices >= $1.00 quote in $0.01 increments; prices
+    below $1.00 quote in $0.0001 increments. IB rejects sub-tick
+    limit prices — every limit price we submit MUST be rounded here.
+
+    Rounding direction is PASSIVE:
+      * ``side == "BUY"``  → ``floor(price / tick) * tick`` (round DOWN)
+      * ``side == "SELL"`` → ``ceil(price / tick) * tick``  (round UP)
+
+    Why passive-per-side (round-2 correctness fix). Half-up rounding
+    on a common one-cent spread puts the mid exactly on a half-penny
+    and rounds UP for both sides — a BUY at the ask (marketable,
+    fills instantly) and a SELL half a cent above the ask (rarely
+    fills). That yields a systematically net-long realized book the
+    covariance never priced. Passive rounding keeps BOTH sides at or
+    inside the mid: buys post at the near-side bid, sells at the
+    near-side ask, both are passive limits and either both fill or
+    both rest — no directional bias in the realized book.
+
+    Representation: use ``Decimal`` for the tick-count arithmetic so
+    ``price / tick`` cannot land at ``149.99999999999997`` and floor
+    to the wrong tick. Then cast back to ``float`` for the IB wire
+    format (IB's Python client takes floats). Snap the returned
+    float to the tick's decimal precision (derived from the tick
+    itself, not a hard-coded ``if tick == 0.01`` fork).
+    """
+    if side not in ("BUY", "SELL"):
+        raise ValueError(f"_round_to_tick: side must be BUY or SELL, got {side!r}")
+    tick = (
+        config.ENTRY_TICK_ABOVE_DOLLAR
+        if abs(price) >= 1.0
+        else config.ENTRY_TICK_BELOW_DOLLAR
+    )
+    # Decimal keeps price/tick exact enough that the floor/ceil
+    # decision is unaffected by binary-float noise. All-Decimal
+    # arithmetic on rounded string inputs is exact; the final cast
+    # back to float is lossless for penny-grid prices representable
+    # in double precision (which every US-equity price under $10T
+    # is).
+    p = Decimal(str(price))
+    t = Decimal(str(tick))
+    if side == "BUY":
+        # Round DOWN toward zero for positive prices; equivalent to
+        # floor for the price >= 0 case that every real quote hits.
+        rounded = (p / t).to_integral_value(rounding=ROUND_DOWN) * t
+    else:  # SELL
+        rounded = (p / t).to_integral_value(rounding=ROUND_UP) * t
+    # Derive the display precision from the tick itself — e.g. tick
+    # 0.01 → 2 decimals, tick 0.0001 → 4. Uses ``normalize`` +
+    # exponent so a future tick change (e.g. NMS half-cent proposals)
+    # does not require another `if` branch here.
+    tick_exp = t.normalize().as_tuple().exponent
+    ndigits = max(0, -tick_exp) if isinstance(tick_exp, int) else 4
+    return float(round(float(rounded), ndigits))
+
+
+def _validate_quote_for_entry(
+    quote: Optional[dict],
+    now_utc: datetime,
+    max_staleness_secs: float,
+    max_rel_spread: float,
+) -> tuple[bool, Optional[str], Optional[float]]:
+    """Apply the LMT-entry quote guards.
+
+    Returns ``(ok, reason, mid)``.  ``ok=False`` means the caller must
+    SKIP this symbol (no entry, no MOC). ``reason`` is a short tag
+    logged and stored on the entry record. On success ``mid`` is the
+    raw (unrounded) mid; the caller rounds via ``_round_to_tick``.
+
+    Rejects, in this order:
+      * missing quote (``quote is None``)
+      * missing bid / ask / mid / ts
+      * non-numeric or non-finite bid / ask / mid (catches
+        Databento's ``UNDEF_PRICE`` sentinel, which pretty-scales to
+        NaN today — see the ``ENTRY_MAX_LIMIT_PRICE`` guard for the
+        finite-but-huge variant)
+      * non-positive bid or ask (bad tick / feed glitch)
+      * crossed or locked (ask < bid — the mid is nonsense)
+      * mid missing / non-positive
+      * absurdly large bid or ask (``> ENTRY_MAX_LIMIT_PRICE`` —
+        catches the "scaled sentinel" case where ``pretty_ref_price``
+        of Databento's INT64_MAX arrives as ~9.22e9 rather than NaN,
+        which would otherwise pass every guard: finite, positive,
+        uncrossed, rel_spread==0)
+      * stale (``now - ts > max_staleness_secs``)
+      * wide (``(ask - bid) / mid > max_rel_spread``)
+
+    ``now_utc`` is compared to ``ts_event`` in UTC. On the live path
+    this is ``datetime.now(_UTC)``; on the replay path the caller
+    passes the replay-day decision timestamp so a historical tbbo
+    doesn't look "months stale" against today's wall clock. A
+    NEGATIVE age (``ts_utc > now_utc``) indicates clock skew and is
+    logged as a warning; small negative ages (< 1s) are treated as
+    fresh; larger backward skews reject as ``quote_stale`` so a
+    scrambled clock cannot admit unbounded look-ahead.
+    """
+    if quote is None:
+        return False, "no_usable_quote_at_entry", None
+    bid = quote.get("bid")
+    ask = quote.get("ask")
+    mid = quote.get("mid")
+    ts = quote.get("ts")
+    if bid is None or ask is None or mid is None or ts is None:
+        return False, "quote_missing_fields", None
+    try:
+        bid_f = float(bid)
+        ask_f = float(ask)
+        mid_f = float(mid)
+    except (TypeError, ValueError):
+        return False, "quote_non_numeric", None
+    if not (math.isfinite(bid_f) and math.isfinite(ask_f)
+            and math.isfinite(mid_f)):
+        return False, "quote_non_finite", None
+    if bid_f <= 0 or ask_f <= 0:
+        return False, "quote_non_positive", None
+    if ask_f < bid_f:
+        return False, "quote_crossed", None
+    if mid_f <= 0:
+        return False, "quote_non_positive", None
+    # Absolute price sanity bound. Guards against Databento
+    # UNDEF_PRICE sentinel (scaled to ~9.22e9) leaking through the
+    # non-finite check. Every US-listed equity trades well below
+    # ENTRY_MAX_LIMIT_PRICE; Berkshire A around $700k is the highest
+    # single-share price in practice.
+    if (bid_f > config.ENTRY_MAX_LIMIT_PRICE
+            or ask_f > config.ENTRY_MAX_LIMIT_PRICE):
+        return False, "quote_absurd_price", None
+    # Staleness: coerce ts to UTC for comparison against now_utc.
+    try:
+        if ts.tzinfo is None:
+            # Should never happen — LiveFeed stamps UTC, ReplayFeed
+            # converts to America/New_York (also tz-aware). But be
+            # defensive.
+            return False, "quote_naive_ts", None
+        ts_utc = ts.astimezone(_UTC)
+    except Exception:
+        return False, "quote_bad_ts", None
+    age_secs = (now_utc - ts_utc).total_seconds()
+    # Clock-skew defence. Negative age = ts is IN THE FUTURE relative
+    # to ``now_utc``; on the live path that's a wall-clock skew,
+    # on the replay path that's a genuine look-ahead attempt.
+    # Tolerate up to 1s of "future" (feed timestamps can beat the
+    # local clock by tens of ms on a busy loop); anything larger is
+    # treated as stale so we never submit a limit priced off a tick
+    # that came after "now".
+    if age_secs < -1.0:
+        logger.warning(
+            "quote_stale (clock skew): tick timestamp is in the "
+            "future relative to now_utc",
+            extra={
+                "age_secs": age_secs,
+                "now_utc": now_utc.isoformat(),
+                "quote_ts_utc": ts_utc.isoformat(),
+            },
+        )
+        return False, "quote_stale", None
+    if age_secs > max_staleness_secs:
+        return False, "quote_stale", None
+    rel_spread = (ask_f - bid_f) / mid_f
+    if rel_spread > max_rel_spread:
+        return False, "quote_wide_spread", None
+    return True, None, mid_f
+
+
+def _submit_limit_entries(
     broker,
     targets: dict[str, int],
     current: dict[str, int],
     managed_universe: set[str],
+    last_quote_by_sym: dict[str, dict],
+    now_utc: datetime,
+    max_staleness_secs: float,
+    max_rel_spread: float,
+    replay_mode: bool = False,
 ) -> list[dict]:
-    """ENTRY batch: per-name plain MKT sized to ``target - current``.
+    """ENTRY batch: per-name LMT priced at the decision-time tbbo
+    mid (rounded PASSIVELY per side), sized to ``target - current``.
 
-    Routed via ``broker.buy`` / ``broker.sell`` with ``order_type="MKT"``
-    and the primitive default ``tif="DAY"`` — a stuck MKT that never
-    fills is bounded by the round-2 fill-gated dispatcher
+    Each entry is a plain LMT (not IB MIDPRICE / pegged, not IOC —
+    a standard DAY LMT with a numeric ``limit_price``) at the mid of
+    the tbbo quote observed in the SAME 15:50 snapshot the MVO
+    consumed (see ``_build_live_day_frame``), passively rounded to
+    a valid US-equity tick (BUY floors DOWN, SELL ceils UP — see
+    ``_round_to_tick``). Routed via ``broker.buy`` / ``broker.sell``
+    with ``order_type="LMT"``, ``limit_price=<numeric>``,
+    ``exchange=ACTIVE_ROUTING``, and the primitive default
+    ``tif="DAY"`` (the DAY is what actually binds — the entry works
+    at the limit until the sweep cancels it just before 15:55; see
+    ``DEFAULT_ENTRY_WORKING_SECS``).
+
+    A stuck LMT that never crosses (much more likely than under the
+    old MKT regime) is bounded by the fill-gated dispatcher
     (``_fill_gated_moc_dispatch``) and the deadline sweep
     (``_sweep_moc_deadline``): the dispatcher polls entries every
-    ``poll_interval_secs`` and stops waiting at
-    ``sweep_deadline``, and the sweep then cancels any entry still
-    non-terminal via ``broker.cancel``. That happens before the sweep
-    sizes its counter-flatten from a fresh get_positions, so a late
-    fill can't leave an unhedged position after MOCs go out.
+    ``poll_interval_secs`` and stops waiting at ``sweep_deadline``,
+    and the sweep then cancels any entry still non-terminal via
+    ``broker.cancel`` BEFORE it sizes its counter-flatten from a
+    fresh ``get_positions``. So an LMT that expires unfilled leaves
+    no position and no MOC, and one that partially filled has its
+    MOC sized to the ACTUAL filled quantity — the two-leg safety
+    invariant is unchanged.
 
-    Fires unconditionally with respect to the MOC submit-by cutoff — an
-    entered position with no exit is bad, but so is refusing to enter
-    because we're worried about the exit; the operator needs to know
-    either way (the MOC-skip case is handled by
+    Fires unconditionally with respect to the MOC submit-by cutoff —
+    an entered position with no exit is bad, but so is refusing to
+    enter because we're worried about the exit; the operator needs
+    to know either way (the MOC-skip case is handled by
     ``_fill_gated_moc_dispatch`` firing per-symbol and
     ``_sweep_moc_deadline`` catching everything left).
 
-    Out-of-universe symbols (``sym in current but not managed_universe``)
-    are pinned to their current qty upstream, so they diff to zero here
-    and we never touch them.
+    ----
+    Quote guards (``_validate_quote_for_entry``).
+    ----
+    A symbol whose ``last_quote_by_sym`` entry is missing, stale
+    (older than ``max_staleness_secs``), crossed / locked (ask <
+    bid), non-positive, or wider than ``max_rel_spread`` is SKIPPED:
+    the returned record has ``order_id=None`` and
+    ``error=<reason>`` (e.g. ``"quote_stale"``,
+    ``"quote_wide_spread"``). ``_fill_gated_moc_dispatch`` treats
+    ``order_id is None`` as ``status="not_submitted"``,
+    ``filled_qty=0``, so no MOC ever fires for a skipped symbol.
+    The coverage cross-check skips entries with ``order_id is None``
+    entirely, so a skipped LMT does not synthesise phantom expected
+    exposure. **No MKT fallback** — the operator's policy is that
+    no entry = no exposure, and a fallback would defeat the whole
+    point of limiting downside from a bad quote.
+
+    Out-of-universe symbols (``sym in current but not
+    managed_universe``) are pinned to their current qty upstream, so
+    they diff to zero here and we never touch them.
 
     Returns a list of dicts, one per attempted entry, with keys:
-      symbol, side, requested_qty, order_id (str|None), error (str|None).
+      symbol, side, requested_qty, order_id (str|None), error (str|None),
+      limit_price (float|None). ``limit_price`` is populated on skips
+      too when the mid was computable but rejected downstream — this
+      is None for a "no quote at all" skip, and populated (with the
+      unrounded mid) for a "quote arrived but was crossed / stale /
+      etc." skip so post-trade analysis can see what we saw.
     Downstream, ``_fill_gated_moc_dispatch`` populates ``filled_qty``
     and ``status`` from ``broker.get_order_status``; the sweep does
     the same for any entry the dispatcher gave up on.
     """
     entries: list[dict] = []
+    n_skipped_by_reason: dict[str, int] = {}
     for sym, tgt in sorted(targets.items()):
         diff = tgt - current.get(sym, 0)
         if diff == 0:
@@ -1216,36 +1595,97 @@ def _submit_mkt_entries(
             continue
         side = "BUY" if diff > 0 else "SELL"
         qty = int(abs(diff))
+        quote = last_quote_by_sym.get(sym)
+        # Re-sample "now" per symbol on the LIVE / paper path so a
+        # slow first-symbol submission doesn't unfairly stale the
+        # last few. On REPLAY the caller pinned ``now_utc`` to the
+        # replay-day decision anchor and we want to preserve that
+        # exact reference across every symbol (a wall-clock sample
+        # here would defeat the whole point of the replay-relative
+        # staleness fix).
+        now_per_sym = now_utc if replay_mode else datetime.now(_UTC)
+        ok, reason, mid = _validate_quote_for_entry(
+            quote, now_per_sym, max_staleness_secs, max_rel_spread,
+        )
+        if not ok:
+            n_skipped_by_reason[reason or "unknown"] = (
+                n_skipped_by_reason.get(reason or "unknown", 0) + 1
+            )
+            logger.warning(
+                "LMT entry skipped — quote guard rejected",
+                extra={
+                    "symbol": sym, "side": side, "qty": qty,
+                    "reason": reason,
+                    "quote_bid": quote.get("bid") if quote else None,
+                    "quote_ask": quote.get("ask") if quote else None,
+                    "quote_mid": quote.get("mid") if quote else None,
+                    "quote_ts": (
+                        quote.get("ts").isoformat()
+                        if quote and quote.get("ts") is not None
+                        else None
+                    ),
+                },
+            )
+            entries.append({
+                "symbol": sym, "side": side, "requested_qty": qty,
+                "order_id": None, "error": reason,
+                "limit_price": (
+                    float(quote["mid"]) if quote and quote.get("mid") is not None
+                    else None
+                ),
+            })
+            continue
+        limit_price = _round_to_tick(float(mid), side)
         try:
             # Routing pulled from live/nasdaq_routing.py::ACTIVE_ROUTING.
-            # Under SMART, the entry MKT is filled against the national
+            # Under SMART, the entry LMT is exposed to the national
             # best bid/offer rather than being confined to the NASDAQ
             # top-of-book — see the module docstring for the rationale.
             if side == "BUY":
-                oid = broker.buy(sym, qty, order_type="MKT",
-                                 exchange=ACTIVE_ROUTING)
+                oid = broker.buy(
+                    sym, qty,
+                    order_type="LMT",
+                    limit_price=limit_price,
+                    exchange=ACTIVE_ROUTING,
+                )
             else:
-                oid = broker.sell(sym, qty, order_type="MKT",
-                                  exchange=ACTIVE_ROUTING)
+                oid = broker.sell(
+                    sym, qty,
+                    order_type="LMT",
+                    limit_price=limit_price,
+                    exchange=ACTIVE_ROUTING,
+                )
         except Exception as e:
             logger.warning(
-                "MKT entry submission failed",
+                "LMT entry submission failed",
                 extra={"symbol": sym, "side": side, "qty": qty,
+                       "limit_price": limit_price,
                        "error": str(e)[:200]},
             )
             entries.append({
                 "symbol": sym, "side": side, "requested_qty": qty,
                 "order_id": None, "error": str(e)[:200],
+                "limit_price": limit_price,
             })
             continue
         logger.info(
-            "MKT entry placed",
-            extra={"symbol": sym, "side": side, "qty": qty, "order_id": oid},
+            "LMT entry placed",
+            extra={
+                "symbol": sym, "side": side, "qty": qty,
+                "order_id": oid, "limit_price": limit_price,
+                "mid_raw": float(mid),
+            },
         )
         entries.append({
             "symbol": sym, "side": side, "requested_qty": qty,
             "order_id": oid, "error": None,
+            "limit_price": limit_price,
         })
+    if n_skipped_by_reason:
+        logger.warning(
+            "LMT entry batch: some symbols skipped by quote guard",
+            extra={"skipped_by_reason": n_skipped_by_reason},
+        )
     return entries
 
 
@@ -1389,7 +1829,7 @@ def _wait_entry_fills(
             e["status"] = getattr(info, "status", "")
         except TimeoutError:
             logger.warning(
-                "MKT entry fill wait timed out",
+                "entry fill wait timed out",
                 extra={"order_id": oid, "symbol": e.get("symbol"),
                        "timeout": this_wait},
             )
@@ -1397,7 +1837,7 @@ def _wait_entry_fills(
             e["status"] = "timeout"
         except Exception as ex:
             logger.warning(
-                "MKT entry status poll failed",
+                "entry status poll failed",
                 extra={"order_id": oid, "symbol": e.get("symbol"),
                        "error": str(ex)[:200]},
             )
@@ -1432,7 +1872,7 @@ def _submit_moc_flatten(
     Safety invariant (structural, not runtime): this function's signature
     does not accept any target-side data (``share_targets``, ``entries``,
     ``target - current``) — the only path to ``qty`` is via the freshly
-    snapshotted position book. A partial MKT fill therefore cannot cause
+    snapshotted position book. A partial LMT fill therefore cannot cause
     an over-flatten; a future refactor that adds a target argument would
     need to be rejected at review, since there is no runtime check that
     can catch such a change from inside this function.
@@ -1451,7 +1891,7 @@ def _submit_moc_flatten(
     except Exception as e:
         # R1: on a TWS drop between entry fills and this snapshot, silent
         # empty returns would let main see (order_ids=[], skipped=[]) and
-        # exit rc=0 — with the ENTIRE MKT-filled book riding the auction
+        # exit rc=0 — with the ENTIRE LMT-filled book riding the auction
         # unhedged. Signal the unknown state distinctly.
         logger.error(
             "MOC exit: get_positions FAILED — POSITIONS MAY BE LIVE INTO "
@@ -1801,17 +2241,34 @@ def _fill_gated_moc_dispatch(
     skipped_past_cutoff: list[str] = []
     positions_unknown = False
 
-    # Effective deadline caps at ``max_wait_secs`` past dispatch start
-    # so a book of stuck entries can't tie up the dispatcher for the
-    # whole ~5-minute pre-sweep window. Under normal conditions
-    # (liquid MKT, sub-second fills) the loop exits almost
-    # immediately as every entry becomes terminal Filled.
+    # Effective deadline. Under the LMT-entry design the dispatcher
+    # WORKS UNTIL THE SWEEP DEADLINE by default
+    # (``DEFAULT_ENTRY_WORKING_SECS is None``) — a passive limit that
+    # hasn't crossed by 15:50:40 is not a wedged submission; it's a
+    # limit that hasn't crossed YET, and the closing ramp routinely
+    # crosses limits set at 15:50 many minutes later. Capping this at
+    # the MKT-era 30s would have the dispatcher walk away and the
+    # sweep cancel every LMT before it had a chance to fill. The
+    # sweep still cancels any still-non-terminal entry before 15:55,
+    # so working through the ramp adds no exposure risk. Callers
+    # (dispatcher tests) can pass an explicit ``max_wait_secs`` to
+    # cap the wait for a fast-test bound.
     if max_wait_secs is None:
-        max_wait_secs = config.DEFAULT_ENTRY_FILL_TIMEOUT_SECS
-    max_dispatcher_deadline = (
-        config.now_ny() + timedelta(seconds=max_wait_secs)
-    )
-    effective_deadline = min(sweep_deadline, max_dispatcher_deadline)
+        _cfg_working_secs = getattr(
+            config, "DEFAULT_ENTRY_WORKING_SECS", None,
+        )
+        if _cfg_working_secs is None:
+            effective_deadline = sweep_deadline
+        else:
+            effective_deadline = min(
+                sweep_deadline,
+                config.now_ny() + timedelta(seconds=float(_cfg_working_secs)),
+            )
+    else:
+        effective_deadline = min(
+            sweep_deadline,
+            config.now_ny() + timedelta(seconds=max_wait_secs),
+        )
 
     while pending:
         if config.now_ny() >= effective_deadline:
@@ -2692,7 +3149,7 @@ def _coverage_cross_check(
         try:
             st = broker.get_order_status(oid)
             status = getattr(st, "status", "")
-            # RRR3: a live MKT entry SHOULD be terminal by cross-check
+            # RRR3: a live entry SHOULD be terminal by cross-check
             # time (Filled / Cancelled / ApiCancelled / Inactive) —
             # either it filled, or the belt-and-braces cancel loop
             # pulled it. A non-terminal read is itself a staleness
@@ -2700,6 +3157,10 @@ def _coverage_cross_check(
             # filled=0 during a TWS event-stream brownout. Treat
             # non-terminal the same as an exception: assume pessimistic
             # full fill. Overcounting exposure > silently missing it.
+            # NOTE: under LMT entries, a genuinely-unfilled DAY LMT
+            # is CANCELLED by the sweep before this cross-check runs,
+            # so a Cancelled/ApiCancelled with filled=0 here is
+            # normal and correctly counts as zero exposure.
             if status not in _TERMINAL_ORDER_STATES:
                 logger.warning(
                     "coverage cross-check: non-terminal status at "
@@ -2998,7 +3459,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # real session — replay paper fills pollute the diff baseline.
     if replay_mode and args.replay_submit:
         logger.warning(
-            "REPLAY SUBMIT: real paper MKT entries + MOC exits will be "
+            "REPLAY SUBMIT: real paper LMT entries + MOC exits will be "
             "placed. Both legs hit the paper account; fills from a replay "
             "pollute the next real paper/live run's diff baseline — "
             "flatten the paper account before the next real session.",
@@ -3107,6 +3568,36 @@ def main(argv: Optional[list[str]] = None) -> int:
     # 3) Snapshot + feature engineering
     # ------------------------------------------------------------------
 
+    # Round-2 replay-clock fix: compute the DECISION TIMESTAMP up
+    # front so downstream can use it consistently for BOTH the
+    # look-ahead cap on the tbbo extraction AND the staleness
+    # comparison in the entry-quote guards. On the LIVE path this
+    # is wall clock ``now``; on the REPLAY path this is the
+    # replay-day 15:50 + print_wait_secs, so measuring "tick age"
+    # against it correctly rejects a tick from LAST WEEK while
+    # accepting one from 15:49 on the replay date. Without this
+    # every replay-mode entry would skip ``quote_stale`` (a
+    # historical tick is trivially days-to-months old vs today's
+    # wall clock) and ``--replay-submit`` would place ZERO orders
+    # while exiting rc=0 — the documented rehearsal-before-real-
+    # money would be a silent no-op.
+    if replay_mode:
+        from datetime import date as _date_ctor
+        _rd_parts = args.replay_date.split("-")
+        _replay_date_obj = _date_ctor(
+            int(_rd_parts[0]), int(_rd_parts[1]), int(_rd_parts[2]),
+        )
+        # Use the datetime constructor + timedelta so
+        # ``print_wait_secs`` can safely be >= 60.
+        _decision_dt_ny = datetime(
+            _replay_date_obj.year, _replay_date_obj.month,
+            _replay_date_obj.day, reb_hh, reb_mm, 0,
+            tzinfo=config.NY_TZ,
+        ) + timedelta(seconds=float(args.print_wait_secs))
+        decision_ts_utc = _decision_dt_ny.astimezone(_UTC)
+    else:
+        decision_ts_utc = datetime.now(_UTC)
+
     # Cache the tbbo snapshot at decision time ONLY on the replay
     # path — replay's snapshot covers the full historical day already,
     # so we can pull the T+1..T+5 mids synchronously without keeping
@@ -3118,14 +3609,28 @@ def main(argv: Optional[list[str]] = None) -> int:
     tbbo_at_decision: pl.DataFrame = pl.DataFrame()
     snapshot_completed_at_utc: Optional[datetime] = None
     last_mid_ts_by_sym: dict[str, datetime] = {}
+    last_quote_by_sym: dict[str, dict] = {}
     try:
         if feed is None:
             day_df = pl.DataFrame()
             last_mid_by_sym: dict[str, float] = {}
         else:
-            day_df, last_mid_by_sym, last_mid_ts_by_sym = _build_live_day_frame(
+            (
+                day_df,
+                last_mid_by_sym,
+                last_mid_ts_by_sym,
+                last_quote_by_sym,
+            ) = _build_live_day_frame(
                 feed, universe, reference_stats,
                 min_coverage=args.min_universe_coverage,
+                # Round-2 look-ahead defence: bound tbbo at the
+                # replay-day decision moment. On the LIVE path this
+                # is "now" and the feed buffer only holds pre-now
+                # ticks anyway; on the REPLAY path this is the
+                # replay-day 15:50 anchor, so the cached whole-day
+                # parquet cannot leak the 16:00 closing print into
+                # the LMT entry price.
+                decision_ts_utc=decision_ts_utc,
             )
             snapshot_completed_at_utc = datetime.now(_UTC)
             if replay_mode:
@@ -3146,6 +3651,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
         day_df = pl.DataFrame()
         last_mid_by_sym = {}
+        last_quote_by_sym = {}
 
     # For replay / dry-run we stop the feed now — replay tbbo is
     # already fully materialised in ``tbbo_at_decision``, and dry-run
@@ -3337,25 +3843,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     # ------------------------------------------------------------------
     recorder: Optional[trade_recorder.TradeRecorder] = None
     try:
+        # ``decision_ts_utc`` was already computed up-front (before
+        # ``_build_live_day_frame``) so both the tbbo-time bound and
+        # the entry staleness comparison share ONE decision timestamp.
+        # The recorder just consumes it here.
         if replay_mode:
-            from datetime import date as _date
-            rd = args.replay_date.split("-")
-            _replay_date_obj = _date(int(rd[0]), int(rd[1]), int(rd[2]))
-            # Anchor the historical decision time at HH:MM then ADD
-            # print-wait-secs as a timedelta — ``second=<int>`` on the
-            # datetime constructor raises ``ValueError`` for values
-            # >= 60, and a swallowed exception would silently disable
-            # the recorder for the whole day.
-            decision_dt_ny = datetime(
-                _replay_date_obj.year, _replay_date_obj.month,
-                _replay_date_obj.day, reb_hh, reb_mm,
-                0, tzinfo=config.NY_TZ,
-            ) + timedelta(seconds=float(args.print_wait_secs))
             recorder_trading_date = args.replay_date
         else:
-            decision_dt_ny = snapshot_at
             recorder_trading_date = config.now_ny().date().isoformat()
-        decision_ts_utc = decision_dt_ny.astimezone(_UTC)
         recorder = trade_recorder.TradeRecorder(
             mode=record_mode,
             decision_ts_utc=decision_ts_utc,
@@ -3533,7 +4028,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             broker.MAX_ORDER_QTY = new_ceiling
 
-        # M1: per-leg submit-by check for the MOC EXIT batch. The MKT ENTRY
+        # M1: per-leg submit-by check for the MOC EXIT batch. The LMT ENTRY
         # batch always fires (see below): a filled entry with no queued exit
         # would still leave open exposure, so we always try to route the exit;
         # if the wall clock has crossed submit_by by then we exit rc=4 loudly.
@@ -3557,25 +4052,110 @@ def main(argv: Optional[list[str]] = None) -> int:
             effective_submit_by = submit_by_at
 
         # --------------------------------------------------------------
-        # LEG 1: plain MKT entries sized to (target - current). Fires
-        # unconditionally with respect to the MOC cutoff. Default
-        # tif=DAY; the fill-gated dispatcher below observes each entry
-        # transitioning to terminal state and either fires the MOC
-        # (Filled) or leaves it for the sweep (Cancelled / stuck).
+        # LEG 1: LMT entries sized to (target - current), priced at
+        # the DECISION-TIME tbbo mid — the same 15:50
+        # ``feed.snapshot()`` that fed the MVO. Reusing that
+        # observation (rather than taking a fresh mid immediately
+        # before submission) means the price we solved against and
+        # the price we bid at agree; the tradeoff is that the mid
+        # is knowingly stale by the MVO solve duration, so the
+        # staleness guard (``DEFAULT_MAX_QUOTE_STALENESS_SECS``) is
+        # the binding safety knob and is measured against
+        # ``quote.ts`` (the tick time) at wall-clock submission time.
+        # Fires unconditionally with respect to the MOC cutoff.
+        # Default tif=DAY; the fill-gated dispatcher below observes
+        # each entry transitioning to terminal state and either
+        # fires the MOC (Filled) or leaves it for the sweep
+        # (Cancelled / stuck / never crossed). A symbol with no
+        # usable decision-time mid is SKIPPED — see
+        # ``_submit_limit_entries`` docstring.
         # --------------------------------------------------------------
+        # Reference "now" for the entry-quote staleness check.
+        # * LIVE / PAPER: ``datetime.now(_UTC)`` — the actual wall
+        #   clock at submit time. Tick age = submit_time - tick_ts.
+        # * REPLAY: ``decision_ts_utc`` — the replay-day 15:50
+        #   anchor. Tick age = replay_decision - tick_ts, so a
+        #   historical tick at 15:49 on the replay date reads as
+        #   ~1 minute old (fresh), not "months old vs today's
+        #   wall clock" (which would skip every symbol).
+        #
+        # ``_submit_limit_entries`` also re-samples ``now`` per
+        # symbol inside its loop so a slow qualification of the
+        # first few names doesn't unfairly stale the last few
+        # names — see the ``now_utc`` handling there.
+        if replay_mode:
+            entry_reference_now_utc = decision_ts_utc
+        else:
+            entry_reference_now_utc = datetime.now(_UTC)
+        if snapshot_completed_at_utc is not None:
+            _seconds_since_decision = (
+                entry_reference_now_utc - snapshot_completed_at_utc
+            ).total_seconds()
+        else:
+            _seconds_since_decision = None
+        # Log per-symbol mid staleness AT SUBMISSION so operators can
+        # watch how far the price we bid at has drifted from the
+        # observation we solved against. Systematic multi-second
+        # staleness is an operational signal — a slow solve or a
+        # slow snapshot-to-submit path shrinks realized fill rate
+        # under LMT entries even if no single quote crosses the
+        # ``DEFAULT_MAX_QUOTE_STALENESS_SECS`` threshold.
+        _ages = [
+            (entry_reference_now_utc - q["ts"].astimezone(_UTC)).total_seconds()
+            for sym, q in last_quote_by_sym.items()
+            if sym in universe_set
+            and q.get("ts") is not None
+            and q["ts"].tzinfo is not None
+            and (extended_targets.get(sym, 0) - current.get(sym, 0)) != 0
+        ]
+        _ages_summary = (
+            {
+                "n": len(_ages),
+                "min": round(min(_ages), 3),
+                "max": round(max(_ages), 3),
+                "median": round(sorted(_ages)[len(_ages) // 2], 3),
+            }
+            if _ages else {"n": 0}
+        )
+        logger.info(
+            "entry-time quote staleness (decision-snapshot age at submit)",
+            extra={
+                "secs_since_decision_snapshot": (
+                    round(_seconds_since_decision, 3)
+                    if _seconds_since_decision is not None else None
+                ),
+                "quote_age_secs_summary": _ages_summary,
+                "n_quotes_available": len(last_quote_by_sym),
+                "n_targets_to_price": sum(
+                    1 for s, t in extended_targets.items()
+                    if s in universe_set and (t - current.get(s, 0)) != 0
+                ),
+                "staleness_threshold_secs": (
+                    config.DEFAULT_MAX_QUOTE_STALENESS_SECS
+                ),
+                "replay_mode": replay_mode,
+            },
+        )
+
         # ARM the exposure gate BEFORE the call, not after: a batch that
         # raises partway through has already put live orders on the book,
         # and a post-call assignment would never run.
         orders_may_be_live = True
-        entries = _submit_mkt_entries(
+        entries = _submit_limit_entries(
             broker=broker,
             targets=extended_targets,
             current=current,
             managed_universe=universe_set,
+            last_quote_by_sym=last_quote_by_sym,
+            now_utc=entry_reference_now_utc,
+            max_staleness_secs=config.DEFAULT_MAX_QUOTE_STALENESS_SECS,
+            max_rel_spread=config.DEFAULT_MAX_ENTRY_REL_SPREAD,
+            replay_mode=replay_mode,
         )
-        # Recorder — one entry submission row per attempted MKT. Even
-        # failed submissions (``order_id is None``) get a row so post-
-        # trade analysis sees the intended trade that never made it.
+        # Recorder — one entry submission row per attempted LMT. Even
+        # skipped / failed submissions (``order_id is None``) get a row
+        # so post-trade analysis sees the intended trade that never
+        # made it, plus the limit price and error tag when populated.
         if recorder is not None:
             _entry_sent_ts = datetime.now(_UTC)
             for _e in entries:
@@ -3585,21 +4165,105 @@ def main(argv: Optional[list[str]] = None) -> int:
                     symbol=_e.get("symbol", ""),
                     side=_e.get("side", ""),
                     requested_qty=int(_e.get("requested_qty", 0) or 0),
-                    order_type="MKT",
+                    order_type="LMT",
                     order_id=_e.get("order_id"),
                     sent_ts_utc=_entry_sent_ts,
                     exchange=ACTIVE_ROUTING,
                     tif="DAY",
                     error=_e.get("error"),
+                    limit_price=_e.get("limit_price"),
                 )
+        _quote_guard_reasons = {
+            "no_usable_quote_at_entry", "quote_missing_fields",
+            "quote_non_numeric", "quote_non_finite",
+            "quote_non_positive", "quote_crossed",
+            "quote_naive_ts", "quote_bad_ts",
+            "quote_stale", "quote_wide_spread",
+            "quote_absurd_price",
+        }
+        _n_intended = len(entries)
+        _n_submitted = sum(1 for e in entries if e.get("order_id"))
+        _n_broker_failed = sum(
+            1 for e in entries
+            if e.get("order_id") is None
+            and e.get("error") not in _quote_guard_reasons
+            and e.get("error") is not None
+        )
+        _n_skipped_quote_guard = sum(
+            1 for e in entries
+            if e.get("order_id") is None
+            and e.get("error") in _quote_guard_reasons
+        )
         logger.info(
-            "MKT entry batch submitted",
+            "LMT entry batch submitted",
             extra={
-                "n_entries": len(entries),
-                "n_ok": sum(1 for e in entries if e.get("order_id")),
-                "n_failed": sum(1 for e in entries if e.get("error")),
+                "n_entries": _n_intended,
+                "n_ok": _n_submitted,
+                "n_failed": _n_broker_failed,
+                "n_skipped_quote_guard": _n_skipped_quote_guard,
             },
         )
+
+        # BLOCKER 4 (round 2): mass-skip guard.
+        # Rc=5 (empty share_targets) fires BEFORE entry submission and
+        # cannot catch a systemic feed wedge that skips e.g. 40 of 49
+        # priced-in names. Executing the surviving 9 is worse than
+        # skipping the whole run: it's a non-random truncated fragment
+        # of a risk-balanced solve entering the closing ramp with a
+        # covariance that was fit on the full set. Refuse loudly with
+        # rc=10 (pre-order refusal — no exposure — stays out of the
+        # ``rc >= 11`` pager band). If any entries DID submit already
+        # (the guard skipped a mix of names), CANCEL them before the
+        # rc=10 return so those DAY LMTs do not linger and fill into
+        # an uncovered position.
+        _n_universe_targets = sum(
+            1 for s, t in extended_targets.items()
+            if s in universe_set and (t - current.get(s, 0)) != 0
+        )
+        if _n_universe_targets > 0:
+            _submit_coverage = _n_submitted / _n_universe_targets
+        else:
+            _submit_coverage = 1.0
+        if _submit_coverage < config.DEFAULT_MIN_ENTRY_SUBMIT_COVERAGE:
+            logger.error(
+                "LMT entry submit coverage below floor — refusing to route "
+                "a truncated fragment of a risk-balanced solve",
+                extra={
+                    "submit_coverage": round(_submit_coverage, 4),
+                    "floor": config.DEFAULT_MIN_ENTRY_SUBMIT_COVERAGE,
+                    "n_priced_targets": _n_universe_targets,
+                    "n_submitted": _n_submitted,
+                    "n_skipped_quote_guard": _n_skipped_quote_guard,
+                    "n_broker_failed": _n_broker_failed,
+                },
+            )
+            # Cancel any entries that DID land on the wire.
+            _submitted_oids = [
+                e.get("order_id") for e in entries
+                if e.get("order_id") is not None
+            ]
+            _n_cancel_ok = 0
+            _n_cancel_failed = 0
+            for _oid in _submitted_oids:
+                try:
+                    broker.cancel(_oid)
+                    _n_cancel_ok += 1
+                except Exception as _ex:
+                    _n_cancel_failed += 1
+                    logger.warning(
+                        "mass-skip cancel: broker.cancel failed",
+                        extra={"order_id": _oid, "error": str(_ex)[:200]},
+                    )
+            logger.error(
+                "mass-skip abort: submitted entries cancelled; exiting rc=10",
+                extra={
+                    "n_cancel_attempted": len(_submitted_oids),
+                    "n_cancel_ok": _n_cancel_ok,
+                    "n_cancel_failed": _n_cancel_failed,
+                },
+            )
+            _stop_feed_safe(feed)
+            return 10
 
         # --------------------------------------------------------------
         # LEG 2: PER-SYMBOL FILL-GATED MOC + DEADLINE SWEEP
@@ -3607,7 +4271,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Concurrent (from the operator's perspective) fill-gated MOC:
         # each entry's opposite-side MOC fires the moment its entry
         # becomes terminal Filled. Sized off a FRESH
-        # broker.get_positions() for that symbol so a partial MKT fill
+        # broker.get_positions() for that symbol so a partial LMT fill
         # cannot over-flatten into an opposite overnight exposure.
         # Runs single-threaded (ib_async is not thread-safe) but polls
         # all entries concurrently in a tight loop — no symbol waits
@@ -3659,7 +4323,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         # the "sweep" fired immediately after the dispatcher — on the
         # normal 49-name day that meant ~15:51 with the real
         # ``sweep_deadline`` at ~15:54:42, leaving the 15:51-15:54:42
-        # window completely uncovered: cancel-race MKT fills after
+        # window completely uncovered: cancel-race entry fills after
         # the first snapshot, dispatcher MOCs that flip terminal-
         # rejected between 15:51 and 15:54, and any lag-deferred
         # symbols (finding 2) all had no belt-and-braces coverage
@@ -3874,7 +4538,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         # snapshot returned an empty position book (get_positions
         # succeeded but returned []/partial due to TWS staleness), main
         # would otherwise see (order_ids=[], skipped=[]) and exit rc=0
-        # — with a MKT-entered book riding the auction unhedged. Detect
+        # — with a LMT-entered book riding the auction unhedged. Detect
         # and flag it as an exposure condition.
         empty_snapshot_after_fills = (
             n_filled_entries > 0

@@ -21,11 +21,17 @@ per trading day: it streams Databento imbalance + tbbo from market open,
 snapshots at 15:50 America/New_York, engineers the same features the
 forecast pipeline was trained on, predicts alpha, solves the MVO,
 converts dollar targets to signed share counts, and executes them as
-a **two-leg batch — MKT entries at 15:50 sized to `target - current`,
-then a per-symbol FILL-GATED MOC counter-flatten (each symbol's MOC
-fires the moment its entry becomes terminal Filled) plus a DEADLINE
-SWEEP before 15:55 that MOC-flattens every residual managed-universe
-position** — so the book is flat overnight. A post-close position
+a **two-leg batch — LMT entries at 15:50 priced at the last observed
+tbbo mid (rounded PASSIVELY per side: BUY floors down, SELL ceils up)
+and sized to `target - current`, then a per-symbol FILL-GATED MOC
+counter-flatten (each symbol's MOC fires the moment its entry becomes
+terminal Filled) plus a DEADLINE SWEEP before 15:55 that MOC-flattens
+every residual managed-universe position and CANCELS every LMT
+still working at the sweep deadline** — so the book is flat overnight.
+A limit that never crosses is simply not entered (no position, no
+MOC, no exposure). A partial fill is MOC-covered at the ACTUAL filled
+qty (sized from a fresh `broker.get_positions()`, not from the
+requested qty). A post-close position
 poll (16:00-16:05) then AUTHORITATIVELY verifies flat before returning
 rc=0; a nonzero managed position after 16:05 is rc=11. `live/retrain.py`
 runs on a slower cadence (weekly or monthly), refreshes the historical
@@ -108,10 +114,25 @@ seconds.
 
 Replay sources imbalance + tbbo from the historical parquet cache the
 retrain / notebooks already populated, feeds them through the SAME
-`_build_live_day_frame -> alpha -> MVO -> sizing -> pre-qualify -> MOC`
-path a real run uses, and (by default) stops one step short of order
-submission. The only thing NOT exercised is the live websocket
-transport — everything downstream is identical to a real session.
+`_build_live_day_frame -> alpha -> MVO -> sizing -> pre-qualify ->
+LMT entries -> MOC` path a real run uses, and (by default) stops one
+step short of order submission. The only thing NOT exercised is the
+live websocket transport — everything downstream is identical to a
+real session, INCLUDING:
+
+- **Replay-day decision clock for the LMT staleness guard**: tick
+  age is measured against the replay-day 15:50 anchor, not today's
+  wall clock, so historical ticks are correctly evaluated as
+  minutes-old (fresh) rather than days-old (silently skipped). If
+  this is ever broken, `--replay-submit` will silently place ZERO
+  orders while returning rc=0 — exactly the failure mode round-2
+  reviewer B caught.
+- **Look-ahead cap on the entry price**: `_extract_last_quote_by_sym`
+  bounds the tbbo frame at the replay-day decision timestamp
+  BEFORE picking the last tick, so the cached whole-day parquet
+  cannot leak the 16:00 closing print into the LMT entry price
+  (that would price the entry at the exact tick the strategy is
+  trying to forecast).
 
 First replay of a date not in the cache would need a one-off Databento
 historical materialisation (not the paid live subscription — cheap
@@ -354,7 +375,7 @@ Timing (all America/New_York):
   is later. (NYSE keeps a 15:50 MOC entry cutoff — different venue,
   different rule. This strategy targets the NASDAQ close cross
   exclusively — see `live/nasdaq_routing.py`.) This flag ONLY bounds
-  the MOC exit batch; the MKT entry batch fires unconditionally so
+  the MOC exit batch; the LMT entry batch fires unconditionally so
   the operator is never left with a filled entry and no queued
   exit. If the cutoff was already past at orchestrator entry (no
   orders placed), the run exits rc=4 (safe skip). If it trips
@@ -389,6 +410,42 @@ Safety and data quality:
 - `--min-universe-coverage MIN_UNIVERSE_COVERAGE` — minimum fraction
   of the active universe that must appear in the snapshot for the run
   to proceed. Default 0.5.
+
+LMT entry quote guards (not CLI flags — config constants; override in
+`live/config.py`):
+
+- `DEFAULT_MAX_QUOTE_STALENESS_SECS` (default `30.0`). Maximum age
+  of the tbbo tick used to price each LMT entry, measured against
+  the wall clock (live/paper) or the replay-day decision anchor
+  (replay). A symbol whose last tick predates this window is
+  skipped with `error="quote_stale"`.
+- `DEFAULT_MAX_ENTRY_REL_SPREAD` (default `0.005` = 50 bps).
+  Maximum `(ask - bid) / mid` at which the mid is a meaningful
+  price. Wider quotes skip with `error="quote_wide_spread"`.
+- `DEFAULT_MIN_ENTRY_SUBMIT_COVERAGE` (default `0.5`). Minimum
+  fraction of priced-in symbols that must actually reach the
+  broker (i.e. NOT skipped by any `quote_*` guard). Below this,
+  the orchestrator cancels any entries that did land, exits
+  `rc=10`, and does NOT proceed to the MOC batch. Catches
+  systemic feed wedges that leave you with a truncated fragment
+  of a risk-balanced solve. `rc=10` is a pre-order refusal (no
+  exposure), so it stays out of the `rc >= 11` pager band.
+- `ENTRY_MAX_LIMIT_PRICE` (default `$5,000,000`). Absolute price
+  sanity bound on any single limit price. Catches the Databento
+  `UNDEF_PRICE` scaled-sentinel variant (~$9.2B); a legitimate
+  BRK-A quote around $700k is well inside the bound.
+
+Skip reasons an operator will see in the logs:
+
+- `no_usable_quote_at_entry` — no tbbo record at all for the symbol.
+- `quote_missing_fields` / `quote_non_numeric` / `quote_non_finite`
+  — one of bid/ask/mid/ts is None, non-numeric, or NaN/inf.
+- `quote_non_positive` — bid or ask <= 0.
+- `quote_crossed` — ask < bid.
+- `quote_absurd_price` — bid or ask > `ENTRY_MAX_LIMIT_PRICE`.
+- `quote_stale` — tick older than `DEFAULT_MAX_QUOTE_STALENESS_SECS`.
+- `quote_wide_spread` — spread wider than `DEFAULT_MAX_ENTRY_REL_SPREAD`.
+- `quote_naive_ts` / `quote_bad_ts` — feed / adapter bug (tz).
 
 Configuration:
 
@@ -483,7 +540,7 @@ than the one before it. Do not skip:
 #    Wednesday avoids exchange-holiday adjacency.
 .venv/bin/python -m live.daily_orchestrator --replay-date 2026-05-13 --paper
 
-# 4. Real paper broker: MKT entries + MOC exits through the paper
+# 4. Real paper broker: LMT entries + MOC exits through the paper
 #    account. Flatten the paper account (`panic --paper`) before the
 #    next real session — replay fills pollute the diff baseline.
 .venv/bin/python -m live.daily_orchestrator \
@@ -520,21 +577,39 @@ than the one before it. Do not skip:
    |          pre-qualify contracts with TWS; drop unqualified
    |          check MAX_ORDER_QTY, raise ceiling if needed
    |
-   |  15:50+ LEG 1: MKT entries sized to (target - current) via
-   |          broker.buy / broker.sell (default tif=DAY).
+   |  15:50+ LEG 1: LMT entries sized to (target - current), priced
+   |          at the mid of the tbbo tick observed in the SAME 15:50
+   |          snapshot (bounded at the decision moment — no look-
+   |          ahead in replay), rounded PASSIVELY per side (BUY
+   |          floors DOWN to the next tick, SELL ceils UP), and
+   |          submitted via broker.buy / broker.sell with
+   |          order_type="LMT", limit_price=<numeric>,
+   |          exchange=ACTIVE_ROUTING, default tif=DAY. A symbol
+   |          whose tbbo is missing / stale / crossed / wider than
+   |          DEFAULT_MAX_ENTRY_REL_SPREAD / non-positive / above
+   |          ENTRY_MAX_LIMIT_PRICE is SKIPPED — no LMT, no MOC,
+   |          no exposure (order_id is None). If more than 50%
+   |          (1 - DEFAULT_MIN_ENTRY_SUBMIT_COVERAGE) of priced-in
+   |          symbols are guard-skipped, any entries that DID
+   |          land are cancelled and the run exits rc=10.
    |
    |  15:50+ LEG 2 (fill-gated dispatcher): a single-threaded fast-
    |          polling loop monitors every entry's status concurrently.
    |          As each entry becomes terminal Filled, its opposite-side
    |          MOC is submitted IMMEDIATELY, sized off a fresh
    |          broker.get_positions() for that symbol. Zero-fill entries
-   |          get NO MOC. Dispatcher runs until either every entry is
-   |          terminal or the sweep deadline lands. A staleness check
-   |          (baseline+signed_fill == snapshot) DEFERS the MOC to the
-   |          sweep whenever the position book lags the fill event
-   |          (round-4 fix: IB emits execution reports before the
-   |          position update — the naive dispatcher would have sized
-   |          an MOC off a stale PRE-fill snapshot).
+   |          (LMT never crossed → Cancelled by the sweep with
+   |          filled=0) get NO MOC. Dispatcher WORKS UNTIL THE SWEEP
+   |          DEADLINE — DEFAULT_ENTRY_WORKING_SECS defaults to
+   |          None, which means the dispatcher does NOT walk away at
+   |          the old MKT-era 30s cap; passive limits routinely cross
+   |          many minutes past 15:50 in the closing ramp. A
+   |          staleness check (baseline+signed_fill == snapshot)
+   |          DEFERS the MOC to the sweep whenever the position book
+   |          lags the fill event (round-4 fix: IB emits execution
+   |          reports before the position update — the naive
+   |          dispatcher would have sized an MOC off a stale PRE-fill
+   |          snapshot).
    |
    |  ~15:51  FIRST SWEEP (immediately after the dispatcher): cancels
    |          any entry still non-terminal, verifies each dispatcher
@@ -614,8 +689,17 @@ than the one before it. Do not skip:
   flattening every existing position.
 - Out-of-universe positions are pinned to their current quantity in
   the extended target so they diff-out to zero — the strategy never
-  touches a position it did not put on. Both MKT entries and MOC exits
+  touches a position it did not put on. Both LMT entries and MOC exits
   respect this.
+- **LMT entry mass-skip guard (rc=10).** If more than
+  `1 - DEFAULT_MIN_ENTRY_SUBMIT_COVERAGE` (default 50%) of the
+  priced-in symbols are skipped by any quote guard (systemic feed
+  wedge, mass-stale ticks), the orchestrator CANCELS any entries
+  that did land and exits `rc=10` BEFORE submitting the MOC batch.
+  A truncated fragment of a risk-balanced solve is worse than no
+  book at all — it's a non-random slice of names that happened to
+  have clean quotes, executed in the closing ramp against a
+  covariance fit on the full set.
 - Every symbol is pre-qualified through TWS before the per-leg loop.
   Symbols IB refuses to qualify are dropped from the target with a
   warning; the batch continues.
@@ -625,8 +709,9 @@ than the one before it. Do not skip:
 - **Structural safety invariant of the two-leg model.** The MOC exit
   quantity is derived from `broker.get_positions()` AFTER the entry
   fills settle, NEVER from `target - current` or the entry's requested
-  quantity. A partial MKT fill therefore cannot cause an over-flatten
-  into an opposite overnight exposure. Enforced by both
+  quantity. A partial LMT fill (or no fill at all) therefore cannot
+  cause an over-flatten into an opposite overnight exposure.
+  Enforced by both
   `_submit_single_moc` and `_sweep_moc_deadline` not accepting any
   target-side argument in their signatures; a compile-time regression
   test (`test_fill_gated_dispatch_never_regresses_leg_2_sized_from_target`)
@@ -768,6 +853,15 @@ or a clean shutdown. Wire the pager to page on `rc >= 11` and to log
   port, or a `--broker-client-id` collision.
 - `9` — `--lambda- <= 0` (invalid argument). No broker contact. Below
   the pager threshold — this is a validation failure, not an exposure.
+- `10` — LMT entry submit coverage below
+  `DEFAULT_MIN_ENTRY_SUBMIT_COVERAGE` (default 0.5). Either a
+  systemic feed wedge left too many symbols with unusable quotes,
+  or a burst of `quote_*` guard skips left the surviving entry set
+  too small to be a coherent risk-balanced book. Any entries that
+  DID land are cancelled BEFORE this return, so no exposure
+  remains. Distinct from rc=5 (empty share_targets), which fires
+  BEFORE entry submission on an empty MVO result. Below the pager
+  threshold — this is a pre-order refusal, not an exposure.
 - `11` — **OVERNIGHT EXPOSURE POSSIBLE — page the operator.** Fires
   on any of two independent classes of signal:
   * **Pre-close (EARLY warning, before 16:00)** — page immediately
@@ -809,24 +903,66 @@ overnight. Each trading day is independent.
 
 Execution is two batches, in strict sequence, per name in the target book:
 
-**LEG 1 — MKT entries.** For each name where
-`diff = target_shares - current_shares != 0`, `broker.buy(sym, qty,
-order_type="MKT")` / `broker.sell(sym, qty, order_type="MKT")`
-submits a plain market order at the broker default `tif="DAY"`.
-Fires unconditionally at 15:50-15:51 — MKT entries are the ONLY
-lateness the strategy is sensitive to (the signal decays through
-the 15:50-16:00 window), so any delay to the sweep or acceptance
-audit does NOT delay the entry batch.
+**LEG 1 — LMT entries at the tbbo mid, PASSIVE per side.** For each
+name where `diff = target_shares - current_shares != 0`:
 
-*Why plain MKT and not a slippage-capped LMT?* Earlier designs tried
-an IOC LMT capped at a `max-slippage-bps` from the entry mid, then a
-plain MKT-IOC. Both were simplified out per operator preference: a
-slippage cap that binds during the 15:50 pre-close is more likely to
-leave an unhedged position than to save meaningful basis points, and
-the strategy's alpha is more sensitive to fill rate than to entry
-price. Plain MKT gives the book the best chance of being filled and,
-therefore, of being hedged by the MOC leg. Slippage on the entry is
-priced into the impact and cost terms of the QP objective.
+- **Price**: `(bid_px_00 + ask_px_00) / 2` observed in the 15:50
+  DECISION-TIME snapshot (the same `feed.snapshot()` that fed the
+  MVO, TIME-BOUNDED at the decision moment so replay cannot leak
+  the 16:00 closing print into the entry price). Rounded PASSIVELY
+  per side: BUY floors DOWN to the next US-equity tick ($0.01 above
+  $1, $0.0001 below), SELL ceils UP. This is a correctness
+  requirement — a common one-cent spread puts the mid on a
+  half-penny, and a symmetric half-up round on both sides would
+  send BUYs at the ask (marketable, always fills) and SELLs half a
+  cent above the ask (rarely fills), producing a systematically
+  net-long realized book the covariance never priced.
+- **Submission**: `broker.buy(sym, qty, order_type="LMT",
+  limit_price=<numeric>, exchange=ACTIVE_ROUTING)` /
+  `broker.sell(...)` at the broker default `tif="DAY"`.
+- **Working time**: `DEFAULT_ENTRY_WORKING_SECS` defaults to
+  `None`, meaning the dispatcher works EACH ENTRY UNTIL THE SWEEP
+  DEADLINE (~15:54:42 on the 49-name book). Passive limits
+  routinely cross many minutes past 15:50 as the closing ramp
+  gathers momentum — capping the wait at the MKT-era 30s would
+  have the sweep cancel almost every entry before it could fill.
+- **Sweep at 15:54:42**: any LMT still non-terminal is CANCELLED
+  before the MOC batch is sized. An entry that never crossed
+  simply leaves no position and no MOC — no exposure risk added.
+- **Quote guards** (all skip the symbol; the run-return records
+  `error=<reason>`, `order_id=None`, and — where computable —
+  the raw mid we would have priced at). A symbol whose tbbo is
+  missing / stale (> `DEFAULT_MAX_QUOTE_STALENESS_SECS`,
+  default 30s) / crossed / wider than
+  `DEFAULT_MAX_ENTRY_REL_SPREAD` (default 50 bps) / non-positive /
+  above `ENTRY_MAX_LIMIT_PRICE` (Databento sentinel scale-leak
+  guard, default $5M) is SKIPPED. No MKT fallback — the operator's
+  policy is that no entry = no exposure.
+- **Mass-skip guard**: if MORE than
+  `1 - DEFAULT_MIN_ENTRY_SUBMIT_COVERAGE` (default 50%) of
+  priced-in symbols are guard-skipped, any entries that DID land
+  are CANCELLED and the run exits `rc=10` before the MOC batch.
+  This is what stops a systemic feed wedge from committing the
+  book to a truncated fragment of a risk-balanced solve.
+
+Fires unconditionally with respect to the `--submit-by` MOC exit
+cutoff — LMT entries are the ONLY lateness the strategy is
+sensitive to (the signal decays through the 15:50-16:00 window),
+so any delay to the sweep or acceptance audit does NOT delay the
+entry batch.
+
+*Why passive LMT and not MKT?* Earlier iterations used plain MKT
+entries and accepted the spread paid on entry. Under a large-cap
+top-49 book at 15:50-15:55, mid-priced passive limits fill often
+enough that the spread saved on the entries that DO cross
+materially improves realized PnL vs. the alpha the forecast
+predicts. The two accepted tradeoffs are (a) LOWER FILL RATE
+than MKT (some names simply don't cross, and are not entered —
+their contribution to the intended book is 0), and (b) the
+staleness / mass-skip guards, which turn a systemic feed wedge
+into an rc=10 refusal instead of a silent partial book. Both are
+worth it under passive rounding per side; both would be dangerous
+without it (see the correctness note above).
 
 **LEG 2 — per-symbol FILL-GATED MOC + DEADLINE SWEEP.**
 
@@ -892,8 +1028,11 @@ cannot cover:
 send (`_submit_single_moc`) and the sweep's MOC batch
 (`_sweep_moc_deadline`) size their `qty` argument from a fresh
 `broker.get_positions()` snapshot, NEVER from `target - current` or
-from the entry's requested quantity. A partial MKT fill (say 50%)
+from the entry's requested quantity. A partial LMT fill (say 50%)
 therefore produces a 50% MOC counter and the book returns to zero.
+An entry that never crossed leaves no position and no MOC — a
+"skipped" MOC for a symbol that never traded is the correct
+outcome, not an exposure.
 A target-diff MOC would over-flatten a partial into an opposite
 overnight exposure — the exact bug this two-leg model exists to
 prevent. Structurally enforced: neither `_submit_single_moc` nor
@@ -921,7 +1060,7 @@ This closes:
   3 of 10 held names; the missing 7 would ride unhedged.
 - **Wait-budget-exhausted** — an entry status truncated by the
   dispatcher's per-tick deadline marks `filled_qty=0` for the
-  remainder, but the MKTs may truly have filled at the exchange.
+  remainder, but the LMTs may truly have filled at the exchange.
   The cross-check re-polls ground-truth via `broker.get_order_status`.
 - **TWS event-stream brownout** — `get_order_status` returns
   successfully with a stale non-terminal status. The cross-check
@@ -1303,7 +1442,7 @@ Nothing has been placed at rc=8 — safe to fix and retry.
   loses one of the two order streams.
 - **Run `panic` against the same TWS client-id as an in-flight
   orchestrator run.** Panic's `cancel_all()` would pull the
-  orchestrator's own MKT entries and MOCs mid-flow, corrupting the
+  orchestrator's own LMT entries and MOCs mid-flow, corrupting the
   rc gate. Panic defaults to client-id 99; orchestrator to 1. Keep
   them distinct. See the concurrency warning in section 10.
 - Run the retrain and the daily simultaneously against the same
@@ -1356,7 +1495,7 @@ default; the orchestrator uses 1. Distinct ids let them coexist against
 the same TWS but they must NEVER target the same client-id
 concurrently. Panic's `cancel_all()` is a global cancel over the
 client's orders — running it against the orchestrator's client-id
-mid-flow would pull the orchestrator's own MKT entries and MOC exits
+mid-flow would pull the orchestrator's own LMT entries and MOC exits
 between submission and the acceptance / coverage audits, corrupting
 the rc gate and possibly leaving an open book unhedged. The two-leg
 model's ordering guarantees only hold when it has exclusive control
@@ -1548,12 +1687,18 @@ Daily orchestrator end-to-end (`test_end_to_end.py`):
 *Two-leg execution safety:*
 
 - `test_daily_orchestrator_places_two_leg_orders`
-  — happy path: MKT entries via `broker.buy`/`broker.sell` with
-  `order_type="MKT"` and the default tif=DAY, then opposite-direction
-  MOC counter-flatten per name sized to the fill; `broker.rebalance()`
-  is never called.
+  — happy path: LMT entries via `broker.buy`/`broker.sell` with
+  `order_type="LMT"`, a numeric `limit_price`, and the default
+  tif=DAY, then opposite-direction MOC counter-flatten per name
+  sized to the fill; `broker.rebalance()` is never called.
+- `test_entries_reach_broker_with_production_defaults`
+  — the ONE end-to-end test that runs with the REAL production
+  `DEFAULT_MAX_QUOTE_STALENESS_SECS` (30s) and
+  `DEFAULT_MAX_ENTRY_REL_SPREAD` (50 bps). Uses a fresh-vs-now
+  fixture so a regression in either default (e.g. dropping
+  staleness to 1s) fails LOUDLY here.
 - `test_two_leg_partial_fill_moc_sized_to_actual_position`
-  — **the core safety invariant.** A 50% MKT fill produces a 50% MOC
+  — **the core safety invariant.** A 50% LMT fill produces a 50% MOC
   counter (sized to actual position), never a full target-diff MOC.
 - `test_two_leg_zero_fill_no_moc_for_that_name`
   — an entry that raises during placement does NOT receive a naked
@@ -1586,7 +1731,7 @@ Daily orchestrator end-to-end (`test_end_to_end.py`):
   — partial `get_positions()` (3 of 10 filled names) → cross-check
   flags 7 uncovered → rc=11 with loud alert.
 - `test_rr1_wait_budget_exhausted_with_real_fills_returns_rc_11`
-  — `wait_for_fill` timing out while MKTs actually filled (correlated
+  — `wait_for_fill` timing out while LMTs actually filled (correlated
   slow-TWS brownout) → cross-check re-polls `get_order_status` and
   catches the real fills → rc=11.
 - `test_r1_get_positions_raises_returns_rc_11`
