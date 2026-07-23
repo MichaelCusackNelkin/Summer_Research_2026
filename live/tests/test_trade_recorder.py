@@ -168,20 +168,14 @@ def test_schema_columns_present_and_typed(tmp_path):
         assert name in table.schema.names, f"missing column {name}"
         got = table.schema.field(name).type
         assert got == dtype, f"{name}: expected {dtype}, got {got}"
-    assert trade_recorder.SCHEMA_VERSION == 5
-    # v4+ must include per-minute mark columns for T+1..T+5.
+    assert trade_recorder.SCHEMA_VERSION == 4
+    # v4 must include per-minute mark columns for T+1..T+5.
     for _n in trade_recorder.MARK_OFFSETS_MINUTES:
         for _col in (f"t{_n}min_price", f"t{_n}min_ts_utc",
                      f"t{_n}min_staleness_secs"):
             assert _col in table.schema.names, (
-                f"v4+ missing mark column {_col}"
+                f"v4 missing mark column {_col}"
             )
-    # v5 must include the nullable ``limit_price`` column for LMT
-    # entry rows.
-    assert "limit_price" in table.schema.names, (
-        "v5 missing limit_price column"
-    )
-    assert table.schema.field("limit_price").type == pa.float64()
 
 
 def test_finalize_produces_no_file_when_empty(tmp_path):
@@ -1335,9 +1329,9 @@ def test_marks_schema_v4_roundtrips_with_all_null_columns(tmp_path):
             assert table.schema.field(col).type.equals(
                 trade_recorder.TRADE_RECORD_SCHEMA.field(col).type
             )
-    # schema_version stamped as 5 on every row.
+    # schema_version stamped as 4 on every row.
     df = pl.read_parquet(path)
-    assert (df["schema_version"] == 5).all()
+    assert (df["schema_version"] == 4).all()
 
 
 def test_marks_replay_path_produces_curve(tmp_path):
@@ -2028,125 +2022,27 @@ def test_read_trades_backfills_v3_parquets_as_typed_nulls(tmp_path):
     v3_path = tmp_path / "paper" / "2026-05-13" / "run-v3.parquet"
     pq.write_table(v3_table, v3_path)
 
-    # The real assertion: read_trades gives every current-schema
-    # column, back-filled as typed nulls on the v3 rows.
+    # The real assertion: read_trades gives every v4 column, back-
+    # filled as typed nulls on the v3 rows.
     combined = trade_recorder.read_trades([v3_path, v4_path])
     for c in trade_recorder.TRADE_RECORD_SCHEMA.names:
         assert c in combined.column_names, (
-            f"read_trades dropped column {c}"
+            f"read_trades dropped v4 column {c}"
         )
     # The v3 row's new-column values are typed nulls (not string
-    # 'None', not skipped). The freshly-recorded row's t1min_price
-    # came from the capture — check it's still there.
+    # 'None', not skipped). The v4 row's t1min_price came from the
+    # capture — check it's still there.
     df = pl.from_arrow(combined).sort("schema_version")
     assert df.height == 2
     v3_row = df.filter(pl.col("schema_version") == 3).row(0, named=True)
-    # The "v4" file was actually written by the current recorder, so
-    # its schema_version stamps to whatever SCHEMA_VERSION is today.
-    v_current_row = df.filter(
-        pl.col("schema_version") == trade_recorder.SCHEMA_VERSION
-    ).row(0, named=True)
+    v4_row = df.filter(pl.col("schema_version") == 4).row(0, named=True)
     assert v3_row["t1min_price"] is None
-    assert v_current_row["t1min_price"] is not None
+    assert v4_row["t1min_price"] is not None
     # And the column keeps its declared pyarrow type.
     for n in (1, 2, 3, 4, 5):
         assert combined.schema.field(f"t{n}min_price").type.equals(
             trade_recorder.TRADE_RECORD_SCHEMA.field(f"t{n}min_price").type
         )
-    # v5-specific back-fill: legacy v3/v4 files get null for the
-    # ``limit_price`` column via ``read_trades``.
-    assert v3_row.get("limit_price") is None
-    # (The fresh row is a MKT-labelled entry in the fixture; that's
-    # legitimately null too — the fixture predates the LMT batch.)
-    assert combined.schema.field("limit_price").type == pa.float64()
-
-
-def test_read_trades_backfills_v4_parquets_as_typed_nulls_limit_price(tmp_path):
-    """Round-2 (reviewer B): real v4->v5 round-trip. A v4-vintage
-    file has EVERY column of the current schema EXCEPT
-    ``limit_price``; ``read_trades`` must back-fill it as a typed
-    null so a mixed [v4, v5] glob does not silently drop the column.
-    """
-    from datetime import timezone as _tz, timedelta as _td, datetime as _dt
-    import polars as pl
-    import pyarrow.parquet as pq
-
-    _UTC = _tz.utc
-    ny = _tz(_td(hours=-4))
-    decision_utc = _dt(2026, 5, 13, 15, 50, 0, tzinfo=ny).astimezone(_UTC)
-    tbbo = pl.DataFrame([{
-        "ts_event": decision_utc,
-        "symbol": "AAA",
-        "price": 40.0, "size": 100,
-        "bid_px_00": 39.99, "ask_px_00": 40.01,
-    }])
-
-    # Build a v5 parquet with a real LMT limit_price populated.
-    rec_v5 = _new_recorder(
-        "paper", tmp_path, run_id="run-v5-lmt",
-    )
-    rec_v5.record_submission(
-        leg="entry", symbol="AAA", side="BUY", requested_qty=1,
-        order_type="LMT", order_id="oid-lmt", limit_price=40.00,
-    )
-    rec_v5.record_fill(
-        leg="entry", symbol="AAA", order_id="oid-lmt",
-        filled_qty=1, fill_price=40.0, status="Filled",
-    )
-    rec_v5.capture_marks_from_tbbo(tbbo, decision_utc)
-    v5_path = rec_v5.finalize()
-    assert v5_path is not None
-
-    # Now fabricate a v4 file: drop only the ``limit_price`` column
-    # from a copy, restamp schema_version=4. Everything else
-    # (mark blocks, exec info, etc.) is retained.
-    v5_table = pq.read_table(v5_path)
-    v4_columns = [c for c in v5_table.column_names if c != "limit_price"]
-    v4_table = v5_table.select(v4_columns)
-    v4_table = v4_table.set_column(
-        v4_table.column_names.index("schema_version"),
-        "schema_version",
-        pa.array([4] * v4_table.num_rows, type=pa.int32()),
-    )
-    v4_path = tmp_path / "paper" / "2026-05-13" / "run-v4.parquet"
-    pq.write_table(v4_table, v4_path)
-
-    # Read both — the v4 row must gain a typed-null limit_price
-    # column; the v5 row must keep its populated limit_price.
-    combined = trade_recorder.read_trades([v4_path, v5_path])
-    df = pl.from_arrow(combined).sort("schema_version")
-    v4_row = df.filter(pl.col("schema_version") == 4).row(0, named=True)
-    v5_row = df.filter(pl.col("schema_version") == 5).row(0, named=True)
-    assert v4_row.get("limit_price") is None
-    assert v5_row.get("limit_price") == pytest.approx(40.00), (
-        f"v5 row's populated limit_price was corrupted through the "
-        f"parquet round-trip; got {v5_row.get('limit_price')!r}"
-    )
-    assert combined.schema.field("limit_price").type == pa.float64()
-
-
-def test_limit_price_survives_parquet_round_trip(tmp_path):
-    """Round-2 (reviewer B): a non-null ``limit_price`` on a fresh
-    v5 write must survive ``TradeRecorder.finalize()`` and read
-    back exactly.
-    """
-    import polars as pl
-    rec = _new_recorder("paper", tmp_path, run_id="run-lp-roundtrip")
-    rec.record_submission(
-        leg="entry", symbol="BBB", side="SELL", requested_qty=25,
-        order_type="LMT", order_id="oid-bbb", limit_price=123.45,
-    )
-    rec.record_fill(
-        leg="entry", symbol="BBB", order_id="oid-bbb",
-        filled_qty=25, fill_price=123.45, status="Filled",
-    )
-    path = rec.finalize()
-    assert path is not None
-    df = pl.read_parquet(path)
-    row = df.filter(pl.col("symbol") == "BBB").row(0, named=True)
-    assert row["limit_price"] == pytest.approx(123.45)
-    assert row["order_type"] == "LMT"
-    assert row["side"] == "SELL"
 
 
 # ---------------------------------------------------------------------------

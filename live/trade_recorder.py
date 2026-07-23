@@ -1,7 +1,7 @@
 """Post-trade recording for slippage / impact analysis.
 
 Records one row per attempted trade to a columnar parquet file. Both legs
-of the two-leg execution (LMT entries and MOC counter-flatten) are captured
+of the two-leg execution (MKT entries and MOC counter-flatten) are captured
 and identified via a ``leg`` column. Separate files are written for
 ``paper``, ``live``, and ``replay`` runs so replay rehearsals never
 contaminate real trading records.
@@ -168,12 +168,7 @@ _UTC = timezone.utc
 #     semantics so v3 parquets stay readable and any downstream code
 #     that reads a t5min column continues to work — T+5 is now one
 #     point on the decay curve, not a renamed thing.
-# v5: added the nullable ``limit_price`` column so LMT entry rows
-#     record the exact price we sent to the broker (rounded to a US-
-#     equity tick from the fresh entry-time mid). Nullable because
-#     MOC exit rows have no limit price, and legacy MKT parquets
-#     back-fill as null via ``read_trades``.
-SCHEMA_VERSION: int = 5
+SCHEMA_VERSION: int = 4
 
 # Every minute-offset the recorder captures a post-decision mark at.
 # Each n in this tuple contributes THREE columns to the schema:
@@ -253,13 +248,6 @@ def _build_trade_record_schema() -> pa.Schema:
         ("t5min_ts_utc", pa.timestamp("us", tz="UTC")),
         ("order_qty", pa.int64()),       # signed by side (+BUY / -SELL)
         ("requested_qty", pa.int64()),   # unsigned qty as sent
-        # LMT entry limit price rounded to the nearest US-equity tick
-        # ($0.01 above $1, $0.0001 below). Null for MOC exit rows and
-        # for v3/v4 rows read back through ``read_trades``. Slippage
-        # vs. limit = fill_price - limit_price (BUY) / limit_price -
-        # fill_price (SELL); slippage vs. mid = fill_price -
-        # arrival_price (same sign convention).
-        ("limit_price", pa.float64()),
         ("filled_qty", pa.float64()),    # IB may report fractional
         ("signed_filled_qty", pa.float64()),
         ("remaining_qty", pa.float64()),
@@ -466,9 +454,7 @@ def extract_broker_extras(broker: Any, oid: str) -> dict[str, Any]:
             pass
 
     # Fills: pull commission / liquidity / venue / exec_id from the FIRST
-    # fill (an aggressive LMT priced at the fresh mid usually fills in
-    # one print against the near-side quote; a passive LMT may pick up
-    # multiple partial fills as the tape crosses).
+    # fill (there is usually only one for an MKT into a top-of-book).
     # Multi-fill orders aggregate — sum commissions, take first venue.
     try:
         fills = getattr(trade, "fills", None)
@@ -803,17 +789,7 @@ class TradeRecorder:
         exchange: Optional[str] = None,
         tif: Optional[str] = None,
         error: Optional[str] = None,
-        limit_price: Optional[float] = None,
     ) -> None:
-        """Record submission-time fields for one entry or MOC leg.
-
-        ``limit_price`` is populated on LMT entries (v5+; see the
-        schema block for the column definition) and left null for
-        MOC exits or MKT-vintage rows. On a skipped LMT with no
-        broker call (``order_id is None``, ``error="quote_stale"``
-        etc.) the caller can still pass the mid we WOULD have used
-        so post-trade analysis sees what got rejected.
-        """
         with self._lock:
             row = self._row(leg, symbol)
             row["side"] = side
@@ -830,8 +806,6 @@ class TradeRecorder:
                 row["tif"] = str(tif)
             if error:
                 row["error"] = str(error)[:400]
-            if limit_price is not None:
-                row["limit_price"] = _finite(limit_price)
         self._journal({
             "kind": "submission",
             "leg": leg,
@@ -843,9 +817,6 @@ class TradeRecorder:
             "exchange": exchange,
             "tif": tif,
             "error": error,
-            "limit_price": (
-                float(limit_price) if limit_price is not None else None
-            ),
             "sent_ts_utc": (
                 _to_utc(sent_ts_utc).isoformat() if sent_ts_utc else None
             ),
@@ -1553,20 +1524,10 @@ def read_trades(
     a row whose ``t{n}min_price`` is null, filter on
     ``schema_version < 4`` to identify the "column didn't exist"
     case (v3 row, back-filled by this helper), and
-    ``schema_version >= 4`` to identify the "mark genuinely didn't
+    ``schema_version == 4`` to identify the "mark genuinely didn't
     populate" case (e.g. no tick at or before the target, or the
     background thread never ran). Downstream calibration must
     exclude both, but the two mean different things about the day.
-
-    v5 adds ``limit_price`` (nullable float64). Legacy v3 and v4
-    parquets read back with null ``limit_price`` — that is a
-    "column didn't exist yet" null, indistinguishable at the
-    per-row level from a v5 MOC row (which is null because MOC
-    rows have no limit) or a v5 entry row whose LMT was
-    rejected pre-submit before a price was computed. Analysts
-    interested in slippage-vs-limit should filter to
-    ``schema_version >= 5 AND leg == 'entry' AND limit_price
-    IS NOT NULL``.
     """
     str_paths = [str(p) for p in paths]
     if not str_paths:

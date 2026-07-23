@@ -37,22 +37,7 @@ from live.tests.test_end_to_end import (
     _prepopulate_live_feed,
     _patch_artifacts,
     _base_argv,
-    _relax_entry_staleness_for_historical_fixture,
 )
-
-
-@pytest.fixture(autouse=True)
-def _module_relax_staleness_for_historical_fixture(monkeypatch):
-    """Same rationale as the module-scoped autouse in
-    ``test_end_to_end.py`` — every test in this file uses
-    ``_prepopulate_live_feed`` (a historical 2026-06-15 fixture) and
-    would trip the production LMT entry staleness guard against
-    today's wall clock, then trip the round-2 mass-skip rc=10
-    guard because 49-of-49 would be skipped ``quote_stale``. Per
-    round-2 reviewer B, the staleness patch is SCOPED per test
-    module rather than living suite-wide in the root conftest.
-    """
-    _relax_entry_staleness_for_historical_fixture(monkeypatch)
 
 
 def test_paper_run_writes_recorder_parquet(monkeypatch, tmp_path):
@@ -310,11 +295,11 @@ def test_recorder_failure_does_not_break_order_path(monkeypatch, tmp_path):
 
     rc = daily_orchestrator.main(_base_argv())
     assert rc == 0
-    lmt_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
-                  if c[2] == "LMT"]
+    mkt_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
+                  if c[2] == "MKT"]
     moc_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
                   if c[2] == "MOC"]
-    assert lmt_orders and moc_orders
+    assert mkt_orders and moc_orders
 
 
 def test_recorder_method_exception_does_not_break_order_path(monkeypatch, tmp_path):
@@ -353,11 +338,11 @@ def test_recorder_method_exception_does_not_break_order_path(monkeypatch, tmp_pa
 
     rc = daily_orchestrator.main(_base_argv())
     assert rc == 0
-    lmt_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
-                  if c[2] == "LMT"]
+    mkt_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
+                  if c[2] == "MKT"]
     moc_orders = [c for c in fake_broker.buy_calls + fake_broker.sell_calls
                   if c[2] == "MOC"]
-    assert lmt_orders and moc_orders
+    assert mkt_orders and moc_orders
 
 
 def test_recorder_run_does_not_touch_production_dir(monkeypatch, tmp_path):

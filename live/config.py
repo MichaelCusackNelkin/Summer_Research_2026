@@ -13,7 +13,7 @@ import logging
 import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional  # noqa: F401 — used in module-level annotations
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -106,136 +106,18 @@ DEFAULT_LAMBDA = 5e-5
 DEFAULT_VOL_CAP = 5e3
 DEFAULT_IMPACT_GAMMA = 0.5
 
-# Two-leg execution: LMT entry at 15:50 priced at the most-recent tbbo mid,
-# MOC counter-flatten at the 16:00 auction (see
-# ``daily_orchestrator._submit_limit_entries`` /
-# ``_fill_gated_moc_dispatch`` / ``_sweep_moc_deadline``).
+# Two-leg execution: MKT entry at 15:50, MOC counter-flatten at the 16:00
+# auction (see daily_orchestrator._submit_mkt_entries /
+# _fill_gated_moc_dispatch / _sweep_moc_deadline).
 # The strategy predicts the 15:50 -> 16:00 close-auction move; we take that
-# move with a limit entry that lands intraday and an MOC exit that lifts
-# at the closing print.
-#
-# ``DEFAULT_ENTRY_FILL_TIMEOUT_SECS`` was the round-1 MKT-era knob —
-# a MKT into a liquid book fills in milliseconds, so 30s was orders of
-# magnitude of slack and functioned as a "gate on truly wedged submissions"
-# rather than a working-time bound. Under a PASSIVE LMT the same knob is
-# fatal to fill rate: passive limits routinely take minutes to cross,
-# so a 30s cap would have the dispatcher walk away and the sweep cancel
-# every entry that hadn't crossed by ~15:50:40 (well before the closing
-# ramp gathers momentum). ``DEFAULT_ENTRY_WORKING_SECS`` (below) replaces
-# it as the working-time knob for LMT entries. This one is retained
-# only for its wait-budget role in the orphaned batch helper
-# ``_wait_for_entry_fills``, which the current pipeline no longer
-# calls; leave the default at 30s in case a rollback resurrects the
-# helper.
+# move with an MKT entry that lands intraday and an MOC exit that lifts at
+# the closing print. Per-order fill-wait bounds the fill-gated MOC
+# dispatcher — as soon as any entry becomes terminal Filled, the fill-gated
+# path submits its opposite-side MOC IMMEDIATELY. Set to 30s to give slow
+# venues headroom; the dispatcher still respects the sweep deadline (see
+# ``_compute_sweep_deadline``) so a slow tape can never delay the sweep
+# past NASDAQ's 15:55:00 MOC entry cutoff.
 DEFAULT_ENTRY_FILL_TIMEOUT_SECS = 30.0
-
-# LMT entry working time (LEG 1) — how long the fill-gated dispatcher
-# is willing to WAIT for entries to become terminal before it exits
-# and hands control to the sweep. The dispatcher's effective deadline
-# is ``min(sweep_deadline, now + DEFAULT_ENTRY_WORKING_SECS)``.
-#
-# Set to ``None`` to always work until the sweep deadline (~15:54:42
-# on the 49-name book, per ``_compute_sweep_deadline``). This is the
-# right default for passive LMTs: an entry that hasn't crossed by
-# 15:50:40 has a MUCH better chance of crossing at 15:53 or 15:54
-# than any post-solve panic-modify could produce; the sweep still
-# guarantees cancellation before 15:55, so leaving the entry
-# working through the ramp adds no exposure risk. Set to a positive
-# float to cap the wait at that many seconds (useful only for
-# tests). The MKT-era 30s default is deliberately NOT reused — see
-# ``DEFAULT_ENTRY_FILL_TIMEOUT_SECS`` above for the history.
-DEFAULT_ENTRY_WORKING_SECS: Optional[float] = None
-
-# Minimum coverage floor for the LMT entry SUBMIT — the fraction of
-# priced-in symbols (universe ∩ nonzero-diff) that must actually
-# reach the broker (i.e. NOT skipped by any ``quote_*`` guard). A
-# systemic feed wedge that skips 40 of 49 targets is worse than
-# 49 of 49 skipped: the operator gets a truncated fragment of a
-# risk-balanced solve — a non-random slice of names that happened
-# to have good quotes, executed in the closing ramp against a
-# covariance that was fit on the full set. Rc=5 (empty share_targets)
-# fires BEFORE entry submission and cannot catch this, so we need a
-# distinct post-guard-skip refusal. Rc=10 is a pre-order refusal
-# (all skipped entries have ``order_id=None`` so no orders were
-# placed) and stays out of the ``rc >= 11`` pager band. Default
-# 0.5 mirrors ``--min-universe-coverage``.
-DEFAULT_MIN_ENTRY_SUBMIT_COVERAGE = 0.5
-
-# -------------------- LMT entry pricing (LEG 1) --------------------
-#
-# LEG 1 entries are standard limit orders priced at the most-recent
-# ``(bid_px_00 + ask_px_00) / 2`` observed in the 15:50 DECISION-TIME
-# snapshot (the same ``feed.snapshot()`` that fed the MVO — see
-# ``daily_orchestrator._build_live_day_frame``). Reusing that
-# observation (rather than taking a fresh snapshot immediately before
-# submission) means the price we solved against and the price we bid
-# at agree; the tradeoff is that the mid is knowingly stale by the
-# MVO solve duration and the guards below must be sized accordingly.
-# Three guards reject a bad quote — an entry with no usable quote is
-# SKIPPED (see ``_submit_limit_entries``); the operator gets an
-# ``error="no_usable_quote_at_entry"`` recorder row and the coverage
-# cross-check treats the skip as "no entry, no exposure"
-# (``order_id`` is None → excluded from expected_held / uncovered
-# accounting).
-
-# Maximum age (seconds) of the last observed tbbo quote, measured
-# against the tick timestamp (``quote.ts``). The reference "now" is
-# * LIVE / PAPER: ``datetime.now(_UTC)`` (wall clock at submit).
-# * REPLAY: the replay-day decision anchor (15:50 + print_wait_secs
-#   on the replay date), NOT today's wall clock. Round-2 fix — the
-#   wall-clock baseline made every historical tick trivially days-
-#   to-months stale on the replay path, silently skipping every
-#   symbol.
-# Effective age on live/paper ≈ (snapshot latency) + (MVO solve
-# time) + (qualify time) ≈ 5-15s on the top-49 book. 30s gives
-# ~2x headroom for that plus catches a genuinely dead tick (feed
-# drop, thin illiquid name whose last print was 30+s before
-# snapshot). Round-2 reviewer note: rounding is now PASSIVE per
-# side, so a slightly-stale tick is much less likely to produce an
-# adverse-selection fill (a stale mid on the moving side is
-# rounded AWAY from that side). A tighter default cuts the
-# stale-tick adverse-selection tail without meaningfully hurting
-# fill rate on the top-49 book where every name prints continuously
-# through the close. Widen only if operator observes systematic
-# ``quote_stale`` skips on a specific name.
-DEFAULT_MAX_QUOTE_STALENESS_SECS = 30.0
-
-# Maximum relative spread ``(ask - bid) / mid`` at which a mid-price
-# LMT is meaningful. Wider than this and the mid is effectively an
-# uninformative midpoint between two stale sides; skip the name.
-# 50 bps is deliberately generous — the top-49 universe is all
-# NASDAQ-primary large caps that trade single-digit-bps spreads in
-# the closing ramp. This is a "clearly broken quote" filter, not a
-# quality filter.
-DEFAULT_MAX_ENTRY_REL_SPREAD = 0.005  # 50 bps
-
-# US equities tick size regime (US Reg NMS Rule 612):
-# * prices >= $1.00 quote in $0.01 increments
-# * prices <  $1.00 quote in $0.0001 increments
-# IB rejects sub-tick LMT prices — every price we submit MUST be
-# rounded to the correct increment. We round PER SIDE, in the
-# PASSIVE direction: BUY floors down to the next tick, SELL ceils
-# up to the next tick. This is a correctness requirement, not an
-# aesthetic preference: a common one-cent spread puts the mid on a
-# half-penny, and a half-up round on both sides would put the BUY
-# at the ask (marketable, always fills) and the SELL half a cent
-# above the ask (rarely fills). The realized book would then run
-# systematically net-long. Passive rounding keeps both sides at or
-# inside the mid: buys post at the near-side bid, sells at the
-# near-side ask, both are passive limits and either both fill or
-# both rest. See ``daily_orchestrator._round_to_tick``.
-ENTRY_TICK_ABOVE_DOLLAR = 0.01
-ENTRY_TICK_BELOW_DOLLAR = 0.0001
-
-# Absolute sanity bound on any single limit price. Guards against
-# Databento sentinel values (UNDEF_PRICE == INT64_MAX == 9.22e18;
-# scaled by pretty_* to ~9.22e9) leaking into ``limit_price=`` and
-# a BUY LMT at $9 billion actually being accepted by TWS. Every
-# US-listed equity in living memory trades below this line;
-# Berkshire A around $700k is the visible outlier. Set generously
-# so a legitimate high-priced name is never blocked, but tight
-# enough to catch any variant of the sentinel-leak class of bugs.
-ENTRY_MAX_LIMIT_PRICE = 5_000_000.0
 
 # RRR1: bounded wall-clock wait for MOC acceptance verification. TWS's
 # placeOrder returns synchronously BEFORE any exchange ack; a rejected

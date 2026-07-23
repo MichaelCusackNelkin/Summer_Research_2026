@@ -34,24 +34,6 @@ from pathlib import Path
 import pytest
 
 
-def pytest_configure(config):
-    """Register custom marks used within this test tree.
-
-    ``production_staleness``: opts a test OUT of the module-scoped
-    autouse fixture in ``test_end_to_end.py`` that relaxes
-    ``DEFAULT_MAX_QUOTE_STALENESS_SECS`` so the historical
-    ``_prepopulate_live_feed`` fixture passes the entry guard.
-    Used by the single "run with production defaults" test the
-    round-2 review required.
-    """
-    config.addinivalue_line(
-        "markers",
-        "production_staleness: opt out of the historical-fixture "
-        "staleness relaxation (asserts entries reach the broker under "
-        "the real production DEFAULT_MAX_QUOTE_STALENESS_SECS).",
-    )
-
-
 @pytest.fixture(autouse=True)
 def _isolate_live_output_dirs(monkeypatch, tmp_path):
     """Redirect every filesystem-writing surface used by the orchestrator
@@ -80,17 +62,11 @@ def _isolate_live_output_dirs(monkeypatch, tmp_path):
     # so tests can push these limits as needed.
     #
     # DEFAULT_ENTRY_FILL_TIMEOUT_SECS bounds ``_fill_gated_moc_dispatch``'s
-    # wall-clock wait for entries to reach terminal state (30s in prod
-    # under the old MKT-era knob). The current dispatcher consults
-    # DEFAULT_ENTRY_WORKING_SECS instead (round-2 blocker 2 fix); the
-    # old knob is only touched by orphaned helpers. Both are patched
-    # to 0.5s here so tests with stuck / never-filling entries exit
-    # the dispatcher promptly and let the sweep run.
+    # wall-clock wait for entries to reach terminal state (30s in prod).
+    # Push it to 0.5s here so tests with stuck / never-filling entries
+    # exit the dispatcher promptly and let the sweep run.
     monkeypatch.setattr(
         config, "DEFAULT_ENTRY_FILL_TIMEOUT_SECS", 0.5, raising=False,
-    )
-    monkeypatch.setattr(
-        config, "DEFAULT_ENTRY_WORKING_SECS", 0.5, raising=False,
     )
     # DEFAULT_POST_CLOSE_POLL_* bound ``_poll_positions_after_close``'s
     # backoff loop. Cap them so a post-close verdict lands in
@@ -141,19 +117,6 @@ def _isolate_live_output_dirs(monkeypatch, tmp_path):
         config, "DEFAULT_POST_CLOSE_POLL_SETTLE_SECS", 0.0,
         raising=False,
     )
-    # Round-2 note: the suite-wide DEFAULT_MAX_QUOTE_STALENESS_SECS
-    # and DEFAULT_MAX_ENTRY_REL_SPREAD monkey-patches that lived
-    # here have been REMOVED. The staleness patch is no longer
-    # needed because ``_submit_limit_entries`` measures tick age
-    # against the REPLAY-DAY decision timestamp in replay mode
-    # (round-2 blocker 3a fix), so historical fixtures at
-    # 2026-06-15 15:50 read as fresh against that same replay-day
-    # anchor. The rel-spread patch was masking a units bug (per
-    # reviewer A) — the fixtures at test_end_to_end.py's
-    # ``_prepopulate_live_feed`` build ~1 bps spreads which are
-    # well inside the 50 bps production default. Any per-test
-    # need for a wider spread can override via
-    # ``monkeypatch.setattr`` in the specific test.
     # ROUND-4 SAFETY FIX (SAFETY reviewer finding 3). The daily
     # orchestrator now runs a SECOND SWEEP at ``sweep_deadline`` with
     # a real ``_sleep_until(sweep_deadline)`` between the first and
