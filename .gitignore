@@ -1,6 +1,8 @@
 # Large data files
 **/data
 **/trial_cache
+**/live
+**/ibkr_broker
 
 # Packaging
 *.egg-info/
