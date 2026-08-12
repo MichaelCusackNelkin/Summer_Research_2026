@@ -1,0 +1,145 @@
+% @sec-impact (line 110): source of the gamma ~ 0.15 anchor.
+@article{almgren2005direct,
+  author  = {Almgren, Robert and Thum, Chee and Hauptmann, Emmanuel and Li, Hong},
+  title   = {Direct Estimation of Equity Market Impact},
+  journal = {Risk},
+  volume  = {18},
+  number  = {7},
+  year    = {2005}
+}
+
+% @sec-impact (line 110): the canonical empirical result for the square-root
+@article{toth2011anomalous,
+  author  = {T{\'o}th, B. and Lemp{\'e}ri{\`e}re, Y. and Deremble, C. and
+             de Lataillade, J. and Kockelkoren, J. and Bouchaud, J.-P.},
+  title   = {Anomalous Price Impact and the Critical Nature of Liquidity in
+             Financial Markets},
+  journal = {Physical Review X},
+  volume  = {1},
+  number  = {2},
+  pages   = {021006},
+  year    = {2011},
+  doi     = {10.1103/PhysRevX.1.021006}
+}
+
+% @sec-single-vs-multi (line 200) and @sec-methods (line 43): the reference for
+% the multi-period alternative you decline.
+@article{boyd2017multiperiod,
+  author  = {Boyd, Stephen and Busseti, Enzo and Diamond, Steven and
+             Kahn, Ronald N. and Koh, Kwangmoo and Nystrup, Peter and Speth, Jan},
+  title   = {Multi-Period Trading via Convex Optimization},
+  journal = {Foundations and Trends in Optimization},
+  volume  = {3},
+  number  = {1},
+  year    = {2017},
+  doi     = {10.1561/2400000023}
+}
+
+% @sec-impact (line 110): the temporary-vs-permanent impact decomposition you
+% invoke when you assume instantaneous impact only. This was in your earlier
+% draft's reference list; re-add it here only if you cite it at that sentence.
+% [VERIFY] Journal of Risk 3(2) is the Winter 2000/2001 issue; the DOI resolves
+% to 2001 but the paper is widely cited as 2000. Pick one and be consistent.
+@article{almgren2001optimal,
+  author  = {Almgren, Robert and Chriss, Neil},
+  title   = {Optimal Execution of Portfolio Transactions},
+  journal = {Journal of Risk},
+  volume  = {3},
+  number  = {2},
+  pages   = {5--39},
+  year    = {2001},
+  doi     = {10.21314/JOR.2001.041}
+}
+
+
+% ---------------------------------------------------------------------------
+% Exchange rules — currently asserted with no source
+% ---------------------------------------------------------------------------
+
+% @sec-intro (line 39): imbalance dissemination from 15:50:00, the Order
+% Imbalance Indicator fields, and the buy/sell/none side semantics.
+% [VERIFY] Confirm the current rule citation format and URL in the Nasdaq
+% rulebook; the rulebook was reorganized into the "Equity 4" series.
+@misc{nasdaq4754,
+  author       = {{Nasdaq Stock Market LLC}},
+  title        = {Equity 4, Rule 4754: Nasdaq Closing Cross},
+  howpublished = {Nasdaq Rulebook},
+  url          = {https://listingcenter.nasdaq.com/rulebook/nasdaq/rules},
+  year         = {2024},
+  note         = {Accessed 2026-08-12}
+}
+
+% ---------------------------------------------------------------------------
+% Software and methods named in the text but uncited
+% ---------------------------------------------------------------------------
+
+% @sec-forecasting (lines 72, 74): "boosted using xgboost".
+@inproceedings{chen2016xgboost,
+  author    = {Chen, Tianqi and Guestrin, Carlos},
+  title     = {{XGBoost}: A Scalable Tree Boosting System},
+  booktitle = {Proceedings of the 22nd {ACM} {SIGKDD} International Conference
+               on Knowledge Discovery and Data Mining},
+  pages     = {785--794},
+  year      = {2016},
+  doi       = {10.1145/2939672.2939785}
+}
+
+% @sec-optimization (line 122): "use CVXPY to independently solve".
+% The CVXPY authors ask that both papers be cited together.
+@article{diamond2016cvxpy,
+  author  = {Diamond, Steven and Boyd, Stephen},
+  title   = {{CVXPY}: A {P}ython-Embedded Modeling Language for Convex Optimization},
+  journal = {Journal of Machine Learning Research},
+  volume  = {17},
+  number  = {83},
+  pages   = {1--5},
+  year    = {2016}
+}
+
+% @sec-forecasting (line 74) and @eq-model: the lasso itself.
+@article{tibshirani1996lasso,
+  author  = {Tibshirani, Robert},
+  title   = {Regression Shrinkage and Selection via the Lasso},
+  journal = {Journal of the Royal Statistical Society, Series B},
+  volume  = {58},
+  number  = {1},
+  pages   = {267--288},
+  year    = {1996}
+}
+
+% The lasso implementation and the TimeSeriesSplit cross-validation (line 74).
+@article{pedregosa2011scikit,
+  author  = {Pedregosa, F. and Varoquaux, G. and Gramfort, A. and Michel, V. and
+             Thirion, B. and Grisel, O. and Blondel, M. and Prettenhofer, P. and
+             Weiss, R. and Dubourg, V. and Vanderplas, J. and Passos, A. and
+             Cournapeau, D. and Brucher, M. and Perrot, M. and Duchesnay, E.},
+  title   = {Scikit-learn: Machine Learning in {P}ython},
+  journal = {Journal of Machine Learning Research},
+  volume  = {12},
+  pages   = {2825--2830},
+  year    = {2011}
+}
+
+
+% ---------------------------------------------------------------------------
+% Data sources (@sec-data, line 194)
+% ---------------------------------------------------------------------------
+
+@misc{databento,
+  author       = {{Databento, Inc.}},
+  title        = {{XNAS.ITCH}: {N}asdaq {TotalView-ITCH} Historical and Live Data},
+  howpublished = {\url{https://databento.com/datasets/XNAS.ITCH}},
+  year         = {2026},
+  note         = {Accessed 2026-08-12}
+}
+
+% [VERIFY] yfinance is an unofficial Yahoo Finance scraper with no canonical
+% citation; this is the convention most papers use. Confirm the maintainer
+% attribution you want to give.
+@misc{yfinance,
+  author       = {Aroussi, Ran},
+  title        = {yfinance: Download Market Data from {Y}ahoo! {F}inance's {API}},
+  howpublished = {\url{https://github.com/ranaroussi/yfinance}},
+  year         = {2026},
+  note         = {Accessed 2026-08-12}
+}
